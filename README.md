@@ -1,5 +1,9 @@
 # @clipy/cli
 
+[![npm version](https://img.shields.io/npm/v/%40clipy%2Fcli)](https://www.npmjs.com/package/@clipy/cli)
+[![license: MIT](https://img.shields.io/npm/l/%40clipy%2Fcli)](https://github.com/manovagyanik1/clipy-cli/blob/main/LICENSE)
+[![node >= 18](https://img.shields.io/node/v/%40clipy%2Fcli)](https://www.npmjs.com/package/@clipy/cli)
+
 The [Clipy](https://clipy.online) command line. List, search, and read your screen
 recordings — transcripts, AI summaries, key moments — from the terminal, download the
 MP4s, or export subtitles. No browser needed.
