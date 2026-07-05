@@ -1,0 +1,46 @@
+{
+  "name": "@clipy/cli",
+  "version": "0.1.0",
+  "description": "Command-line interface for Clipy — list, search, and read your screen recordings' transcripts, AI summaries, and key moments from the terminal.",
+  "license": "MIT",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "clipy": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "keywords": [
+    "clipy",
+    "cli",
+    "screen-recording",
+    "transcript",
+    "srt",
+    "loom-alternative",
+    "ai-agent"
+  ],
+  "homepage": "https://clipy.online",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manovagyanik1/clipy-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/manovagyanik1/clipy-cli/issues"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
