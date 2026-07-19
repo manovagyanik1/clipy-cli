@@ -15,6 +15,9 @@ description: Read and create Clipy screen recordings. Use when the user shares a
 
 # Clipy — recordings you can read AND make
 
+Written for @clipy/cli + @clipy/mcp 0.8.0 (the two versions move in lockstep). If
+\`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
+
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
 recording has a share link, an AI transcript + summary, key moments, and a
 machine-readable context document. With the CLI you can also CREATE recordings:
@@ -78,6 +81,29 @@ Notes are absolute (\`"12: text"\`) or pass-scoped (\`"pass2: text"\`,
 \`"pass2@5: text"\`). Pass-scoped notes anchor to a --viewports pass's REAL start,
 so they stay aligned when load time shifts the pass boundaries.
 
+## Recording a logged-in app (headless web capture)
+
+The headless browser starts signed out. To record a page behind auth, seed the
+session BEFORE the first navigation — otherwise the app's route guard runs before
+your credentials exist and redirects to /login (seeding localStorage AFTER visiting
+a guarded route loses that race). \`--storage-state\` and \`--init-script\` apply
+BEFORE any page script structurally, which is what avoids the trap. All four flags
+work on both \`record\` and \`session start\` (web only; rejected on --source mac-screen):
+
+    # reuse a saved Playwright login (cookies + per-origin localStorage)
+    clipy record --url https://app.example.com/dashboard --for 20 --storage-state ./auth.json
+
+    # or seed a token / cookie directly
+    clipy session start --url https://app.example.com/dashboard \\
+      --local-storage "authToken=eyJ…" --cookie "sid=abc; Domain=app.example.com; Secure"
+
+- \`--storage-state <file>\` — a Playwright storageState JSON (log in once, save
+  \`context.storageState({ path })\`); passed straight to newContext. Never printed.
+- \`--cookie "name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]"\` —
+  repeatable; without a Domain it's url-scoped to the target.
+- \`--local-storage "key=value"\` — repeatable; origin-guarded to the target.
+- \`--init-script <file>\` — a JS file run before every page's own scripts.
+
 ## Session mode — you drive the app, Clipy records
 
     clipy session start --url http://localhost:3000 --title "Overflow fix"
@@ -103,6 +129,76 @@ and \`CLIPY_DISABLE_CDP=1\` forces it off.
 Headless captures are silent, so your notes/marks BECOME the transcript (honestly
 labeled as agent narration, never passed off as speech). Narrate every meaningful
 step.
+
+### Assert what you claim (assertion marks)
+
+A plain mark is an unverified claim — you can write \`clipy mark "the Redemptions
+tab is active"\` whether it's true or not, and the transcript reads as fact either
+way. Make marks EVIDENCE by attaching an assertion the recording daemon checks
+against its live page:
+
+    clipy mark "opened redemptions" --assert-url "**/redemptions"
+    clipy mark "status is Active" --assert-selector ".status-badge" --assert-text "Active"
+
+- \`--assert-selector <css>\` — the element must match (its trimmed text is recorded
+  as the observed value).
+- \`--assert-text <substr>\` — that element's text must contain the substring (needs
+  --assert-selector).
+- \`--assert-url <glob>\` — the page URL must match (\`**\` = anything, \`*\` = any
+  non-slash segment, no \`*\` = substring). Combine freely; all checks must pass.
+
+A pass annotates the mark \`… [assert ✓ <observed>]\`; a fail annotates it
+\`… [ASSERT ✗ expected …; observed …]\` — a wrong claim is preserved AS a failed
+assertion, it can never read as fact. \`--fail-mode warn\` (default) records the ✗
+and keeps going; \`--fail-mode abort\` DISCARDS the whole session (nothing uploaded,
+non-zero exit) so you never ship a clip that asserted its way into a broken state.
+If any assertions ran, a leading \`[verification] N assertion(s): P passed, F failed\`
+note opens the transcript. Assertions need a WEB session (rejected on --source
+mac-screen — there's no page to probe). Prefer asserting the specific claims a
+reviewer cares about over narrating them unverified.
+
+### Before/after in one recording (clipy chapter)
+
+\`clipy chapter "<label>"\` marks a section boundary, so one video carries a BEFORE
+and an AFTER — the PR-review shape:
+
+    clipy session start --url http://localhost:3000/settings --title "Overflow fix"
+    clipy mark "sidebar overflows" --assert-selector ".sidebar.is-overflowing"
+    clipy chapter "AFTER — fix applied"
+    # (git switch fix-branch, restart the dev server, reload)
+    clipy mark "sidebar wraps" --assert-selector ".sidebar:not(.is-overflowing)"
+    clipy session stop
+
+### Crash-safe wrapping (clipy session run)
+
+If your driver script crashes, a plain \`session start\` keeps recording dead air to
+\`--max\` and uploads it. \`session run\` guarantees cleanup:
+
+    clipy session run --url http://localhost:3000 --expose-cdp -- node driver.js
+
+It starts the session, runs everything after \`--\` with inherited stdio, then: exit
+0 → \`session stop\` (upload); any non-zero exit or signal → \`session abort\` (discard)
+with the child's exit code propagated. The command runs with \`CLIPY_SESSION=1\` set
+(and \`CLIPY_CDP_URL=<cdpHttpUrl>\` when --expose-cdp). All session-start flags apply
+before the \`--\`.
+
+### Mark timing (backdating + in-page marks)
+
+Each \`clipy mark\` is a process spawn (~100-300ms), so a mark can land slightly after
+the state it describes. Backdate onto the recording clock:
+
+    clipy mark "toast appeared" --ago 2     # 2s before now
+    clipy mark "page loaded" --at 4         # absolute 4s on the recording clock
+
+When you drive over --expose-cdp, emit marks IN-PAGE with zero spawn latency by
+calling the bindings the daemon exposes:
+
+    await page.evaluate(() => window.__clipyMark("clicked Export"));
+    await page.evaluate(() => window.__clipyChapter("AFTER — fix applied"));
+
+(While CDP is exposed the page's own scripts can call these too — same trust model as
+--expose-cdp itself.) \`clipy playwright-path\` prints the node_modules dir to resolve
+Playwright for your driver: \`NODE_PATH=$(clipy playwright-path) node driver.js\`.
 
 ## Record the real Mac screen — a window or a display
 

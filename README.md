@@ -1,9 +1,5 @@
 # @clipy/cli
 
-> This repository is the public mirror of **`@clipy/cli`**. The package is developed in
-> the Clipy monorepo and synced here with each npm release — browse the source or file
-> issues here.
-
 [![npm version](https://img.shields.io/npm/v/%40clipy%2Fcli)](https://www.npmjs.com/package/@clipy/cli)
 [![license: MIT](https://img.shields.io/npm/l/%40clipy%2Fcli)](https://github.com/manovagyanik1/clipy-cli/blob/main/LICENSE)
 [![node >= 18](https://img.shields.io/node/v/%40clipy%2Fcli)](https://www.npmjs.com/package/@clipy/cli)
@@ -73,8 +69,12 @@ clipy wait <id> --for both           # block until transcript/summary are ready
 clipy record --url <app> [--for 15]  # record a web app headlessly → a Clipy recording
 clipy session start --url <app>      # start recording in the background while you work
 clipy mark "reproduced the bug"      # drop a live-timestamped note into the session
+clipy mark "on redemptions" --assert-url '**/redemptions'   # assert what you claim
+clipy chapter "AFTER — fix applied"  # split the recording into before/after sections
+clipy session run --url <app> -- npm run demo   # start, run a command, auto stop/abort
 clipy session stop                   # finish + upload; your marks become the transcript
 clipy doctor                         # health check: key, Mac bridge, Playwright, install mode
+clipy playwright-path                # node_modules dir of the Playwright this CLI resolves
 clipy mcp                            # run the Clipy MCP server (npx -y @clipy/mcp)
 ```
 
@@ -126,6 +126,37 @@ still-compiling dev server's blank screen.
 notes (and session marks, below) as the recording's transcript, summary input, and
 agent-context — clearly marked as agent narration, never passed off as speech-to-text.
 
+### Recording a logged-in app
+
+To record an authenticated SPA, seed the session **before** the browser navigates —
+Clipy applies all of these to the Playwright context ahead of the first page load, so the
+app's route guard sees the auth state on first paint (seeding `localStorage` *after*
+visiting a guarded route loses that race and bounces you to `/login`). These flags apply
+to headless web capture on `record` and `session start`; they're rejected on
+`--source mac-screen` (which records the real, already-logged-in screen).
+
+- `--storage-state <file>` — a Playwright [`storageState`](https://playwright.dev/docs/auth)
+  JSON (cookies + per-origin `localStorage`), passed straight to `browser.newContext()`.
+  The easiest path: log in once with Playwright and save `context.storageState({ path })`,
+  then hand that file to Clipy. Its contents are never printed or logged.
+- `--cookie "name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]"` — set one
+  cookie (repeatable). Without a `Domain` it's scoped to the target URL; with one it's
+  domain-scoped.
+- `--local-storage "key=value"` — set one `localStorage` pair for the target origin
+  (repeatable).
+- `--init-script <file>` — run a JS file in every page before its own scripts (e.g. to
+  stub a feature flag or inject a token).
+
+```bash
+# Reuse a saved Playwright login
+clipy record --url https://app.example.com/dashboard --for 20 \
+  --storage-state ./auth.json
+
+# Or seed a token directly
+clipy record --url https://app.example.com/dashboard \
+  --local-storage "authToken=eyJ…" --cookie "sid=abc; Domain=app.example.com; Secure"
+```
+
 ## Session mode — you work, Clipy records
 
 For recordings where an agent (or you) drives the app live, don't script the capture:
@@ -159,18 +190,119 @@ clipy session start --url http://localhost:3000 --expose-cdp --title "Overflow f
 ```js
 const { chromium } = require("playwright");
 const browser = await chromium.connectOverCDP(cdpHttpUrl); // from `clipy session status --json`
-const page = browser.contexts()[0].pages()[0];             // the page being recorded
-await page.goto("http://localhost:3000/settings");
+const page = browser.contexts()[0].pages()[0];             // the page being recorded (a NEW context is not captured)
+await page.goto("http://localhost:3000/settings");         // navigate / click / fill as usual
+
+// page.viewportSize() is null over a CDP attach — resize via the device-metrics override:
+const cdp = await browser.newCDPSession(page);
+await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });
+
 await browser.close();                                     // detaches; the recording keeps going
 ```
 
-Drive the existing context/page (above) so your actions land in the recording — a brand-new
-context you open won't be captured.
+Four things that otherwise cost a debugging round: attach with `connectOverCDP`; the
+recorded page is `browser.contexts()[0].pages()[0]` (a brand-new context/page you open
+won't be captured); `page.viewportSize()` is `null` on a CDP attach; and a resize needs a
+CDP `Emulation.setDeviceMetricsOverride`, not `setViewportSize`. Your driver script
+resolves Playwright from **its own** directory — if `require("playwright")` can't find it,
+run the script with `NODE_PATH=$(clipy playwright-path) node driver.js`.
+
+**In-page marks (zero spawn latency).** While `--expose-cdp` is on, the daemon also exposes
+`window.__clipyMark("text")` and `window.__clipyChapter("label")` in the recorded page.
+Calling them from your driver (`page.evaluate(() => window.__clipyMark("clicked Export"))`)
+emits a mark or chapter *without* spawning a `clipy mark` process, so it lands exactly when
+your code runs. These marks land in the same transcript and count toward the same 200-mark
+cap. Note: while CDP is exposed the page's **own** scripts can call these too — that's the
+same trust boundary as `--expose-cdp` itself (any local process can already drive the
+browser), so only enable it when you intend to drive the session.
+
+`session start` also accepts the same auth flags as `record`
+(`--storage-state` / `--cookie` / `--local-storage` / `--init-script`) to record a
+logged-in app; see [Recording a logged-in app](#recording-a-logged-in-app).
 
 Safety rails are built in: the session **auto-stops and uploads** at `--max <sec>`
 (default 600, hard cap 1800) so a forgotten session can never run away; `clipy session
 abort` discards everything; a crashed daemon is detected and cleared on the next command;
 corrupt captures are refused before upload, and a failed upload keeps the local file.
+
+### Assertion marks — recordings as evidence
+
+A plain mark is an unverified claim: an agent can write `clipy mark "the Redemptions
+tab is active"` whether or not it is, and the transcript reads as authoritative either
+way. Assertion marks fix that. The recording daemon owns the live Playwright page, so it
+can **check the claim against the real DOM** and annotate the mark with what it actually
+observed — a false claim can't pass as fact.
+
+```bash
+# Assert a URL (globs: ** = anything, * = any non-slash segment, no * = substring)
+clipy mark "opened the redemptions tab" --assert-url "**/redemptions"
+
+# Assert an element exists and contains text
+clipy mark "status flipped to Active" --assert-selector ".status-badge" --assert-text "Active"
+```
+
+- **Pass** → the mark is stored as `status flipped to Active [assert ✓ .status-badge="Active"]`
+  and the CLI prints a green `✓`.
+- **Fail** → it's stored as
+  `status flipped to Active [ASSERT ✗ expected "Active"; observed .status-badge="Pending"]`
+  and the CLI prints a red `✗`. The wrong claim is preserved *as a failed assertion*, not
+  as a fact.
+
+`--assert-selector <css>` checks an element matches (its trimmed text becomes the
+`observed` value); `--assert-text <substr>` requires that element's text to contain a
+substring (it needs a selector); `--assert-url <glob>` matches the page URL. Combine them
+freely — all provided checks must pass.
+
+`--fail-mode` decides what a failed assertion does: `warn` (default) records the `✗` and
+keeps recording; **`abort` discards the whole session** — nothing is uploaded and the CLI
+exits non-zero, so a driver that asserts its way to a broken state doesn't ship a misleading
+clip. If any assertions ran, a leading `[verification] N assertion(s): P passed, F failed`
+note is prepended at 0 ms, so the transcript and the `.md` context open with the scorecard.
+
+Assertions evaluate against a real page, so they need a **web** session (they're rejected on
+`--source mac-screen`, which records the real screen with no page to probe).
+
+### Before/after in one recording — `clipy chapter`
+
+`clipy chapter "<label>"` drops a section boundary so a single video can carry both a
+BEFORE and an AFTER state — exactly the shape of a PR-review recording:
+
+```bash
+clipy session start --url http://localhost:3000/settings --title "Sidebar overflow fix"
+# … demo the bug on the base branch …
+clipy mark "sidebar overflows on mobile" --assert-selector ".sidebar.is-overflowing"
+clipy chapter "AFTER — fix applied"
+# … git switch fix-branch, restart the dev server, reload …
+clipy mark "sidebar wraps correctly" --assert-selector ".sidebar:not(.is-overflowing)"
+clipy session stop
+```
+
+### `session run` — crash-safe wrapping
+
+If a driver script crashes mid-session, a plain `session start` keeps recording dead air
+up to `--max` and then uploads it. `session run` wraps a command so cleanup is guaranteed:
+
+```bash
+clipy session run --url http://localhost:3000 --expose-cdp -- node driver.js
+```
+
+It starts the session, runs everything after `--` with inherited stdio, and then: **exit 0
+→ `session stop`** (upload + share link); **any non-zero exit or a signal → `session abort`**
+(discard) and the child's exit code is propagated. The command runs with `CLIPY_SESSION=1`
+in its environment (and `CLIPY_CDP_URL=<cdpHttpUrl>` when `--expose-cdp` is set, so the
+driver knows where to attach). `Ctrl-C` is forwarded to the child, then the session is
+discarded. All the `session start` flags (`--url`, `--title`, `--max`, `--type`,
+`--expose-cdp`, auth flags) apply before the `--`.
+
+### Backdating a mark
+
+Each `clipy mark` is a short process spawn (~100–300 ms), so a mark can land slightly after
+the state it describes. Backdate it onto the recording clock:
+
+```bash
+clipy mark "the toast appeared" --ago 2     # 2 seconds before now
+clipy mark "page finished loading" --at 4   # at an absolute 4s on the recording clock
+```
 
 ## Record the real screen — a window, a display (Mac)
 
@@ -196,8 +328,12 @@ clipy session stop                              # uploads, prints the share link
 
 ## Scripting
 
-`--json` prints the raw API response for `list`, `search`, `show`, `transcript`,
-`summary`, `moments`, and `wait`:
+Every command has machine-readable output. `--json` is supported on **`list`, `search`,
+`show`, `transcript`, `summary`, `moments`, `wait`, `record`, `session start/stop/status`,
+`mark`, `chapter`, `doctor`, and `playwright-path`** — stdout is the JSON payload, stderr is progress
+and hints, and errors exit non-zero with a message on stderr prefixed `error:`. For the
+full capability manifest (every command, flag, env var, and exit code) run
+`clipy guide --json`.
 
 ```bash
 # Newest recording's id
@@ -205,6 +341,9 @@ clipy list -n 1 --json | jq -r '.recordings[0].id'
 
 # Export subtitles for a recording
 clipy transcript 3kelcef8wo8h --srt > recording.srt
+
+# Record headlessly and capture the share link
+clipy record --url http://localhost:3000 --for 20 --json | jq -r '.shareUrl'
 
 # Record with anything, then block until Clipy finished transcribing
 clipy wait 3kelcef8wo8h --for both && clipy summary 3kelcef8wo8h

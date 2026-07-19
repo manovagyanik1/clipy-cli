@@ -14,7 +14,7 @@
  */
 
 import { parseArgs } from "node:util";
-import { appendFileSync, closeSync, createWriteStream, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { appendFileSync, closeSync, createWriteStream, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -25,6 +25,7 @@ import { pipeline } from "node:stream/promises";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { CLIPY_SKILL_MD } from "./skill.js";
 import { browserLogin, shouldUseManualLogin, type BrowserLoginResult } from "./browserLogin.js";
 import {
@@ -382,6 +383,13 @@ ${c.bold("RECORD")} ${c.dim("(needs an API key with the \"ingest\" permission)")
                       notes become the transcript
     --width/--height  Viewport + video size (default 1280×720)
     --wait            Block until the transcript is ready before printing
+    --json            Print {id, shareUrl, contextUrl, sizeBytes}
+    ${c.dim("auth (headless web capture only) — seed a logged-in session BEFORE the")}
+    ${c.dim("first navigation, so an app's route guard sees it (never on --source mac-screen):")}
+    --storage-state <f>   Playwright storageState JSON (cookies + localStorage)
+    --cookie "n=v[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]"  (repeatable)
+    --local-storage "k=v" Seed a localStorage pair for the target origin (repeatable)
+    --init-script <f>     Run a JS file before every page load
 
 ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session per directory)")}
   ${c.dim("--source mac-screen on record/session records the REAL screen via the")}
@@ -397,9 +405,27 @@ ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session
                                     the recording kind (see record). --expose-cdp
                                     opens a CDP endpoint so your tools can drive the
                                     page as it records (off by default; any local
-                                    process could attach — CLIPY_DISABLE_CDP=1 forces off)
-  mark "<what just happened>"       Drop a live timestamped note; marks become
-                                    the recording's transcript chapters
+                                    process could attach — CLIPY_DISABLE_CDP=1 forces off).
+                                    Accepts the same auth flags as record
+                                    (--storage-state/--cookie/--local-storage/--init-script)
+                                    and --json (returns cdpUrl/cdpHttpUrl)
+  session run [start flags] -- <command …>
+                                    Start a session, run the command (inherited
+                                    stdio), then GUARANTEE cleanup: exit 0 uploads,
+                                    any non-zero exit or signal discards and
+                                    propagates the code. Sets CLIPY_SESSION=1 (+
+                                    CLIPY_CDP_URL with --expose-cdp). Crash-safe
+                                    wrapper for driver scripts — no dead-air uploads.
+  mark "<what just happened>"       Drop a live timestamped note; marks become the
+                                    recording's transcript. Verify what you claim:
+    --assert-selector <css>         assert an element exists (observed text recorded)
+    --assert-text <substr>          require that element's text to contain <substr>
+    --assert-url <glob>             assert the page URL matches (**/* wildcards)
+    --fail-mode warn|abort          warn (default) annotates ASSERT ✗; abort
+                                    discards the whole session on a failed assertion
+    --at <sec> | --ago <sec>        backdate the mark (absolute / N seconds ago)
+  chapter "<label>"                 Split the recording into BEFORE/AFTER sections
+                                    (demo base → chapter "AFTER" → demo the fix)
   session stop                      Finish: close browser, upload, print link
   session abort                     Discard the session — nothing is uploaded
   session status                    Show the active session's state
@@ -413,6 +439,9 @@ ${c.bold("AGENTS")}
                                     Playwright, and install mode — with fix hints
   guide --json                      Machine-readable manifest: every command,
                                     flag, env var, and exit code
+  playwright-path [--json]          Print the node_modules dir of the Playwright
+                                    this CLI resolves, for your own driver scripts:
+                                    ${c.dim("NODE_PATH=$(clipy playwright-path) node driver.js")}
   transcript <id> --replace <file>  Replace a transcript with agent-authored
                                     JSON ({segments} or {plaintext}); regenerates
                                     the summary ${c.dim("(needs the \"ingest\" permission)")}
@@ -421,7 +450,9 @@ ${c.bold("AGENTS")}
 ${c.bold("GLOBAL FLAGS")}
   --key <key>       API key for this invocation (else CLIPY_API_KEY, else stored login)
   --api-url <url>   API base (else CLIPY_API_URL, default https://clipy.online)
-  --json            Machine-readable output (list/search/show/transcript/summary/moments/wait)
+  --json            Machine-readable output. Supported on: list, search, show,
+                    transcript, summary, moments, wait, record, session
+                    start/stop/status, mark, chapter, doctor, playwright-path
   -v, --version     Print version
 
 ${c.bold("EXIT CODES")}
@@ -1059,7 +1090,18 @@ async function doctorBridgeChecks(): Promise<DoctorCheck[]> {
 async function doctorPlaywrightCheck(): Promise<DoctorCheck> {
   const res = await resolvePlaywright();
   if (res.ok) {
-    return { name: "playwright", status: "pass", detail: `resolved via ${res.source}`, data: { source: res.source } };
+    // "PASS" here only means Clipy can load Playwright — NOT that the user's own
+    // --expose-cdp driver script will, since it resolves from a different cwd.
+    // Report where we found it, and always hand back the NODE_PATH escape hatch.
+    const nodeModulesDir = res.path ? nodeModulesDirOf(res.path) : null;
+    return {
+      name: "playwright",
+      status: "pass",
+      detail: `resolved via ${res.source}${res.path ? ` (${res.path})` : ""}`,
+      hint:
+        "your own scripts (e.g. --expose-cdp drivers) resolve Playwright independently — from another directory `require('playwright')` can fail; run them with NODE_PATH=$(clipy playwright-path) or install Playwright there",
+      data: { source: res.source, path: res.path ?? null, nodeModulesDir },
+    };
   }
   const { mode } = detectInstallMode();
   return {
@@ -1281,10 +1323,33 @@ interface PwPage {
   close(): Promise<void>;
   on(event: string, handler: (arg: never) => void): unknown;
   mouse: { wheel(deltaX: number, deltaY: number): Promise<void> };
+  url(): string;
+  // Evaluate in the page — used by assertion marks. Kept generic + loose so the
+  // CLI typechecks without Playwright's real types installed.
+  evaluate<R, A = unknown>(fn: (arg: A) => R, arg?: A): Promise<R>;
 }
 interface PwContext {
   newPage(): Promise<PwPage>;
+  // Both run before any page script — that's what lets a logged-in SPA's route
+  // guard see cookies/localStorage on first paint (see the auth-capture note).
+  addInitScript(script: { path?: string; content?: string }): Promise<void>;
+  addCookies(cookies: PwCookie[]): Promise<void>;
+  // Publishes window.<name>(...) in every page — used (only under --expose-cdp)
+  // to let an in-page CDP driver emit marks/chapters with zero spawn latency.
+  exposeBinding(name: string, cb: (source: unknown, ...args: unknown[]) => unknown): Promise<void>;
   close(): Promise<void>;
+}
+// Playwright's cookie shape — either url-scoped ({name,value,url}) or
+// domain-scoped ({name,value,domain,path,…}); addCookies accepts both.
+interface PwCookie {
+  name: string;
+  value: string;
+  url?: string;
+  domain?: string;
+  path?: string;
+  secure?: boolean;
+  httpOnly?: boolean;
+  sameSite?: "Strict" | "Lax" | "None";
 }
 interface PwBrowser {
   newContext(opts: Record<string, unknown>): Promise<PwContext>;
@@ -1304,7 +1369,7 @@ interface PwChromium {
 type InstallMode = "npx" | "global" | "local" | "unknown";
 
 type PlaywrightResolution =
-  | { ok: true; chromium: PwChromium; source: string }
+  | { ok: true; chromium: PwChromium; source: string; path?: string }
   | { ok: false; source: null; error: string };
 
 /** Pull `chromium` out of a dynamically-imported Playwright module. A bare
@@ -1322,7 +1387,17 @@ async function resolvePlaywright(): Promise<PlaywrightResolution> {
   for (const mod of ["playwright", "playwright-core"]) {
     try {
       const chromium = chromiumFrom(await import(mod));
-      if (chromium) return { ok: true, chromium, source: `import('${mod}')` };
+      if (chromium) {
+        // A bare import doesn't tell us WHERE it loaded from; ask the resolver
+        // for the absolute entry path so doctor/playwright-path can report it.
+        let path: string | undefined;
+        try {
+          path = createRequire(import.meta.url).resolve(mod);
+        } catch {
+          // resolved as a module but not to a concrete file path — leave unknown
+        }
+        return { ok: true, chromium, source: `import('${mod}')`, path };
+      }
     } catch {
       // try the next strategy
     }
@@ -1335,7 +1410,7 @@ async function resolvePlaywright(): Promise<PlaywrightResolution> {
       const requireFromCwd = createRequire(join(process.cwd(), "package.json"));
       const resolved = requireFromCwd.resolve(mod);
       const chromium = chromiumFrom(await import(pathToFileURL(resolved).href));
-      if (chromium) return { ok: true, chromium, source: `${mod} at ${dirname(resolved)}` };
+      if (chromium) return { ok: true, chromium, source: `${mod} at ${dirname(resolved)}`, path: resolved };
     } catch {
       // fall through to the miss
     }
@@ -1351,7 +1426,16 @@ async function resolvePlaywright(): Promise<PlaywrightResolution> {
  *  npx runs from an isolated `_npx` cache; a global bin lives outside cwd; a
  *  project-local install sits under cwd/node_modules. */
 function detectInstallMode(): { mode: InstallMode; argv1: string } {
-  const argv1 = process.argv[1] ? resolve(process.argv[1]) : "";
+  const raw = process.argv[1] ? resolve(process.argv[1]) : "";
+  // nvm/npm global bins are SYMLINKS (…/bin/clipy → …/lib/node_modules/@clipy/cli/dist/index.js).
+  // Match against the REAL path or every global install misreports as
+  // "unknown (running from source?)"; fall back to the raw path on a broken link.
+  let argv1 = raw;
+  try {
+    if (raw) argv1 = realpathSync(raw);
+  } catch {
+    // dangling/permission-denied symlink — keep the raw path
+  }
   const norm = argv1.replace(/\\/g, "/");
   const cwd = resolve(process.cwd()).replace(/\\/g, "/");
   let mode: InstallMode = "unknown";
@@ -1359,6 +1443,17 @@ function detectInstallMode(): { mode: InstallMode; argv1: string } {
   else if (norm.startsWith(`${cwd}/`) && /\/node_modules\//.test(norm)) mode = "local";
   else if (/\/node_modules\//.test(norm)) mode = "global";
   return { mode, argv1 };
+}
+
+/** From a resolved package entry file, the node_modules DIRECTORY that contains
+ *  it — the substring up to and including the last "node_modules" segment — so
+ *  `NODE_PATH=$(clipy playwright-path) node driver.js` can require playwright.
+ *  Returns null when the entry isn't under a node_modules dir (linked/monorepo). */
+function nodeModulesDirOf(entryPath: string): string | null {
+  // \\→/ is a 1:1 char swap, so the index is valid against the original string.
+  const idx = entryPath.replace(/\\/g, "/").lastIndexOf("/node_modules");
+  if (idx < 0) return null;
+  return entryPath.slice(0, idx + "/node_modules".length);
 }
 
 /** One-line install hint keyed to the install mode (the `doctor` ↳ line). For
@@ -1408,6 +1503,37 @@ async function loadChromium(): Promise<PwChromium> {
   const res = await resolvePlaywright();
   if (res.ok) return res.chromium;
   die(playwrightMissingMessage(detectInstallMode().mode));
+}
+
+/** `clipy playwright-path` — print the node_modules DIRECTORY holding the
+ *  Playwright this CLI resolves, so a user's own driver script can find the same
+ *  copy: `NODE_PATH=$(clipy playwright-path) node driver.js`. Exits non-zero
+ *  (empty stdout) if Playwright is unresolvable, so the command substitution
+ *  fails loudly rather than handing NODE_PATH a bogus value. */
+async function cmdPlaywrightPath(json: boolean): Promise<void> {
+  const res = await resolvePlaywright();
+  if (!res.ok) {
+    if (json) {
+      printJson({ path: null, nodeModulesDir: null, source: null });
+      process.exitCode = 1;
+      return;
+    }
+    die(`${res.error}\n${playwrightInstallHint(detectInstallMode().mode)}`, 1);
+  }
+  const nodeModulesDir = res.path ? nodeModulesDirOf(res.path) : null;
+  if (json) {
+    printJson({ path: res.path ?? null, nodeModulesDir, source: res.source });
+    if (!nodeModulesDir) process.exitCode = 1;
+    return;
+  }
+  if (!nodeModulesDir) {
+    die(
+      `Playwright resolved${res.path ? ` at ${res.path}` : ""} but not from a node_modules directory — ` +
+        `NODE_PATH can't point at it; install Playwright in your script's project instead`,
+      1,
+    );
+  }
+  process.stdout.write(`${nodeModulesDir}\n`);
 }
 
 // --- Narration + shared upload plumbing (used by record AND session mode) ---
@@ -1754,6 +1880,153 @@ async function waitForFirstPaint(
   return waited;
 }
 
+// --- Auth capture (--storage-state / --init-script / --cookie / --local-storage)
+// Seed a logged-in session into the headless browser BEFORE it navigates.
+// Recording an authenticated SPA otherwise loses a race: seeding localStorage
+// AFTER visiting a guarded route lets the app's route guard redirect to a login
+// page before storage exists. Playwright's storageState + init scripts + cookies
+// all take effect before any page script, which structurally avoids that.
+// The parent CLI validates these up front (fast, clear errors) and the raw specs
+// ride RecordOpts/SessionState so the detached daemon — a separate process that
+// re-reads state from disk — can re-parse and apply them itself.
+
+interface AuthCapture {
+  storageStatePath?: string;
+  initScriptPath?: string;
+  cookieSpecs: string[];
+  localStorageSpecs: string[];
+}
+
+/** Parse one `--cookie` value into a Playwright cookie. Grammar:
+ *  `name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]`. The first
+ *  `;`-segment is name=value (split on the first `=`); later segments are
+ *  case-insensitive attributes. Without a Domain we url-scope the cookie to the
+ *  target; with one we domain-scope it. Throws on a malformed spec so the parent
+ *  can turn it into a die(2). */
+function parseCookieSpec(spec: string, targetUrl: string): PwCookie {
+  const segments = spec.split(";").map((s) => s.trim()).filter(Boolean);
+  if (segments.length === 0) throw new Error(`--cookie "${spec}" is empty`);
+  const eq = segments[0].indexOf("=");
+  if (eq < 1) throw new Error(`--cookie "${spec}" must start with name=value`);
+  const name = segments[0].slice(0, eq).trim();
+  const value = segments[0].slice(eq + 1).trim();
+  if (!name) throw new Error(`--cookie "${spec}" has an empty name`);
+  let domain: string | undefined;
+  let path: string | undefined;
+  let secure = false;
+  let httpOnly = false;
+  let sameSite: "Strict" | "Lax" | "None" | undefined;
+  for (const seg of segments.slice(1)) {
+    const aEq = seg.indexOf("=");
+    const attr = (aEq >= 0 ? seg.slice(0, aEq) : seg).trim().toLowerCase();
+    const aVal = aEq >= 0 ? seg.slice(aEq + 1).trim() : "";
+    switch (attr) {
+      case "domain": domain = aVal; break;
+      case "path": path = aVal; break;
+      case "secure": secure = true; break;
+      case "httponly": httpOnly = true; break;
+      case "samesite": {
+        const s = aVal.toLowerCase();
+        sameSite = s === "strict" ? "Strict" : s === "none" ? "None" : "Lax";
+        break;
+      }
+      default:
+        throw new Error(
+          `--cookie "${spec}": unknown attribute "${attr}" (accepted: Domain, Path, Secure, HttpOnly, SameSite)`,
+        );
+    }
+  }
+  if (domain) {
+    return { name, value, domain, path: path || "/", secure, httpOnly, ...(sameSite ? { sameSite } : {}) };
+  }
+  return { name, value, url: targetUrl };
+}
+
+/** Parse one `--local-storage` value ("key=value"; value may be empty). */
+function parseLocalStorageSpec(spec: string): [string, string] {
+  const eq = spec.indexOf("=");
+  if (eq < 1) throw new Error(`--local-storage "${spec}" must be key=value`);
+  return [spec.slice(0, eq), spec.slice(eq + 1)];
+}
+
+/** The single init script that seeds localStorage. Each pair is origin-guarded
+ *  so it never leaks into an unexpected origin the page might navigate to, and
+ *  runs before page scripts so route guards see the storage on first paint. */
+function localStorageInitScript(pairs: [string, string][], origin: string): string {
+  return pairs
+    .map(
+      ([k, v]) =>
+        `if (location.origin === ${JSON.stringify(origin)}) localStorage.setItem(${JSON.stringify(k)}, ${JSON.stringify(v)});`,
+    )
+    .join("\n");
+}
+
+/** Validate the auth-capture flags in the PARENT process — before launching a
+ *  browser or daemonizing — so an agent gets an instant, precise usage error
+ *  instead of a cryptic daemon-log failure. NEVER prints the storage-state
+ *  contents: it holds live credentials; only a shape warning is emitted. */
+function validateAuthCapture(auth: AuthCapture, targetUrl: string): void {
+  if (auth.storageStatePath) {
+    let raw: string;
+    try {
+      raw = readFileSync(auth.storageStatePath, "utf8");
+    } catch {
+      die(`--storage-state file not found or unreadable: ${auth.storageStatePath}`, 2);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      die(`--storage-state is not valid JSON: ${auth.storageStatePath}`, 2);
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      die(`--storage-state must be a Playwright storageState JSON object: ${auth.storageStatePath}`, 2);
+    }
+    if (!("cookies" in parsed) && !("origins" in parsed)) {
+      process.stderr.write(
+        `${c.yellow("warning:")} --storage-state has neither "cookies" nor "origins" — it may not be a Playwright storageState file\n`,
+      );
+    }
+  }
+  if (auth.initScriptPath) {
+    try {
+      statSync(auth.initScriptPath);
+    } catch {
+      die(`--init-script file not found: ${auth.initScriptPath}`, 2);
+    }
+  }
+  // Parse the cookie / local-storage specs now purely to surface grammar errors
+  // up front; the values are re-parsed where they're applied.
+  for (const spec of auth.cookieSpecs) {
+    try {
+      parseCookieSpec(spec, targetUrl);
+    } catch (e) {
+      die((e as Error).message, 2);
+    }
+  }
+  for (const spec of auth.localStorageSpecs) {
+    try {
+      parseLocalStorageSpec(spec);
+    } catch (e) {
+      die((e as Error).message, 2);
+    }
+  }
+}
+
+/** Apply cookies, seeded localStorage, and the user init script to a freshly
+ *  created context, in that order, BEFORE newPage()/goto. --storage-state is
+ *  applied by the caller at newContext() time (Playwright takes the file path
+ *  directly), not here. Re-parses the raw specs the parent already validated. */
+async function applyAuthCapture(context: PwContext, auth: AuthCapture, targetUrl: string): Promise<void> {
+  const cookies = auth.cookieSpecs.map((s) => parseCookieSpec(s, targetUrl));
+  if (cookies.length) await context.addCookies(cookies);
+  const pairs = auth.localStorageSpecs.map(parseLocalStorageSpec);
+  if (pairs.length) {
+    await context.addInitScript({ content: localStorageInitScript(pairs, new URL(targetUrl).origin) });
+  }
+  if (auth.initScriptPath) await context.addInitScript({ path: auth.initScriptPath });
+}
+
 interface RecordOpts {
   url: string;
   forSec: number;
@@ -1766,6 +2039,7 @@ interface RecordOpts {
   height: number;
   wait: boolean;
   json: boolean;
+  auth: AuthCapture;
 }
 
 async function cmdRecord(ctx: Ctx, opts: RecordOpts): Promise<void> {
@@ -1780,6 +2054,7 @@ async function cmdRecord(ctx: Ctx, opts: RecordOpts): Promise<void> {
   if (target.protocol !== "http:" && target.protocol !== "https:") {
     die(`--url must be http(s), got ${target.protocol}`, 2);
   }
+  validateAuthCapture(opts.auth, target.href); // usage errors (exit 2) before auth/browser
   requireKey(ctx); // fail fast before we spin up a browser
 
   const chromium = await loadChromium();
@@ -1833,7 +2108,11 @@ async function cmdRecord(ctx: Ctx, opts: RecordOpts): Promise<void> {
       const context = await browser.newContext({
         viewport: { width: frame.width, height: frame.height },
         recordVideo: { dir: tmpDir, size: frame },
+        // Playwright takes the storageState file path directly (cookies + origins).
+        ...(opts.auth.storageStatePath ? { storageState: opts.auth.storageStatePath } : {}),
       });
+      // Seed cookies/localStorage/init-script before the first navigation.
+      await applyAuthCapture(context, opts.auth, target.href);
       const page = await context.newPage();
       // captureStart is set AFTER the first meaningful paint (below), so notes
       // and pass marks aren't anchored to the blank t=0 a compiling app shows.
@@ -1993,6 +2272,14 @@ interface SessionState {
   /** Opt-in (via --expose-cdp): only then does the daemon launch a debugging
    *  port. The env kill switch CLIPY_DISABLE_CDP=1 overrides it in the daemon. */
   exposeCdp?: boolean;
+  /** Auth-capture flags (web sessions). The daemon is a separate process that
+   *  re-reads this file, so the RAW specs ride here and it re-parses + applies
+   *  them to its context (storage-state as a file path, cookies + init scripts).
+   *  --storage-state can point at a credentials file, hence this file's 0600. */
+  storageStatePath?: string;
+  initScriptPath?: string;
+  cookieSpecs?: string[];
+  localStorageSpecs?: string[];
   state:
     | "starting"
     | "recording"
@@ -2008,6 +2295,14 @@ interface SessionState {
    *  is the http base — both accepted by playwright.connectOverCDP(). */
   cdpUrl?: string;
   cdpHttpUrl?: string;
+  /** Local control endpoint the web daemon serves (127.0.0.1, OS-assigned port,
+   *  bearer-token auth). `clipy mark`/`chapter` POST to it so the daemon — which
+   *  owns the live Playwright page — can evaluate assertions and stamp marks with
+   *  its own clock. Token is a random UUID; the file's 0600 mode keeps it owner-
+   *  only. Absent ⇒ pre-0.6 session or the server couldn't bind (marks fall back
+   *  to the marks file). */
+  controlPort?: number;
+  controlToken?: string;
   error?: string;
   /** On upload failure the capture is preserved here instead of deleted. */
   keptVideoPath?: string;
@@ -2075,6 +2370,140 @@ function cleanupSessionFiles(state: SessionState, file: string): void {
       // best-effort
     }
   }
+}
+
+// --- Assertion-backed marks -------------------------------------------------
+// A mark can carry an assertion the daemon evaluates against its LIVE Playwright
+// page, so the note is evidence rather than an unverified claim. The parsed
+// spec rides the HTTP /mark call; the daemon annotates the mark text with the
+// outcome (✓ / ✗ + what it actually observed) so a false claim cannot read as
+// fact in the transcript. `failMode: "abort"` discards the whole session on a
+// failed assertion (no upload) — the CLI reports it loudly.
+
+interface MarkAssert {
+  selector?: string;
+  expectText?: string;
+  urlGlob?: string;
+  failMode: "warn" | "abort";
+}
+
+/** Compile a URL glob to a RegExp: `**` → `.*`, a lone `*` → `[^/]*`, every
+ *  other regex metachar escaped. A glob with NO `*` is treated as a bare
+ *  substring match (the common "is this path in the URL" case). */
+function urlGlobMatches(glob: string, url: string): boolean {
+  if (!glob.includes("*")) return url.includes(glob);
+  // Escape regex metachars, then restore the glob wildcards. \x00 is a private
+  // placeholder so `**` isn't clobbered while we expand single `*`.
+  const escaped = glob
+    .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*/g, "\x00")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\x00/g, ".*");
+  try {
+    return new RegExp(`^${escaped}$`).test(url);
+  } catch {
+    return url.includes(glob.replace(/\*/g, ""));
+  }
+}
+
+/** POST to the web daemon's local control endpoint with the bearer token.
+ *  Throws on connection failure / non-2xx (the caller decides whether to fall
+ *  back to the marks file or die). */
+async function postToControl(
+  state: SessionState,
+  path: string,
+  body: unknown,
+  timeoutMs: number,
+): Promise<Json> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${state.controlPort}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${state.controlToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body ?? {}),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let parsed: Json = {};
+    try {
+      parsed = text ? (JSON.parse(text) as Json) : {};
+    } catch {
+      parsed = { raw: text };
+    }
+    if (!res.ok) {
+      throw new Error(
+        typeof parsed.error === "string" ? parsed.error : `control endpoint error ${res.status}`,
+      );
+    }
+    return parsed;
+  } catch (e) {
+    if ((e as Error).name === "AbortError") throw new Error(`control endpoint timed out after ${timeoutMs / 1000}s`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+interface AssertOutcome {
+  passed: boolean;
+  observed: string;
+  expected: string;
+}
+
+/** Evaluate an assertion against the daemon's live page. Wraps the single
+ *  page.evaluate in a 5s race so an unresponsive page throws (a caught error the
+ *  caller turns into a 5xx) instead of hanging the daemon. A selector that
+ *  simply doesn't match is a normal FAIL, not an error. */
+async function evaluateAssertion(page: PwPage, assert: MarkAssert): Promise<AssertOutcome> {
+  const expected: string[] = [];
+  const observed: string[] = [];
+  let passed = true;
+
+  if (assert.urlGlob) {
+    const url = page.url();
+    expected.push(`url~"${assert.urlGlob}"`);
+    observed.push(`url=${url}`);
+    if (!urlGlobMatches(assert.urlGlob, url)) passed = false;
+  }
+
+  if (assert.selector) {
+    const sel = assert.selector;
+    // Runs in the browser; typed locally so the CLI needs no DOM lib to build.
+    const lookup = page.evaluate((s: string) => {
+      const doc = (globalThis as unknown as {
+        document?: { querySelector(sel: string): { textContent: string | null } | null };
+      }).document;
+      const el = doc?.querySelector(s);
+      if (!el) return { match: false as const };
+      const raw = (el.textContent ?? "").trim().replace(/\s+/g, " ");
+      return { match: true as const, text: raw.slice(0, 200) };
+    }, sel);
+    const result = await Promise.race([
+      lookup,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("page did not respond within 5s")), 5000),
+      ),
+    ]);
+    if (!result.match) {
+      passed = false;
+      expected.push(assert.expectText ? `${sel} containing "${assert.expectText}"` : `${sel} present`);
+      observed.push(`${sel}=no match`);
+    } else {
+      observed.push(`${sel}=${result.text ? `"${result.text}"` : "(empty)"}`);
+      if (assert.expectText != null && assert.expectText !== "") {
+        expected.push(`"${assert.expectText}"`);
+        if (!result.text.includes(assert.expectText)) passed = false;
+      } else {
+        expected.push(`${sel} present`);
+      }
+    }
+  }
+
+  return { passed, observed: observed.join("; "), expected: expected.join("; ") };
 }
 
 // --- Mac bridge flows (--source mac-screen): the desktop app records -------
@@ -2189,6 +2618,24 @@ function bridgeInfoFromSession(state: SessionState): BridgeInfo {
   };
 }
 
+/** The ready-to-run Playwright snippet printed after `session start --expose-cdp`.
+ *  Encodes the four gotchas that otherwise cost an agent a debugging round:
+ *  use connectOverCDP; the recorded page is contexts()[0].pages()[0] (a fresh
+ *  context/page is NOT the one being recorded); viewportSize() is null over CDP;
+ *  and a resize needs a CDP Emulation.setDeviceMetricsOverride, not setViewportSize. */
+function cdpDriverSnippet(cdpHttpUrl: string): string {
+  return [
+    `${c.dim("drive the recorded page with your own Playwright:")}`,
+    c.dim(`  const { chromium } = require('playwright');`),
+    c.dim(`  const browser = await chromium.connectOverCDP(${JSON.stringify(cdpHttpUrl)});`),
+    c.dim(`  const page = browser.contexts()[0].pages()[0];   // the page being recorded (a NEW context/page is not captured)`),
+    c.dim(`  await page.goto('https://…');                     // navigate / click / fill as usual`),
+    c.dim(`  const cdp = await browser.newCDPSession(page);    // page.viewportSize() is null over CDP —`),
+    c.dim(`  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });`),
+    c.dim(`  resolve playwright for your script: NODE_PATH=$(clipy playwright-path) node driver.js`),
+  ].join("\n");
+}
+
 async function cmdSessionStart(
   ctx: Ctx,
   opts: {
@@ -2204,6 +2651,7 @@ async function cmdSessionStart(
     window?: string;
     display?: string;
     exposeCdp?: boolean;
+    auth: AuthCapture;
   },
 ): Promise<void> {
   if (opts.source === "mac-screen") {
@@ -2252,6 +2700,7 @@ async function cmdSessionStart(
   if (target.protocol !== "http:" && target.protocol !== "https:") {
     die(`--url must be http(s), got ${target.protocol}`, 2);
   }
+  validateAuthCapture(opts.auth, target.href); // usage errors (exit 2) before auth/daemonizing
   const key = requireKey(ctx);
   await loadChromium(); // fail fast with install instructions before daemonizing
 
@@ -2281,6 +2730,10 @@ async function cmdSessionStart(
     width: opts.width,
     height: opts.height,
     exposeCdp: opts.exposeCdp,
+    storageStatePath: opts.auth.storageStatePath,
+    initScriptPath: opts.auth.initScriptPath,
+    cookieSpecs: opts.auth.cookieSpecs.length ? opts.auth.cookieSpecs : undefined,
+    localStorageSpecs: opts.auth.localStorageSpecs.length ? opts.auth.localStorageSpecs : undefined,
     state: "starting",
     marksPath: join(dir, `marks-${id}.jsonl`),
     controlPath: join(dir, `control-${id}.json`),
@@ -2335,9 +2788,9 @@ async function cmdSessionStart(
   process.stdout.write(`${c.green("✓")} recording ${c.bold(target.href)} (max ${maxSec}s)\n`);
   if (started?.cdpHttpUrl) {
     process.stdout.write(
-      `${c.yellow("⚠ CDP exposed:")} any local process can attach to and control this browser while the session runs.\n` +
-        `${c.dim(`drive the browser: connect your tools to ${started.cdpHttpUrl}`)}\n`,
+      `${c.yellow("⚠ CDP exposed:")} any local process can attach to and control this browser while the session runs.\n`,
     );
+    process.stdout.write(`${cdpDriverSnippet(started.cdpHttpUrl)}\n`);
   } else if (opts.exposeCdp) {
     // Asked for it, but it isn't up — either env-disabled or discovery failed.
     process.stdout.write(
@@ -2363,9 +2816,41 @@ function requireSession(): { file: string; state: SessionState } {
   return { file, state };
 }
 
-async function cmdMark(text: string, json: boolean): Promise<void> {
+/** Print a /mark or /chapter control response (or a file-fallback shape). A
+ *  failed assertion prints a red ✗; everything else a green ✓. The mark text is
+ *  already annotated daemon-side, so it carries the ✓/✗ + observed inline. */
+function printMarkResult(res: Json, json: boolean): void {
+  if (json) {
+    printJson(res);
+    return;
+  }
+  const sec = (Number(res.tMs ?? 0) / 1000).toFixed(1);
+  const assert = res.assert as { passed?: boolean } | undefined;
+  const glyph = assert && assert.passed === false ? c.red("✗") : c.green("✓");
+  process.stdout.write(`${glyph} mark @ ${sec}s — ${String(res.text ?? "")}\n`);
+}
+
+interface MarkOpts {
+  atSec?: number;
+  agoSec?: number;
+  assert?: MarkAssert;
+}
+
+async function cmdMark(text: string, json: boolean, opts: MarkOpts): Promise<void> {
   const { file, state } = requireSession();
+  const hasAssert = !!opts.assert;
+  const backdated = opts.atSec != null || opts.agoSec != null;
+
   if (state.kind === "mac") {
+    // The Mac app records the real screen — there is no page to probe, and the
+    // bridge stamps every mark on its own clock, so assertions and backdating
+    // are web-session features.
+    if (hasAssert) {
+      die("assertions need a web session — the Mac app records the real screen; there is no page to probe", 2);
+    }
+    if (backdated) {
+      die("--at/--ago need a web session — the Mac bridge stamps each mark on its own clock", 2);
+    }
     const result = await bridgeRequest(bridgeInfoFromSession(state), "mark", { text }).catch(
       (e: Error) => {
         if (e instanceof BridgeUnavailableError) {
@@ -2391,14 +2876,113 @@ async function cmdMark(text: string, json: boolean): Promise<void> {
   if (state.state !== "recording" || !state.recordStartEpochMs) {
     die(`session is ${state.state} — marks can only be added while recording`);
   }
-  const tMs = Math.max(0, Date.now() - state.recordStartEpochMs);
-  appendFileSync(state.marksPath, `${JSON.stringify({ tMs, text: text.trim() })}\n`);
-  if (json) {
-    printJson({ tMs, text: text.trim() });
+
+  // --at is an absolute recording-clock time; --ago is N seconds before now,
+  // both computed against the SAME recordStartEpochMs the daemon saved. Absent ⇒
+  // let the daemon stamp its live clock (undefined atMs).
+  const atMs = backdated
+    ? opts.atSec != null
+      ? Math.max(0, Math.round(opts.atSec * 1000))
+      : Math.max(0, Date.now() - state.recordStartEpochMs - Math.round((opts.agoSec ?? 0) * 1000))
+    : undefined;
+
+  if (state.controlPort && state.controlToken) {
+    let res: Json;
+    try {
+      res = await postToControl(
+        state,
+        "/mark",
+        {
+          text: text.trim(),
+          ...(atMs != null ? { atMs } : {}),
+          ...(hasAssert ? { assert: opts.assert } : {}),
+        },
+        5000,
+      );
+    } catch (e) {
+      // Assertions REQUIRE the live page — there's no honest file fallback for a
+      // verification the daemon couldn't run. Plain marks fall back to the file.
+      if (hasAssert) {
+        die(`the session daemon isn't answering — assertions need the live page (${(e as Error).message})`);
+      }
+      const tMs = atMs != null ? atMs : Math.max(0, Date.now() - state.recordStartEpochMs);
+      appendFileSync(state.marksPath, `${JSON.stringify({ tMs, text: text.trim() })}\n`, { mode: 0o600 });
+      printMarkResult({ tMs, text: text.trim() }, json);
+      return;
+    }
+    if (res.aborted) {
+      // A failed assertion with --fail-mode abort discarded the session. Show
+      // the ✗ mark, then die loudly so the agent can't mistake this for success.
+      printMarkResult(res, json);
+      die("session ABORTED by a failed assertion (--fail-mode abort) — nothing was uploaded. Fix the condition, then start a new session.");
+    }
+    printMarkResult(res, json);
     return;
   }
-  const sec = (tMs / 1000).toFixed(1);
-  process.stdout.write(`${c.green("✓")} mark @ ${sec}s — ${text.trim()}\n`);
+
+  // No control endpoint (session started by a pre-0.6 CLI): assertions can't run.
+  if (hasAssert) {
+    die("this session has no control endpoint (started by an older clipy) — stop it and run `clipy session start` again to use assertion marks");
+  }
+  const tMs = atMs != null ? atMs : Math.max(0, Date.now() - state.recordStartEpochMs);
+  appendFileSync(state.marksPath, `${JSON.stringify({ tMs, text: text.trim() })}\n`, { mode: 0o600 });
+  printMarkResult({ tMs, text: text.trim() }, json);
+}
+
+/** `clipy chapter "<label>"` — a chapter is a specially-formatted mark
+ *  (=== CHAPTER: <label> ===) that splits one recording into BEFORE/AFTER
+ *  sections (demo base branch → chapter "AFTER" → swap branch → demo the fix). */
+async function cmdChapter(label: string, json: boolean): Promise<void> {
+  const { file, state } = requireSession();
+  const chapterText = `=== CHAPTER: ${label} ===`;
+  if (state.kind === "mac") {
+    const result = await bridgeRequest(bridgeInfoFromSession(state), "mark", { text: chapterText }).catch(
+      (e: Error) => {
+        if (e instanceof BridgeUnavailableError) {
+          cleanupSessionFiles(state, file);
+          die("the Clipy app is no longer running — session cleared. Start a new one.");
+        }
+        die(e.message);
+      },
+    );
+    if (json) {
+      printJson({ tMs: Number(result.atSeconds ?? 0) * 1000, label, text: chapterText });
+      return;
+    }
+    process.stdout.write(
+      `${c.green("✓")} chapter @ ${Number(result.atSeconds ?? 0).toFixed(1)}s — ${label}\n`,
+    );
+    return;
+  }
+  if (!pidAlive(state.pid)) {
+    cleanupSessionFiles(state, file);
+    die("the session daemon is no longer running (crashed?) — session cleared. Start a new one.");
+  }
+  if (state.state !== "recording" || !state.recordStartEpochMs) {
+    die(`session is ${state.state} — chapters can only be added while recording`);
+  }
+  if (state.controlPort && state.controlToken) {
+    try {
+      const res = await postToControl(state, "/chapter", { label }, 5000);
+      if (json) {
+        printJson({ tMs: Number(res.tMs ?? 0), label, text: chapterText });
+      } else {
+        process.stdout.write(
+          `${c.green("✓")} chapter @ ${(Number(res.tMs ?? 0) / 1000).toFixed(1)}s — ${label}\n`,
+        );
+      }
+      return;
+    } catch {
+      // Chapters aren't assertions — fall back to the marks file on failure.
+    }
+  }
+  const tMs = Math.max(0, Date.now() - state.recordStartEpochMs);
+  appendFileSync(state.marksPath, `${JSON.stringify({ tMs, text: chapterText })}\n`, { mode: 0o600 });
+  if (json) {
+    printJson({ tMs, label, text: chapterText });
+  } else {
+    process.stdout.write(`${c.green("✓")} chapter @ ${(tMs / 1000).toFixed(1)}s — ${label}\n`);
+  }
 }
 
 async function cmdSessionStop(json: boolean): Promise<void> {
@@ -2509,7 +3093,61 @@ async function cmdSessionAbort(json: boolean): Promise<void> {
     await new Promise((r) => setTimeout(r, 300));
   }
   const final = readSessionState(file);
+  const alive = final ? pidAlive(final.pid) : false;
+
+  // The daemon is still alive AND mid-upload of a stop/max capture — the abort
+  // arrived after it committed to finishing. Killing it would strand a partial
+  // server-side upload, so let it finish; the user can collect it with
+  // `session stop`. Leave the state file in place for that.
+  if (final && alive && (final.state === "stopping" || final.state === "uploading")) {
+    if (json) {
+      printJson({ state: "finishing" });
+    } else {
+      process.stderr.write(
+        `${c.yellow("!")} the recording is already being uploaded (abort came too late) — it will finish; run ${c.bold("clipy session stop")} to collect the link\n`,
+      );
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  // Still recording after the full wait ⇒ the abort didn't take (wedged Chromium
+  // / hung page). Don't quietly delete the state file out from under a process
+  // that may still be recording — escalate: SIGTERM, a short grace, then SIGKILL,
+  // and only THEN clean up. This is what makes `session run`'s "guaranteed
+  // cleanup" honest.
+  const wedged = final ? alive && (final.state === "starting" || final.state === "recording") : false;
+  if (wedged && final) {
+    try {
+      process.kill(final.pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+    const graceDeadline = Date.now() + 3000;
+    while (pidAlive(final.pid) && Date.now() < graceDeadline) {
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    if (pidAlive(final.pid)) {
+      try {
+        process.kill(final.pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  }
   if (final) cleanupSessionFiles(final, file);
+  if (wedged) {
+    // Exit non-zero (and truthfully) — the daemon had to be force-killed, so we
+    // can't promise a clean discard. Use process.exitCode (not process.exit) so
+    // a caller like `session run` can still override with the child's code.
+    if (json) printJson({ state: "killed", pid: final?.pid ?? null });
+    else
+      process.stderr.write(
+        `${c.yellow("!")} the session daemon ignored abort for 30s and was force-killed (pid ${final?.pid}); nothing was uploaded\n`,
+      );
+    process.exitCode = 1;
+    return;
+  }
   if (json) printJson({ state: "aborted" });
   else process.stdout.write(`${c.green("✓")} session aborted — nothing was uploaded\n`);
 }
@@ -2585,8 +3223,86 @@ async function cmdSessionStatus(json: boolean): Promise<void> {
       `${elapsed != null ? ` — ${elapsed}s elapsed (max ${state.maxSec}s)` : ""}\n`,
   );
   if (state.cdpHttpUrl && state.state === "recording" && alive) {
-    process.stdout.write(`${c.dim(`drive the browser: connect your tools to ${state.cdpHttpUrl}`)}\n`);
+    process.stdout.write(
+      `${c.dim(`drive the recorded page: connectOverCDP(${state.cdpHttpUrl}) → browser.contexts()[0].pages()[0]  ·  resize via CDP Emulation.setDeviceMetricsOverride  ·  resolve playwright with NODE_PATH=$(clipy playwright-path)`)}\n`,
+    );
   }
+}
+
+/**
+ * `clipy session run [start-flags] -- <command …>` — the crash-safe wrapper.
+ * Starts a session, runs the command with inherited stdio, and GUARANTEES
+ * cleanup: exit 0 uploads (session stop), any non-zero exit / signal discards
+ * (session abort) and propagates the child's code. This is the fleet answer to
+ * a crashed driver recording dead air to its max ceiling.
+ */
+async function cmdSessionRun(
+  ctx: Ctx,
+  startOpts: Parameters<typeof cmdSessionStart>[1],
+  childArgv: string[],
+): Promise<void> {
+  if (childArgv.length === 0) {
+    die("usage: clipy session run [start flags] -- <command …>  (everything after -- is the command to run)", 2);
+  }
+  // Start the session and block until it's recording. Force human output — the
+  // child inherits our stdio and the deliverable is the wrapped run, not JSON.
+  await cmdSessionStart(ctx, { ...startOpts, json: false });
+
+  const file = sessionFilePath(process.cwd());
+  const cdpHttpUrl = readSessionState(file)?.cdpHttpUrl;
+
+  const [cmd, ...args] = childArgv;
+  process.stderr.write(`${c.dim(`running: ${childArgv.join(" ")}`)}\n`);
+  const child = spawn(cmd, args, {
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      // Signals to the child that it's being recorded, and where to drive.
+      CLIPY_SESSION: "1",
+      ...(cdpHttpUrl ? { CLIPY_CDP_URL: cdpHttpUrl } : {}),
+    },
+  });
+
+  // Forward Ctrl-C / termination to the child; its exit then drives the abort
+  // path below (so we never double-abort or race the child).
+  let forwarded = false;
+  const forward = (sig: NodeJS.Signals) => {
+    forwarded = true;
+    try {
+      child.kill(sig);
+    } catch {
+      // child already gone
+    }
+  };
+  const onSigint = () => forward("SIGINT");
+  const onSigterm = () => forward("SIGTERM");
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
+
+  const outcome = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((res) => {
+    child.on("error", (e) => {
+      // Couldn't even spawn the command — don't leave the session recording.
+      void cmdSessionAbort(false)
+        .catch(() => {})
+        .finally(() => die(`failed to run command "${cmd}": ${e.message}`));
+    });
+    child.on("exit", (code, signal) => res({ code, signal }));
+  });
+
+  process.off("SIGINT", onSigint);
+  process.off("SIGTERM", onSigterm);
+
+  if (outcome.code === 0 && !outcome.signal && !forwarded) {
+    await cmdSessionStop(false); // clean exit → upload + print the share link
+    return;
+  }
+  process.stderr.write(
+    `${c.yellow(
+      `command ${outcome.signal ? `terminated by ${outcome.signal}` : `exited ${outcome.code}`} — discarding the recording`,
+    )}\n`,
+  );
+  await cmdSessionAbort(false);
+  process.exit(outcome.code ?? 1); // propagate the child's failure
 }
 
 // --- The daemon itself (hidden __session-daemon command) --------------------
@@ -2658,8 +3374,26 @@ async function runSessionDaemon(file: string): Promise<void> {
     autoMarks.push({ startMs: Math.max(0, Date.now() - recordStart), text });
   };
 
+  // Marks that arrive over the control endpoint (`clipy mark`/`chapter`) or the
+  // in-page __clipyMark/__clipyChapter bindings. Kept in memory (like autoMarks)
+  // and merged at stop. A hard 200 cap here is the server limit; storeDaemonMark
+  // refuses past it so `clipy mark` gets an error rather than a silent drop.
+  const daemonMarks: NarrationNote[] = [];
+  const storeDaemonMark = (note: NarrationNote): boolean => {
+    if (daemonMarks.length >= 200) return false;
+    daemonMarks.push(note);
+    return true;
+  };
+  // Assertion tallies → the leading [verification] note at stop.
+  let assertRan = 0;
+  let assertPassed = 0;
+  let assertFailed = 0;
+  // A failed --fail-mode=abort assertion sets this; the main loop discards.
+  let controlSignal: "abort" | null = null;
+
   mkdirSync(state.tmpDir, { recursive: true });
   let browser: PwBrowser | null = null;
+  let controlServer: ReturnType<typeof createHttpServer> | null = null;
   try {
     const chromium = await loadChromium();
     log(`launching chromium for ${state.url}`);
@@ -2682,7 +3416,46 @@ async function runSessionDaemon(file: string): Promise<void> {
     const context = await browser.newContext({
       viewport: { width: state.width, height: state.height },
       recordVideo: { dir: state.tmpDir, size: { width: state.width, height: state.height } },
+      // Playwright takes the storageState file path directly (cookies + origins).
+      ...(state.storageStatePath ? { storageState: state.storageStatePath } : {}),
     });
+    // Seed cookies/localStorage/init-script before the first navigation — re-parse
+    // the raw specs the parent CLI already validated. A bad spec here is caught by
+    // the outer try/catch and fails the session cleanly.
+    await applyAuthCapture(
+      context,
+      {
+        storageStatePath: state.storageStatePath,
+        initScriptPath: state.initScriptPath,
+        cookieSpecs: state.cookieSpecs ?? [],
+        localStorageSpecs: state.localStorageSpecs ?? [],
+      },
+      state.url,
+    );
+
+    // In-page mark/chapter bindings — only under --expose-cdp, and only alongside
+    // the debugging port a driver already uses. A page.evaluate(() =>
+    // window.__clipyMark("…")) emits a mark with ZERO spawn latency (no `clipy
+    // mark` process). Same 200-cap store as the HTTP path. NOTE: while CDP is
+    // exposed, the page's own scripts can call these too — that's within the
+    // existing --expose-cdp trust model (any local process can already drive the
+    // browser), and it's documented in the README's --expose-cdp section.
+    if (wantCdp) {
+      const inPageMark = (label: string): void => {
+        if (recordStart === 0) return;
+        const text = label.trim();
+        if (text) storeDaemonMark({ startMs: Math.max(0, Date.now() - recordStart), text });
+      };
+      await context
+        .exposeBinding("__clipyMark", (_src, ...args) => inPageMark(String(args[0] ?? "")))
+        .catch((e: Error) => log(`__clipyMark binding failed: ${e.message}`));
+      await context
+        .exposeBinding("__clipyChapter", (_src, ...args) =>
+          inPageMark(`=== CHAPTER: ${String(args[0] ?? "").trim()} ===`),
+        )
+        .catch((e: Error) => log(`__clipyChapter binding failed: ${e.message}`));
+    }
+
     const page = await context.newPage();
 
     // Best-effort: publish the CDP URL so `session start`/`status` can hand it
@@ -2718,8 +3491,147 @@ async function runSessionDaemon(file: string): Promise<void> {
       }
     }) as never);
 
+    // Local control endpoint: `clipy mark`/`chapter` POST here so the daemon —
+    // which owns the live page — evaluates assertions and stamps marks on its
+    // own clock. 127.0.0.1 only, bearer-token auth (random UUID). If it can't
+    // bind, the recording still runs and marks fall back to the marks file.
+    const controlToken = randomUUID();
+    let controlPort = 0;
+
+    /** POST /mark → tMs (atMs override or live clock), optional assertion run
+     *  against the page, stored (annotated) mark, and the response the CLI shows. */
+    const handleMark = async (body: Json): Promise<Json> => {
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      if (!text) throw new Error("mark text is required");
+      const tMs =
+        typeof body.atMs === "number" && Number.isFinite(body.atMs)
+          ? Math.max(0, Math.round(body.atMs))
+          : Math.max(0, Date.now() - recordStart);
+      let annotated = text;
+      let assertOut: { passed: boolean; observed: string } | undefined;
+      let aborted = false;
+      const assertSpec = body.assert as MarkAssert | undefined;
+      if (assertSpec && typeof assertSpec === "object") {
+        // evaluateAssertion throws if the page is unresponsive — surfaced as a
+        // 5xx so the CLI die()s rather than recording an unverified claim.
+        const ev = await evaluateAssertion(page, assertSpec);
+        assertRan++;
+        if (ev.passed) assertPassed++;
+        else assertFailed++;
+        annotated = ev.passed
+          ? `${text} [assert ✓ ${ev.observed}]`
+          : `${text} [ASSERT ✗ expected ${ev.expected}; observed ${ev.observed}]`;
+        assertOut = { passed: ev.passed, observed: ev.observed };
+        if (!ev.passed && assertSpec.failMode === "abort") aborted = true;
+      }
+      if (!storeDaemonMark({ startMs: tMs, text: annotated })) {
+        throw new Error("mark limit reached (200 marks per recording)");
+      }
+      if (aborted) controlSignal = "abort";
+      return {
+        tMs,
+        text: annotated,
+        ...(assertOut ? { assert: assertOut } : {}),
+        ...(aborted ? { aborted: true } : {}),
+      };
+    };
+
+    /** POST /chapter → a =={ CHAPTER }== mark at the live clock. */
+    const handleChapter = (body: Json): Json => {
+      const label = typeof body.label === "string" ? body.label.trim() : "";
+      if (!label) throw new Error("chapter label is required");
+      const tMs = Math.max(0, Date.now() - recordStart);
+      if (!storeDaemonMark({ startMs: tMs, text: `=== CHAPTER: ${label} ===` })) {
+        throw new Error("mark limit reached (200 marks per recording)");
+      }
+      return { tMs };
+    };
+
+    const BODY_CAP = 1_000_000;
+    controlServer = createHttpServer((req, res) => {
+      const respond = (status: number, obj: Json): void => {
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(obj));
+      };
+      if (req.headers.authorization !== `Bearer ${controlToken}`) {
+        respond(401, { error: "unauthorized" });
+        return;
+      }
+      if (req.method !== "POST") {
+        respond(405, { error: "method not allowed" });
+        return;
+      }
+      // Only JSON — a wrong content-type is almost always a confused client.
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().includes("application/json")) {
+        respond(415, { error: "content-type must be application/json" });
+        return;
+      }
+      // Reject an over-cap body: first by its declared Content-Length (before
+      // reading a byte), then again if the stream itself exceeds the cap. Send an
+      // explicit 413 and DRAIN the rest (req.resume) so a mid-upload client reads
+      // the status instead of hitting the opaque socket error a bare destroy gave.
+      const declared = Number(req.headers["content-length"] ?? "");
+      if (Number.isFinite(declared) && declared > BODY_CAP) {
+        respond(413, { error: "request body too large (1MB cap)" });
+        req.resume();
+        return;
+      }
+      let raw = "";
+      let tooLarge = false;
+      req.on("data", (chunk) => {
+        if (tooLarge) return; // keep consuming (draining) but stop accumulating
+        raw += chunk;
+        if (raw.length > BODY_CAP) {
+          tooLarge = true;
+          respond(413, { error: "request body too large (1MB cap)" });
+        }
+      });
+      req.on("end", () => {
+        if (tooLarge) return;
+        void (async () => {
+          let body: Json;
+          try {
+            body = raw ? (JSON.parse(raw) as Json) : {};
+          } catch {
+            respond(400, { error: "invalid JSON body" });
+            return;
+          }
+          try {
+            if (req.url === "/mark") respond(200, await handleMark(body));
+            else if (req.url === "/chapter") respond(200, handleChapter(body));
+            else respond(404, { error: "not found" });
+          } catch (e) {
+            respond(500, { error: (e as Error).message });
+          }
+        })();
+      });
+    });
+    // Tight timeouts (Node defaults are minutes) so a wedged local client can't
+    // pin daemon sockets open. headersTimeout must be ≤ requestTimeout.
+    controlServer.requestTimeout = 10_000;
+    controlServer.headersTimeout = 10_000;
+    try {
+      await new Promise<void>((resolveBind, rejectBind) => {
+        controlServer!.on("error", rejectBind);
+        controlServer!.listen(0, "127.0.0.1", () => resolveBind());
+      });
+      const addr = controlServer.address();
+      controlPort = typeof addr === "object" && addr ? addr.port : 0;
+      log(`control endpoint listening on 127.0.0.1:${controlPort}`);
+    } catch (e) {
+      log(`control endpoint failed to bind (${(e as Error).message}) — marks will use the file fallback`);
+      controlServer = null;
+      controlPort = 0;
+    }
+
     recordStart = Date.now();
-    save({ state: "recording", recordStartEpochMs: recordStart, cdpUrl, cdpHttpUrl });
+    save({
+      state: "recording",
+      recordStartEpochMs: recordStart,
+      cdpUrl,
+      cdpHttpUrl,
+      ...(controlPort ? { controlPort, controlToken } : {}),
+    });
     try {
       await page.goto(state.url, { waitUntil: "load", timeout: 30_000 });
     } catch {
@@ -2730,6 +3642,12 @@ async function runSessionDaemon(file: string): Promise<void> {
     let stopReason: "stop" | "abort" | "max" = "stop";
     for (;;) {
       await page.waitForTimeout(400);
+      // A failed --fail-mode=abort assertion (set by the control handler) discards
+      // the session just like a control-file abort.
+      if (controlSignal === "abort") {
+        stopReason = "abort";
+        break;
+      }
       let control: { action?: string } | null = null;
       try {
         control = JSON.parse(readFileSync(state.controlPath, "utf8")) as { action?: string };
@@ -2776,21 +3694,39 @@ async function runSessionDaemon(file: string): Promise<void> {
     await browser.close().catch(() => {});
     browser = null;
 
-    // Merge the agent's marks (written live by `clipy mark` with its own
-    // clock) with the [auto] instrumentation marks.
-    const agentMarks: NarrationNote[] = [];
+    // Merge marks from three sources: the file (fallback path, written by
+    // `clipy mark` when the control endpoint was unreachable), the daemon-side
+    // marks (control endpoint + in-page bindings, already assertion-annotated),
+    // and the [auto] instrumentation marks.
+    const fileMarks: NarrationNote[] = [];
     try {
       for (const line of readFileSync(state.marksPath, "utf8").split("\n")) {
         if (!line.trim()) continue;
         const m = JSON.parse(line) as { tMs?: number; text?: string };
         if (typeof m.tMs === "number" && typeof m.text === "string" && m.text.trim()) {
-          agentMarks.push({ startMs: Math.max(0, Math.round(m.tMs)), text: m.text.trim() });
+          fileMarks.push({ startMs: Math.max(0, Math.round(m.tMs)), text: m.text.trim() });
         }
       }
     } catch {
       // no marks file — fine
     }
-    const notes = [...agentMarks, ...autoMarks].sort((a, b) => a.startMs - b.startMs);
+    let notes = [...fileMarks, ...daemonMarks, ...autoMarks].sort((a, b) => a.startMs - b.startMs);
+    // If any assertions ran, prepend a 0ms verification summary so it LEADS the
+    // transcript and the .md context (a stable sort keeps it ahead of other 0ms
+    // marks). This is the "recordings are evidence" headline.
+    if (assertRan > 0) {
+      notes.unshift({
+        startMs: 0,
+        text: `[verification] ${assertRan} assertion(s): ${assertPassed} passed, ${assertFailed} failed`,
+      });
+      notes.sort((a, b) => a.startMs - b.startMs);
+    }
+    // Server limit: cap the merged set at 200 marks (the verification note sorts
+    // to 0ms so it always survives the slice).
+    if (notes.length > 200) {
+      log(`mark limit: merged ${notes.length} marks — keeping the first 200 (dropped ${notes.length - 200})`);
+      notes = notes.slice(0, 200);
+    }
 
     save({ state: "uploading" });
     const uploaded = await uploadWebmToClipy(ctx, {
@@ -2823,6 +3759,7 @@ async function runSessionDaemon(file: string): Promise<void> {
     log(`failed: ${(e as Error).message}`);
     process.exitCode = 1;
   } finally {
+    if (controlServer) controlServer.close();
     if (browser) await browser.close().catch(() => {});
   }
 }
@@ -2930,7 +3867,7 @@ async function cmdAgents(
 // contract changes.
 // ---------------------------------------------------------------------------
 
-const GUIDE_SCHEMA_VERSION = 3;
+const GUIDE_SCHEMA_VERSION = 5;
 
 function cmdGuide(json: boolean): void {
   if (!json) {
@@ -2982,10 +3919,12 @@ function cmdGuide(json: boolean): void {
       cmdDoc("download", "clipy download <id> [-o path]", "Download the MP4"),
       cmdDoc("open", "clipy open <id>", "Open the share page in a browser"),
       cmdDoc("wait", "clipy wait <id> [--for transcript|summary|both] [--timeout sec]", "Block until artifacts are ready"),
-      cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. With --source mac-screen: records the real screen via the Clipy Mac app (--type not yet applied on mac); --window '<title|app|id>' or --display <id> target one window/display (ids from clipy sources)", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--width", "--height", "--wait", "--source", "--window", "--display"]),
-      cmdDoc("session", "clipy session <start|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen] [--window w] [--display d] [--expose-cdp]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). --window/--display (with --source mac-screen) record one window/display. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off", ["--url", "--max", "--type", "--source", "--window", "--display", "--expose-cdp"]),
-      cmdDoc("mark", "clipy mark \"<text>\"", "Drop a live-timestamped note into the active session"),
-      cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and where it resolved from), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails"),
+      cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. Auth (web capture only, applied before the first navigation so a logged-in SPA's route guard sees it): --storage-state <playwright storageState JSON path>, --cookie 'name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]' (repeatable), --local-storage 'key=value' (repeatable, target origin only), --init-script <js file run before every page load>. With --source mac-screen: records the real screen via the Clipy Mac app (--type not yet applied on mac; auth flags rejected — the screen is already logged in); --window '<title|app|id>' or --display <id> target one window/display (ids from clipy sources). --json prints {id, shareUrl, contextUrl, sizeBytes}", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--storage-state", "--cookie", "--local-storage", "--init-script", "--width", "--height", "--wait", "--source", "--window", "--display", "--json"]),
+      cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen] [--window w] [--display d] [--expose-cdp] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). --window/--display (with --source mac-screen) record one window/display. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code — the crash-safe wrapper so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--expose-cdp", "--storage-state", "--cookie", "--local-storage", "--init-script", "--json"]),
+      cmdDoc("mark", "clipy mark \"<text>\" [--assert-selector <css> [--assert-text <substr>]] [--assert-url <glob>] [--fail-mode warn|abort] [--at <sec>|--ago <sec>] [--json]", "Drop a live-timestamped note into the active session. ASSERTION MARKS make the note evidence instead of a claim: --assert-selector checks a CSS selector matches (its trimmed textContent is recorded as 'observed'); --assert-text requires that element's text to contain a substring (needs --assert-selector); --assert-url matches the page URL against a glob (** = any, * = any non-slash, no * = substring). The daemon evaluates against its live page and annotates the mark: pass ⇒ '<text> [assert ✓ <observed>]', fail ⇒ '<text> [ASSERT ✗ expected …; observed …]' — a false claim cannot read as fact. --fail-mode warn (default) records the ✗; --fail-mode abort DISCARDS the whole session on a failed assertion (no upload) and the CLI exits non-zero. If any assertions ran, a leading 0ms '[verification] N assertion(s): P passed, F failed' note is prepended. --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now (mutually exclusive). Assertions/backdating need a web session (rejected on --source mac-screen). Up to 200 marks per recording.", ["--assert-selector", "--assert-text", "--assert-url", "--fail-mode", "--at", "--ago", "--json"]),
+      cmdDoc("chapter", "clipy chapter \"<label>\" [--json]", "Mark a BEFORE/AFTER section boundary in the active recording (stored as '=== CHAPTER: <label> ==='). The PR-review shape: demo the base branch, run `clipy chapter \"AFTER — fix applied\"`, swap branches + restart the dev server, demo the fix — one video carrying both states. Works on web + --source mac-screen sessions.", ["--json"]),
+      cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails", ["--json"]),
+      cmdDoc("playwright-path", "clipy playwright-path [--json]", "Print the node_modules directory of the Playwright this CLI resolves, so your own --expose-cdp driver scripts can load the same copy: NODE_PATH=$(clipy playwright-path) node driver.js. Exits 1 (empty stdout) if Playwright is unresolvable. --json prints {path, nodeModulesDir, source}", ["--json"]),
       cmdDoc("sources", "clipy sources [--json]", "List displays + windows the Clipy Mac app can capture — ids feed --window/--display"),
       cmdDoc("agents", "clipy agents <status|install|uninstall> <claude|codex|cursor>", "Install the bundled Clipy skill for a coding agent; install triggers a browser login first when no key is configured (interactive terminals only)"),
       cmdDoc("guide", "clipy guide --json", "This manifest"),
@@ -2998,7 +3937,13 @@ function cmdGuide(json: boolean): void {
       "Headless captures have no audio: --note flags and session marks become the transcript, labeled agent-narration.",
       "--note is absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text'); pass-scoped notes anchor to the real start of a --viewports pass, so they don't drift when load time shifts the pass boundaries. A malformed pass note (e.g. 'pass2 text' with no colon) is a usage error, not silently demoted.",
       "--type declares what a recording IS (bug_report/feature_request/product_demo/walkthrough_tutorial/feedback_review/discussion_talk/other, plus short aliases) so the AI summary doesn't misread a demo as a bug report. Applied on web today; --source mac-screen support is pending a Clipy app update.",
+      "Assertion marks are the differentiator: assert what you claim. `clipy mark \"X\" --assert-selector '.status' --assert-text Active` records X only alongside the live-page truth — the daemon runs the check against its Playwright page and annotates the mark ✓/✗ with what it actually observed, so a false claim cannot pass as fact in the transcript. --fail-mode abort turns a failed assertion into a discarded session (nothing uploaded, non-zero exit). Assertions need a web session and the daemon's control endpoint (started by clipy 0.6+); they are rejected on --source mac-screen.",
+      "clipy chapter \"<label>\" splits one recording into BEFORE/AFTER sections for PR-review-style demos: record the base branch, `clipy chapter \"AFTER — fix applied\"`, swap branches + restart, record the fix. One video carries both states.",
+      "clipy session run [start flags] -- <command…> is the crash-safe wrapper: it starts a session, runs your driver command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), and guarantees cleanup — exit 0 uploads, any non-zero exit or signal discards and propagates the code. Use it so a crashing driver never records dead air to the max ceiling.",
+      "clipy mark --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now — a `clipy mark` spawn lands ~100-300ms late, so backdate to align a mark with the state it describes. When driving over --expose-cdp, call window.__clipyMark(\"text\") / window.__clipyChapter(\"label\") IN-PAGE (page.evaluate) to emit marks/chapters with zero spawn latency; while CDP is exposed the page's own scripts can call these too (within the existing --expose-cdp trust model).",
       "session --expose-cdp (web, opt-in) publishes a CDP endpoint (cdpHttpUrl) in `session start`/`session status` output and the 0600 session state file; connect with playwright.connectOverCDP() to drive the recorded page. Off by default (any local process could attach); CLIPY_DISABLE_CDP=1 forces it off.",
+      "Driving an --expose-cdp session: connect with playwright.connectOverCDP(cdpHttpUrl); the recorded page is browser.contexts()[0].pages()[0] (a fresh context/page you open is NOT captured); page.viewportSize() is null over a CDP attach; resize with a CDP session's Emulation.setDeviceMetricsOverride, not setViewportSize. Your own driver script resolves Playwright from its own cwd — run it as NODE_PATH=$(clipy playwright-path) node driver.js if require('playwright') can't find it.",
+      "Auth for headless web capture (record + session start): --storage-state <playwright storageState JSON> is passed straight to Playwright's newContext; --cookie / --local-storage / --init-script are applied to the context BEFORE the first navigation, so a logged-in SPA's route guard sees the state on first paint (seeding it after navigating loses that race). --cookie without a Domain is url-scoped to the target; with a Domain it is domain-scoped. --local-storage pairs are origin-guarded to the target. All four are web-only and are rejected on --source mac-screen, which records the real, already-signed-in screen. The storage-state file may hold live credentials; the CLI never prints its contents and the session state file that carries these specs is chmod 0600.",
       "clipy record gates its capture clock on the first non-blank frame (up to a 10s cap, then starts anyway) so notes aren't anchored to a still-compiling t=0.",
       "Run `clipy doctor` first when record/session or --source mac-screen fails — it names the exact missing piece (key, bridge socket/handshake/version, Playwright, install mode).",
       "Public recordings have an unauthenticated context document at https://clipy.online/video/<id>.md.",
@@ -3052,9 +3997,25 @@ async function cmdTranscriptReplace(ctx: Ctx, id: string, file: string): Promise
 // Entry
 // ---------------------------------------------------------------------------
 
+/** Parse a --at/--ago seconds value (fractional allowed, must be ≥ 0). */
+function parseSeconds(v: string, flag: string): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) die(`${flag} must be a non-negative number of seconds`, 2);
+  return n;
+}
+
 async function main(): Promise<void> {
+  // Split on the first `--` ourselves so `session run … -- <cmd> [--child-flags]`
+  // never feeds the child's own flags to parseArgs (strict:false would otherwise
+  // fold them into `values`). Everything after `--` is the child command verbatim;
+  // for every other command childArgv is simply unused.
+  const rawArgv = process.argv.slice(2);
+  const ddIndex = rawArgv.indexOf("--");
+  const childArgv = ddIndex >= 0 ? rawArgv.slice(ddIndex + 1) : [];
+  const parseArgv = ddIndex >= 0 ? rawArgv.slice(0, ddIndex) : rawArgv;
+
   const { values, positionals } = parseArgs({
-    args: process.argv.slice(2),
+    args: parseArgv,
     allowPositionals: true,
     strict: false,
     options: {
@@ -3084,7 +4045,17 @@ async function main(): Promise<void> {
       window: { type: "string" },
       display: { type: "string" },
       type: { type: "string" },
+      "assert-selector": { type: "string" },
+      "assert-text": { type: "string" },
+      "assert-url": { type: "string" },
+      "fail-mode": { type: "string" },
+      at: { type: "string" },
+      ago: { type: "string" },
       "expose-cdp": { type: "boolean", default: false },
+      "storage-state": { type: "string" },
+      "init-script": { type: "string" },
+      cookie: { type: "string", multiple: true },
+      "local-storage": { type: "string", multiple: true },
       width: { type: "string" },
       height: { type: "string" },
       wait: { type: "boolean", default: false },
@@ -3122,6 +4093,24 @@ async function main(): Promise<void> {
     const n = parseInt(String(v ?? ""), 10);
     return Number.isFinite(n) && n > 0 ? n : dflt;
   };
+
+  // Auth-capture flags seed a logged-in session into headless web capture; they
+  // don't apply to --source mac-screen (which records the real, already-signed-in
+  // screen). Resolve the file paths to absolute so the detached daemon — spawned
+  // without an explicit cwd — reads the same files the parent validated.
+  const authFlagsPresent = Boolean(
+    values["storage-state"] ||
+      values["init-script"] ||
+      (values.cookie as string[] | undefined)?.length ||
+      (values["local-storage"] as string[] | undefined)?.length,
+  );
+  const authCapture = (): AuthCapture => ({
+    storageStatePath: values["storage-state"] ? resolve(String(values["storage-state"])) : undefined,
+    initScriptPath: values["init-script"] ? resolve(String(values["init-script"])) : undefined,
+    cookieSpecs: (values.cookie as string[] | undefined) ?? [],
+    localStorageSpecs: (values["local-storage"] as string[] | undefined) ?? [],
+  });
+  const macAuthGuard = "auth state applies to headless web capture — --source mac-screen records the real, already-logged-in screen";
 
   switch (command) {
     case "login":
@@ -3201,6 +4190,9 @@ async function main(): Promise<void> {
     case "doctor":
       await cmdDoctor(ctx, json);
       return;
+    case "playwright-path":
+      await cmdPlaywrightPath(json);
+      return;
     case "agents":
       await cmdAgents(ctx, rest[0], rest[1], json);
       return;
@@ -3242,6 +4234,7 @@ async function main(): Promise<void> {
       if (values.window && values.display) {
         die("--window and --display are mutually exclusive — pick one capture source", 2);
       }
+      if (source === "mac-screen" && authFlagsPresent) die(macAuthGuard, 2);
       const recordingKind = values.type ? requireRecordingKind(String(values.type)) : undefined;
       if (source === "mac-screen") {
         const noteFlags = (values.note as string[] | undefined) ?? [];
@@ -3299,12 +4292,16 @@ async function main(): Promise<void> {
         height: num(values.height, 720),
         wait: Boolean(values.wait),
         json,
+        auth: authCapture(),
       });
       return;
     }
     case "session": {
       const sub = rest[0];
-      if (sub === "start") {
+      // Shared by `start` and `run`: validate the capture flags and build the
+      // cmdSessionStart opts. `positionalUrl` is rest[1] for `start` (session
+      // start <url>) — `run` has no positional url, only --url.
+      const buildStartOpts = (positionalUrl: string | undefined): Parameters<typeof cmdSessionStart>[1] => {
         const source = String(values.source ?? "web");
         if (source !== "web" && source !== "mac-screen") {
           die("--source must be web (headless browser) or mac-screen (the Clipy Mac app)", 2);
@@ -3315,11 +4312,12 @@ async function main(): Promise<void> {
         if (values.window && values.display) {
           die("--window and --display are mutually exclusive — pick one capture source", 2);
         }
-        const url = (values.url as string | undefined)?.trim() || rest[1];
+        if (source === "mac-screen" && authFlagsPresent) die(macAuthGuard, 2);
+        const url = (values.url as string | undefined)?.trim() || positionalUrl;
         if (!url && source === "web") {
           die("usage: clipy session start --url <http(s) url> [--max <sec>] [--source web|mac-screen]", 2);
         }
-        await cmdSessionStart(ctx, {
+        return {
           url: url || "mac-screen",
           window: (values.window as string | undefined)?.trim() || undefined,
           display: (values.display as string | undefined)?.trim() || undefined,
@@ -3332,9 +4330,18 @@ async function main(): Promise<void> {
           width: num(values.width, 1280),
           height: num(values.height, 720),
           json,
-          source,
+          source: source as "web" | "mac-screen",
           exposeCdp: Boolean(values["expose-cdp"]),
-        });
+          auth: authCapture(),
+        };
+      };
+      if (sub === "start") {
+        await cmdSessionStart(ctx, buildStartOpts(rest[1]));
+        return;
+      }
+      if (sub === "run") {
+        // Everything after `--` is the command; start flags come before it.
+        await cmdSessionRun(ctx, buildStartOpts(undefined), childArgv);
         return;
       }
       if (sub === "stop") {
@@ -3349,13 +4356,46 @@ async function main(): Promise<void> {
         await cmdSessionStatus(json);
         return;
       }
-      die("usage: clipy session <start|stop|abort|status>", 2);
+      die("usage: clipy session <start|run|stop|abort|status>", 2);
       return;
     }
     case "mark": {
       const text = rest.join(" ").trim();
-      if (!text) die('usage: clipy mark "<what just happened>"', 2);
-      await cmdMark(text, json);
+      if (!text) {
+        die('usage: clipy mark "<what just happened>" [--assert-selector <css> [--assert-text <substr>]] [--assert-url <glob>] [--fail-mode warn|abort] [--at <sec>|--ago <sec>]', 2);
+      }
+      const selector = (values["assert-selector"] as string | undefined)?.trim() || undefined;
+      const expectText = values["assert-text"] as string | undefined; // exact, not trimmed
+      const urlGlob = (values["assert-url"] as string | undefined)?.trim() || undefined;
+      if (expectText != null && !selector) {
+        die("--assert-text needs --assert-selector (the substring is checked against that element's text)", 2);
+      }
+      const failModeRaw = (values["fail-mode"] as string | undefined)?.trim().toLowerCase();
+      if (failModeRaw && failModeRaw !== "warn" && failModeRaw !== "abort") {
+        die("--fail-mode must be warn or abort", 2);
+      }
+      const hasAssert = Boolean(selector || (expectText != null && expectText !== "") || urlGlob);
+      if (failModeRaw && !hasAssert) {
+        die("--fail-mode only applies with an assertion (--assert-selector / --assert-text / --assert-url)", 2);
+      }
+      if (values.at != null && values.ago != null) die("--at and --ago are mutually exclusive", 2);
+      const atSec = values.at != null ? parseSeconds(String(values.at), "--at") : undefined;
+      const agoSec = values.ago != null ? parseSeconds(String(values.ago), "--ago") : undefined;
+      await cmdMark(text, json, {
+        atSec,
+        agoSec,
+        assert: hasAssert
+          ? { selector, expectText, urlGlob, failMode: (failModeRaw as "warn" | "abort") || "warn" }
+          : undefined,
+      });
+      return;
+    }
+    case "chapter": {
+      const label = rest.join(" ").trim();
+      if (!label) {
+        die('usage: clipy chapter "<label>"   e.g. clipy chapter "AFTER — fix applied"', 2);
+      }
+      await cmdChapter(label, json);
       return;
     }
     case "__session-daemon": {
