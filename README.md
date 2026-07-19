@@ -14,7 +14,13 @@ recording an instant share link, an AI transcript and summary, and
 [agent-readable context](https://clipy.online/for-agents) — so both humans and AI
 agents can act on what was recorded. This package is its terminal client.
 
-It is **read-only**: it can never create, edit, or delete your recordings.
+Every command except [`record`](#record) is **read-only** — those can never create,
+edit, or delete your recordings. `record` is the one that creates a recording, and
+only with an `ingest`-scoped key.
+
+> This repository is the public mirror of **`@clipy/cli`**. The package is developed in
+> the Clipy monorepo and synced here with each npm release — browse the source or file
+> issues here.
 
 ```bash
 npx @clipy/cli list          # or: npm i -g @clipy/cli && clipy list
@@ -45,11 +51,68 @@ clipy context <id>                   # the full agent-context bundle as markdown
 clipy download <id> [-o out.mp4]     # download the MP4
 clipy open <id>                      # open the share page in your browser
 clipy wait <id> --for both           # block until transcript/summary are ready
+clipy record --url <app> [--for 15]  # record a web app headlessly → a Clipy recording
+clipy session start --url <app>      # start recording in the background while you work
+clipy mark "reproduced the bug"      # drop a live-timestamped note into the session
+clipy session stop                   # finish + upload; your marks become the transcript
 clipy mcp                            # run the Clipy MCP server (npx -y @clipy/mcp)
 ```
 
 Every recording-reading command accepts either the bare public id (`3kelcef8wo8h`) or the
 full share URL (`https://clipy.online/video/3kelcef8wo8h`).
+
+## Record
+
+`clipy record` captures a web app in a **headless** browser and uploads it as a Clipy
+recording — no display needed, so it works in CI and cloud sandboxes. Made for agents:
+build a feature, then record the running app so it can be shared or read back.
+
+```bash
+# Record a running app for 20s, wait for the transcript, print the links
+clipy record --url http://localhost:3000 --for 20 --wait
+```
+
+It needs two things beyond a normal install:
+
+1. **Playwright** (kept out of the base install so the read-only commands stay tiny):
+   ```bash
+   npm install -g playwright && npx playwright install chromium
+   ```
+2. An API key with the **"Record & upload" (ingest)** permission — pick it when you
+   create the key at [clipy.online/settings/api-keys](https://clipy.online/settings/api-keys).
+
+Flags: `--for <sec>` (record duration after load, default 15; per viewport), `--title <t>`
+/ `--description <d>`, `--viewports mobile,tablet,desktop` (or `390x844,1440x900` — records
+every size sequentially into ONE video with a transcript chapter per pass),
+`--note "12: opened settings"` (repeatable timestamped narration notes),
+`--width`/`--height` (viewport + video size, default 1280×720), `--wait` (block until the
+transcript is ready), `--json` (print `{id, shareUrl, contextUrl, sizeBytes}`).
+
+**Narration = the transcript.** Headless captures have no audio, so Clipy uses your
+notes (and session marks, below) as the recording's transcript, summary input, and
+agent-context — clearly marked as agent narration, never passed off as speech-to-text.
+
+## Session mode — you work, Clipy records
+
+For recordings where an agent (or you) drives the app live, don't script the capture:
+start a session, work normally, and narrate with marks as you go.
+
+```bash
+clipy session start --url http://localhost:3000 --title "Settings overflow fix"
+# … drive the app with your own tools …
+clipy mark "reproduced the overflow on the settings page"
+clipy mark "after the fix: the sidebar wraps correctly"
+clipy session stop        # closes the browser, uploads, prints the share link
+```
+
+The session records in a detached background daemon, so every command returns
+immediately. `clipy mark` stamps notes against the live recording clock; navigations and
+console errors are added automatically as `[auto]` marks. One session per directory.
+
+Safety rails are built in: the session **auto-stops and uploads** at `--max <sec>`
+(default 600, hard cap 1800) so a forgotten session can never run away; `clipy session
+abort` discards everything; a crashed daemon is detected and cleared on the next command;
+corrupt captures are refused before upload, and a failed upload keeps the local file.
 
 ## Scripting
 
