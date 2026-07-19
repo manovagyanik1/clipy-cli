@@ -65,10 +65,18 @@ One-shot capture of a running app (notes become the transcript, see below):
     clipy record --url http://localhost:3000 --for 20 --wait \\
       --title "Export button demo" --note "0: homepage" --note "8: export works"
 
+Declare what you recorded with \`--type\` (demo|bug|walkthrough|feature|feedback|
+discussion|other) — it keeps the AI summary from misreading a demo as a bug report.
+
 Multi screen-size demo (one video, a transcript chapter per pass):
 
     clipy record --url http://localhost:3000/settings \\
-      --viewports mobile,tablet,desktop --title "Settings overflow fix"
+      --viewports mobile,tablet,desktop --title "Settings overflow fix" \\
+      --note "pass1: mobile" --note "pass2@3: tablet after scroll"
+
+Notes are absolute (\`"12: text"\`) or pass-scoped (\`"pass2: text"\`,
+\`"pass2@5: text"\`). Pass-scoped notes anchor to a --viewports pass's REAL start,
+so they stay aligned when load time shifts the pass boundaries.
 
 ## Session mode — you drive the app, Clipy records
 
@@ -83,6 +91,14 @@ The session runs in a background daemon; commands return immediately. It
 auto-stops and uploads at \`--max\` (default 600s, cap 1800s), so a forgotten
 session can't run away. One session per directory. Up to 200 marks per recording
 (further marks are refused, not silently dropped).
+
+If you intend to drive the browser yourself, pass \`--expose-cdp\` to
+\`session start\`: it opens a CDP endpoint (\`cdpHttpUrl\` in \`session start\` /
+\`session status --json\` and the session state file). Connect your own tooling
+(\`playwright.connectOverCDP(cdpHttpUrl)\`) and drive the EXISTING context/page —
+navigation, clicks, viewport — to have your actions captured while it records.
+It's OFF by default (while open, any local process can attach to that browser),
+and \`CLIPY_DISABLE_CDP=1\` forces it off.
 
 Headless captures are silent, so your notes/marks BECOME the transcript (honestly
 labeled as agent narration, never passed off as speech). Narrate every meaningful
@@ -128,6 +144,16 @@ time.
 - When you hand a recording back, give the user BOTH the share URL
   (\`clipy.online/video/<id>\`, the human page) AND the \`.md\` context URL
   (\`clipy.online/video/<id>.md\`, for their agents).
+
+## When record / session / --source mac-screen fails
+
+Run \`clipy doctor\` (\`--json\` for parsing). It one-shot-checks the API key, the
+Mac agent bridge (running? version new enough?), whether Playwright is loadable
+from here, and how the CLI is installed — each a PASS/WARN/FAIL with a fix hint.
+It names the exact missing piece instead of leaving you to guess. Under \`npx\`,
+a globally-installed Playwright is NOT visible; \`clipy doctor\` says so and gives
+the right fix (\`npm i -g @clipy/cli playwright\`, or run from a project that has
+Playwright installed).
 
 ## Keeping the CLI current
 

@@ -74,6 +74,7 @@ clipy record --url <app> [--for 15]  # record a web app headlessly → a Clipy r
 clipy session start --url <app>      # start recording in the background while you work
 clipy mark "reproduced the bug"      # drop a live-timestamped note into the session
 clipy session stop                   # finish + upload; your marks become the transcript
+clipy doctor                         # health check: key, Mac bridge, Playwright, install mode
 clipy mcp                            # run the Clipy MCP server (npx -y @clipy/mcp)
 ```
 
@@ -101,11 +102,25 @@ It needs two things beyond a normal install:
    create the key at [clipy.online/settings/api-keys](https://clipy.online/settings/api-keys).
 
 Flags: `--for <sec>` (record duration after load, default 15; per viewport), `--title <t>`
-/ `--description <d>`, `--viewports mobile,tablet,desktop` (or `390x844,1440x900` — records
-every size sequentially into ONE video with a transcript chapter per pass),
-`--note "12: opened settings"` (repeatable timestamped narration notes),
-`--width`/`--height` (viewport + video size, default 1280×720), `--wait` (block until the
-transcript is ready), `--json` (print `{id, shareUrl, contextUrl, sizeBytes}`).
+/ `--description <d>`, `--type <kind>` (what the recording IS — see below),
+`--viewports mobile,tablet,desktop` (or `390x844,1440x900` — records every size sequentially
+into ONE video with a transcript chapter per pass), `--note "12: opened settings"` (repeatable
+timestamped narration notes), `--width`/`--height` (viewport + video size, default 1280×720),
+`--wait` (block until the transcript is ready), `--json` (print `{id, shareUrl, contextUrl, sizeBytes}`).
+
+**`--type <kind>` declares what the recording is** so the AI summary reads it correctly (a demo
+isn't a bug report). Accepts `bug_report`, `feature_request`, `product_demo`,
+`walkthrough_tutorial`, `feedback_review`, `discussion_talk`, `other` — and the short aliases
+`bug`, `feature`, `demo`/`product`, `walkthrough`/`tutorial`/`guide`, `feedback`/`review`,
+`discussion`/`talk`/`meeting`. An unrecognized value is a usage error. (Applied on the web path
+today; `--source mac-screen` support is pending a Clipy app update.)
+
+**Note timestamps.** A `--note` is absolute by default (`"12: opened settings"` → 12s).
+With `--viewports`, anchor a note to a pass instead so it can't drift when load time
+shifts the pass boundaries: `--note "pass2: mobile layout"` lands at the real start of
+pass 2, and `--note "pass2@5: after scrolling"` lands 5s into it. Recording starts the
+note clock on the first non-blank frame (up to a 10s wait), so `"0: …"` isn't pinned to a
+still-compiling dev server's blank screen.
 
 **Narration = the transcript.** Headless captures have no audio, so Clipy uses your
 notes (and session marks, below) as the recording's transcript, summary input, and
@@ -127,6 +142,30 @@ clipy session stop        # closes the browser, uploads, prints the share link
 The session records in a detached background daemon, so every command returns
 immediately. `clipy mark` stamps notes against the live recording clock; navigations and
 console errors are added automatically as `[auto]` marks. One session per directory.
+
+**Drive the recorded browser (opt-in).** Pass `--expose-cdp` to `session start` and the
+daemon's headless Chromium opens a CDP endpoint you can attach to and drive navigation, clicks,
+and viewport while Clipy records the same page. It's **off by default** — while it's open, any
+local process can attach to and control that browser, so only enable it when you intend to drive
+the session. `clipy session start --expose-cdp` prints the endpoint (and `session start --json`
+/ `session status --json` return it as `cdpHttpUrl` / `cdpUrl`, also written to the `0600`
+session state file). The env var `CLIPY_DISABLE_CDP=1` is a hard kill switch that overrides the
+flag.
+
+```bash
+clipy session start --url http://localhost:3000 --expose-cdp --title "Overflow fix"
+```
+
+```js
+const { chromium } = require("playwright");
+const browser = await chromium.connectOverCDP(cdpHttpUrl); // from `clipy session status --json`
+const page = browser.contexts()[0].pages()[0];             // the page being recorded
+await page.goto("http://localhost:3000/settings");
+await browser.close();                                     // detaches; the recording keeps going
+```
+
+Drive the existing context/page (above) so your actions land in the recording — a brand-new
+context you open won't be captured.
 
 Safety rails are built in: the session **auto-stops and uploads** at `--max <sec>`
 (default 600, hard cap 1800) so a forgotten session can never run away; `clipy session

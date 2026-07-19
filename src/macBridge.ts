@@ -9,7 +9,7 @@
  * line back.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createConnection } from "node:net";
@@ -28,9 +28,40 @@ const REQUEST_TIMEOUT_MS = 15_000;
 /** stop waits for the streaming upload to hand back the share link. */
 const STOP_TIMEOUT_MS = 200_000;
 
+/** The oldest Clipy Mac app version that ships the agent bridge this CLI drives.
+ *  Older builds either don't write the discovery file at all or wrote it to a
+ *  path the CLI never read (the pre-0.1.41 bundle-id location), so `--source
+ *  mac-screen` silently found nothing. Surfaced by `clipy doctor` and in the
+ *  stale/missing-bridge errors below. */
+export const MIN_BRIDGE_APP_VERSION = "0.1.41";
+
+const UPDATE_HINT =
+  "your installed Clipy app may predate the agent bridge — update via https://clipy.online/download";
+
 export function bridgeFilePath(): string {
   if (process.env.CLIPY_BRIDGE_FILE?.trim()) return process.env.CLIPY_BRIDGE_FILE;
   return join(homedir(), "Library", "Application Support", "Clipy", "agent-bridge.json");
+}
+
+/** Numeric-dotted version compare: a<b → -1, a==b → 0, a>b → 1. Missing/short
+ *  parts count as 0 (so "0.1" == "0.1.0"). */
+export function compareVersions(a: string, b: string): number {
+  const pa = a.split(".").map((x) => parseInt(x, 10) || 0);
+  const pb = b.split(".").map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+/** True only when a well-formed appVersion is present AND older than the minimum.
+ *  A missing/garbled version returns false — we can't prove it's old, so callers
+ *  fall back to the softer "may predate the bridge" hint instead. */
+export function bridgeAppOutdated(appVersion: string | null | undefined): boolean {
+  const v = appVersion?.trim();
+  if (!v || !/^\d+(\.\d+)*$/.test(v)) return false;
+  return compareVersions(v, MIN_BRIDGE_APP_VERSION) < 0;
 }
 
 function pidAlive(pid: number): boolean {
@@ -43,8 +74,11 @@ function pidAlive(pid: number): boolean {
 }
 
 /** Reads + validates the discovery file; throws BridgeUnavailableError with a
- *  friendly one-liner when the app isn't installed or running. */
+ *  diagnostic one-liner (file path, pid + liveness, appVersion, and an update
+ *  hint when the app looks too old) so an agent hitting a dead end can see what
+ *  was actually found and self-correct. */
 export function readBridgeInfo(): BridgeInfo {
+  const path = bridgeFilePath();
   if (process.platform !== "darwin" && !process.env.CLIPY_BRIDGE_FILE) {
     throw new BridgeUnavailableError(
       "--source mac-screen records through the Clipy Mac app, which only runs on macOS.",
@@ -52,27 +86,205 @@ export function readBridgeInfo(): BridgeInfo {
   }
   let raw: string;
   try {
-    raw = readFileSync(bridgeFilePath(), "utf8");
+    raw = readFileSync(path, "utf8");
   } catch {
     throw new BridgeUnavailableError(
-      "the Clipy app is not running (no agent bridge found). Open Clipy, or install it from https://clipy.online/download",
+      `the Clipy app is not running: no agent bridge file at ${path}. ` +
+        `Open Clipy (or install it from https://clipy.online/download). ` +
+        `If Clipy IS running, ${UPDATE_HINT}.`,
     );
   }
   let info: BridgeInfo;
   try {
     info = JSON.parse(raw) as BridgeInfo;
   } catch {
-    throw new BridgeUnavailableError("agent bridge file is corrupt — restart the Clipy app");
+    throw new BridgeUnavailableError(
+      `agent bridge file at ${path} is corrupt (unparseable JSON) — restart the Clipy app`,
+    );
   }
   if (!info.socketPath || !info.token || typeof info.pid !== "number") {
-    throw new BridgeUnavailableError("agent bridge file is incomplete — restart the Clipy app");
+    const seen = info.appVersion ? ` (file reports appVersion ${info.appVersion})` : "";
+    throw new BridgeUnavailableError(
+      `agent bridge file at ${path} is incomplete — missing socketPath/token/pid${seen}. ` +
+        `Restart the Clipy app.`,
+    );
   }
   if (!pidAlive(info.pid)) {
+    // A dead pid whose file also reports a pre-bridge version is the classic
+    // "app predates the agent bridge" shape: an older Clipy is running under a
+    // different pid and can't rewrite this file (it has no bridge code), so a
+    // fresh launch never clears the stale artifact. Say so, don't just say
+    // "restart".
+    if (bridgeAppOutdated(info.appVersion)) {
+      throw new BridgeUnavailableError(
+        `stale agent bridge at ${path} (pid ${info.pid} is dead, file appVersion ${info.appVersion}). ` +
+          `Your installed Clipy app likely predates the agent bridge (needs ${MIN_BRIDGE_APP_VERSION}+) — ` +
+          `update via https://clipy.online/download.`,
+      );
+    }
     throw new BridgeUnavailableError(
-      "the Clipy app is not running (stale agent bridge). Open Clipy and try again.",
+      `stale agent bridge at ${path}: pid ${info.pid} is not running (dead)` +
+        `${info.appVersion ? `, appVersion ${info.appVersion}` : ""} — the Clipy app has quit. ` +
+        `Open Clipy and try again.`,
     );
   }
   return info;
+}
+
+/** Full BridgeInfo (INCLUDING the token) straight from the discovery file,
+ *  skipping the liveness/version gating readBridgeInfo does — for the doctor
+ *  handshake, which wants to attempt a `status` call even against a possibly
+ *  stale file. Returns null when absent/incomplete. The token this carries must
+ *  never be logged or placed in doctor's printed output. */
+export function bridgeInfoFromFile(): BridgeInfo | null {
+  try {
+    const info = JSON.parse(readFileSync(bridgeFilePath(), "utf8")) as Partial<BridgeInfo>;
+    if (!info.socketPath || !info.token || typeof info.pid !== "number") return null;
+    return {
+      socketPath: info.socketPath,
+      token: info.token,
+      pid: info.pid,
+      appVersion: typeof info.appVersion === "string" ? info.appVersion : "",
+      protocolVersion: typeof info.protocolVersion === "number" ? info.protocolVersion : 1,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Can we open the bridge's Unix socket at all? (Openable but unanswered is a
+ *  distinct failure from a missing socket — doctor reports them separately.) */
+export function probeSocketOpenable(socketPath: string): Promise<boolean> {
+  return new Promise((resolvePromise) => {
+    const socket = createConnection({ path: socketPath });
+    let done = false;
+    const finish = (openable: boolean) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolvePromise(openable);
+    };
+    const timer = setTimeout(() => finish(false), 2_000);
+    socket.on("connect", () => {
+      clearTimeout(timer);
+      finish(true);
+    });
+    socket.on("error", () => {
+      clearTimeout(timer);
+      finish(false);
+    });
+  });
+}
+
+/** Live handshake: ask the running app for its status (which echoes appVersion)
+ *  so doctor can confirm the socket answers AND catch a discovery file that
+ *  points at a different app version than the one actually replying. */
+export async function probeBridgeHandshake(
+  info: BridgeInfo,
+): Promise<{ ok: boolean; appVersion?: string; error?: string }> {
+  try {
+    const data = await bridgeRequest(info, "status");
+    const appVersion = typeof data.appVersion === "string" ? data.appVersion : undefined;
+    return { ok: true, appVersion };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+/** Structured, non-throwing health snapshot of the agent bridge for `clipy
+ *  doctor`. Mirrors readBridgeInfo's validation but reports each sub-check
+ *  (exists / parses / complete / pid alive / appVersion) instead of failing on
+ *  the first problem. */
+export interface BridgeDiagnostics {
+  path: string;
+  /** false on non-macOS without CLIPY_BRIDGE_FILE — the bridge doesn't apply. */
+  applicable: boolean;
+  exists: boolean;
+  parses: boolean;
+  complete: boolean;
+  pid: number | null;
+  pidAlive: boolean | null;
+  appVersion: string | null;
+  /** true = >= MIN, false = < MIN, null = unknown (missing/garbled version). */
+  versionOk: boolean | null;
+  socketPath: string | null;
+  /** Discovery-file mtime (ms) — the app rewrites it on every launch (0.1.41+),
+   *  so a very old mtime alongside a dead pid is the stale-artifact shape. */
+  mtimeMs: number | null;
+  healthy: boolean;
+  detail: string;
+}
+
+export function inspectBridge(): BridgeDiagnostics {
+  const path = bridgeFilePath();
+  const applicable = process.platform === "darwin" || !!process.env.CLIPY_BRIDGE_FILE?.trim();
+  const base: BridgeDiagnostics = {
+    path,
+    applicable,
+    exists: false,
+    parses: false,
+    complete: false,
+    pid: null,
+    pidAlive: null,
+    appVersion: null,
+    versionOk: null,
+    socketPath: null,
+    mtimeMs: null,
+    healthy: false,
+    detail: "",
+  };
+  if (!applicable) {
+    return {
+      ...base,
+      detail: "not macOS — the agent bridge is only used for --source mac-screen on macOS",
+    };
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return {
+      ...base,
+      detail: "no bridge file (the Clipy app is not running, or it predates the agent bridge)",
+    };
+  }
+  let mtimeMs: number | null = null;
+  try {
+    mtimeMs = statSync(path).mtimeMs;
+  } catch {
+    // mtime is best-effort context, not a gate
+  }
+  const rep: BridgeDiagnostics = { ...base, exists: true, mtimeMs };
+  let info: Partial<BridgeInfo>;
+  try {
+    info = JSON.parse(raw) as Partial<BridgeInfo>;
+  } catch {
+    return { ...rep, detail: "bridge file is corrupt (unparseable JSON)" };
+  }
+  rep.parses = true;
+  rep.appVersion = typeof info.appVersion === "string" ? info.appVersion : null;
+  rep.socketPath = typeof info.socketPath === "string" ? info.socketPath : null;
+  rep.pid = typeof info.pid === "number" ? info.pid : null;
+  rep.complete = !!info.socketPath && !!info.token && typeof info.pid === "number";
+  if (!rep.complete) {
+    return { ...rep, detail: "bridge file is incomplete (missing socketPath/token/pid)" };
+  }
+  rep.pidAlive = pidAlive(info.pid as number);
+  rep.versionOk = rep.appVersion ? !bridgeAppOutdated(rep.appVersion) : null;
+  if (!rep.pidAlive) {
+    return { ...rep, detail: `pid ${rep.pid} is not running (the Clipy app has quit)` };
+  }
+  if (bridgeAppOutdated(rep.appVersion)) {
+    return {
+      ...rep,
+      detail: `Clipy app v${rep.appVersion} is older than the required v${MIN_BRIDGE_APP_VERSION} — ${UPDATE_HINT}`,
+    };
+  }
+  return {
+    ...rep,
+    healthy: true,
+    detail: `Clipy app v${rep.appVersion ?? "?"} running (pid ${rep.pid})`,
+  };
 }
 
 interface BridgeOk {
