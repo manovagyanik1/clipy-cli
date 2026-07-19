@@ -14,10 +14,10 @@ recording an instant share link, an AI transcript and summary, and
 [agent-readable context](https://clipy.online/for-agents) — so both humans and AI
 agents can act on what was recorded. This package is its terminal client.
 
-The read commands work with any valid key. The recording commands — [`record`](#record)
-and the `session` flow (`session start`, `mark`, `session stop`) — need the key's
-`ingest` scope ("Record & upload"); a read-only key can read your recordings but can
-never create, edit, or delete them.
+The read commands need the `recordings:read` scope, which every key gets by default. The
+recording commands — [`record`](#record) and the `session` flow (`session start`, `mark`,
+`session stop`) — need the key's `ingest` scope ("Record & upload"); a `recordings:read`-only
+key can read your recordings but can never create, edit, or delete them.
 
 > This repository is the public mirror of **`@clipy/cli`**. The package is developed in
 > the Clipy monorepo and synced here with each npm release — browse the source or file
