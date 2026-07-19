@@ -33,10 +33,11 @@
 
 import { createServer } from "node:http";
 import { spawnSync, spawn, execSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import assert from "node:assert/strict";
 
 const DIST_INDEX = fileURLToPath(new URL("../dist/index.js", import.meta.url));
@@ -156,13 +157,19 @@ function runCli(args, { cwd, env } = {}) {
   });
 }
 
-/** Read the single session state file this workspace's daemon wrote. */
-function readSessionState(configHome) {
+/** The single session state file this workspace's daemon wrote (path + parsed). */
+function sessionFileOf(configHome) {
   const dir = join(configHome, "clipy", "sessions");
   const file = readdirSync(dir).find((n) => n.startsWith("session-") && n.endsWith(".json"));
   if (!file) throw new Error(`no session state file under ${dir}`);
-  return JSON.parse(readFileSync(join(dir, file), "utf8"));
+  return join(dir, file);
 }
+function readSessionState(configHome) {
+  return JSON.parse(readFileSync(sessionFileOf(configHome), "utf8"));
+}
+
+// Resolve the GLOBAL Playwright (same copy the CLI daemon uses) for the CDP test.
+const globalRequire = createRequire(join(NODE_PATH || tmpdir(), "clipy-noop.cjs"));
 
 const noteText = (notes, needle) => notes.find((n) => typeof n.text === "string" && n.text.includes(needle));
 
@@ -329,6 +336,213 @@ await test("mark --at with --ago is a usage error (exit 2)", async () => {
   const r = await runCli(["mark", "claim", "--at", "2", "--ago", "3"], ws);
   assert.equal(r.code, 2, `expected exit 2, got ${r.code}: ${r.stderr}`);
   assert.match(r.stderr, /--at and --ago are mutually exclusive/);
+});
+
+// --- NEW-1: session resolution via CLIPY_SESSION_FILE from a foreign cwd -----
+
+await test("mark resolves the session via CLIPY_SESSION_FILE from a different cwd", async () => {
+  const ws = freshWorkspace();
+  const otherCwd = mkdtempSync(join(tmpdir(), "clipy-ctl-other-"));
+  try {
+    const start = await runCli(["session", "start", "--url", appBase, "--max", "30"], ws);
+    assert.equal(start.code, 0, `session start failed (${start.code}): ${start.stderr}`);
+    const sessFile = sessionFileOf(ws.configHome);
+
+    // From a different cwd, WITHOUT the env var: the cwd hash misses ⇒ no session.
+    const noEnv = await runCli(["mark", "from elsewhere"], { cwd: otherCwd, env: ws.env });
+    assert.equal(noEnv.code, 1, `expected exit 1 without CLIPY_SESSION_FILE, got ${noEnv.code}`);
+    assert.match(noEnv.stderr, /no recording session/);
+
+    // WITH CLIPY_SESSION_FILE: it resolves the session even from the foreign cwd.
+    const withEnv = await runCli(["mark", "resolved by env"], {
+      cwd: otherCwd,
+      env: { ...ws.env, CLIPY_SESSION_FILE: sessFile },
+    });
+    assert.equal(withEnv.code, 0, `env-resolved mark failed (${withEnv.code}): ${withEnv.stderr}`);
+    assert.match(withEnv.stdout, /✓ mark @/);
+  } finally {
+    await runCli(["session", "abort"], ws).catch(() => {});
+  }
+});
+
+// --- NEW-4: in-page __clipyMark assertions over CDP -------------------------
+
+await test("in-page __clipyMark(text, opts) evaluates assertions daemon-side (✓/✗) + rejects bad opts", async () => {
+  const ws = freshWorkspace();
+  lastComplete = null;
+  let cdpBrowser = null;
+  try {
+    const start = await runCli(["session", "start", "--url", appBase, "--max", "30", "--expose-cdp", "--json"], ws);
+    assert.equal(start.code, 0, `session start --expose-cdp failed (${start.code}): ${start.stderr}`);
+    const cdpHttpUrl = JSON.parse(start.stdout).cdpHttpUrl;
+    assert.ok(cdpHttpUrl, `expected a cdpHttpUrl in start --json; got ${start.stdout}`);
+
+    const { chromium } = globalRequire("playwright");
+    cdpBrowser = await chromium.connectOverCDP(cdpHttpUrl);
+    const page = cdpBrowser.contexts()[0].pages()[0];
+
+    // Passing assertion (#t contains Hello) → ✓-annotated, returned to the driver.
+    const passRes = await page.evaluate(() =>
+      window.__clipyMark("in-page hello", { assertSelector: "#t", assertText: "Hello" }),
+    );
+    assert.ok(passRes && passRes.text.includes("[assert ✓"), `in-page pass should be ✓: ${JSON.stringify(passRes)}`);
+
+    // Failing assertion (#nope missing) → ✗-annotated (warn: session continues).
+    const failRes = await page.evaluate(() => window.__clipyMark("in-page missing", { assertSelector: "#nope" }));
+    assert.ok(failRes && failRes.text.includes("[ASSERT ✗"), `in-page fail should be ✗: ${JSON.stringify(failRes)}`);
+
+    // assertText without assertSelector rejects (the driver sees the misuse).
+    let threw = false;
+    try {
+      await page.evaluate(() => window.__clipyMark("bad opts", { assertText: "x" }));
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw, "assertText without assertSelector must reject to the driver");
+
+    await cdpBrowser.close(); // detach — the recording keeps going
+    cdpBrowser = null;
+
+    const stop = await runCli(["session", "stop", "--json"], ws);
+    assert.equal(stop.code, 0, `session stop failed (${stop.code}): ${stop.stderr}`);
+
+    const notes = lastComplete?.narration?.notes ?? [];
+    assert.ok(noteText(notes, "in-page hello") && noteText(notes, "in-page hello").text.includes("[assert ✓"), "in-page pass in transcript");
+    assert.ok(noteText(notes, "in-page missing") && noteText(notes, "in-page missing").text.includes("[ASSERT ✗"), "in-page fail in transcript");
+    assert.match(notes[0].text, /^\[verification\] 2 assertion\(s\): 1 passed, 1 failed$/, `verification leads: ${notes[0]?.text}`);
+  } finally {
+    if (cdpBrowser) await cdpBrowser.close().catch(() => {});
+    await runCli(["session", "abort"], ws).catch(() => {});
+  }
+});
+
+// --- P0: a mark NEVER drops -------------------------------------------------
+
+// (1) Genuinely-unreachable control endpoint → the asserted mark is recorded
+// with a ⚠ UNVERIFIED tag (never a silent pass) and lands in the K tally bucket.
+// Simulated by pointing the client at a closed port (deterministic ECONNREFUSED);
+// the daemon never sees the mark, so nothing dedups it away.
+await test("unreachable control endpoint → asserted mark recorded ⚠ UNVERIFIED + K tally bucket", async () => {
+  const ws = freshWorkspace();
+  lastComplete = null;
+  try {
+    const start = await runCli(["session", "start", "--url", appBase, "--max", "60"], ws);
+    assert.equal(start.code, 0, `session start failed (${start.code}): ${start.stderr}`);
+
+    const sessFile = sessionFileOf(ws.configHome);
+    const st = JSON.parse(readFileSync(sessFile, "utf8"));
+    const deadPort = await new Promise((res) => {
+      const s = createServer();
+      s.listen(0, "127.0.0.1", () => {
+        const p = s.address().port;
+        s.close(() => res(p));
+      });
+    });
+    // The daemon keeps its real port in memory; only the client reads this field,
+    // and `session stop` uses the control FILE, so this doesn't break stop.
+    writeFileSync(sessFile, JSON.stringify({ ...st, controlPort: deadPort }));
+
+    const m = await runCli(["mark", "cannot verify this", "--assert-selector", "#t", "--assert-text", "Hello"], ws);
+    assert.equal(m.code, 0, `a mark to an unreachable daemon must still exit 0, got ${m.code}: ${m.stderr}`);
+    assert.match(m.stderr, /UNVERIFIED/, `expected a loud ⚠ UNVERIFIED line: ${m.stderr}`);
+
+    const stop = await runCli(["session", "stop", "--json"], ws);
+    assert.equal(stop.code, 0, `session stop failed (${stop.code}): ${stop.stderr}`);
+
+    const notes = lastComplete?.narration?.notes ?? [];
+    const mark = noteText(notes, "cannot verify this");
+    assert.ok(mark, `the un-droppable mark must be in the transcript: ${JSON.stringify(notes.map((n) => n.text))}`);
+    assert.ok(mark.text.includes("[ASSERT ⚠"), `the mark must carry the ⚠ unverified tag: ${mark.text}`);
+    assert.match(notes[0].text, /^\[verification\].*\bunverified\b/, `tally must show the K bucket: ${notes[0]?.text}`);
+  } finally {
+    await runCli(["session", "abort"], ws).catch(() => {});
+  }
+});
+
+// (2) A daemon that STALLS then catches up (kill -STOP / -CONT, the real recompile
+// scenario): the client times out and writes a ⚠ safety-net mark, but the daemon
+// eventually processes the same HTTP mark — so dedup (client id) keeps the daemon's
+// evaluated copy and the mark appears EXACTLY ONCE. Never lost, never duplicated.
+await test("SIGSTOP then SIGCONT: a slow-daemon mark is never lost and never duplicated", async () => {
+  const ws = freshWorkspace();
+  lastComplete = null;
+  let daemonPid = 0;
+  let stopped = false;
+  try {
+    const start = await runCli(["session", "start", "--url", appBase, "--max", "60"], ws);
+    assert.equal(start.code, 0, `session start failed (${start.code}): ${start.stderr}`);
+    daemonPid = readSessionState(ws.configHome).pid;
+    try {
+      process.kill(daemonPid, "SIGSTOP");
+      stopped = true;
+    } catch (e) {
+      console.log(`    (skipping — SIGSTOP unavailable: ${e.message})`);
+      return;
+    }
+    const m = await runCli(["mark", "slow daemon mark", "--assert-selector", "#t", "--assert-text", "Hello"], {
+      cwd: ws.cwd,
+      env: { ...ws.env, CLIPY_CONTROL_TIMEOUT_MS: "1000" },
+    });
+    assert.equal(m.code, 0, `a slow-daemon mark must still exit 0, got ${m.code}: ${m.stderr}`);
+    assert.match(m.stderr, /UNVERIFIED/, `client should report ⚠ after the timeout: ${m.stderr}`);
+
+    process.kill(daemonPid, "SIGCONT");
+    stopped = false;
+
+    const stop = await runCli(["session", "stop", "--json"], ws);
+    assert.equal(stop.code, 0, `session stop failed (${stop.code}): ${stop.stderr}`);
+
+    const notes = lastComplete?.narration?.notes ?? [];
+    const hits = notes.filter((n) => typeof n.text === "string" && n.text.includes("slow daemon mark"));
+    assert.equal(
+      hits.length,
+      1,
+      `the mark must appear EXACTLY once (never lost, never duplicated); got ${hits.length}: ${JSON.stringify(hits.map((h) => h.text))}`,
+    );
+  } finally {
+    if (stopped && daemonPid) {
+      try {
+        process.kill(daemonPid, "SIGCONT");
+      } catch {
+        // already gone
+      }
+    }
+    await runCli(["session", "abort"], ws).catch(() => {});
+  }
+});
+
+// --- NEW-2: --user-data-dir persistent profile ------------------------------
+
+await test("record --user-data-dir uses a persistent profile and uploads", async () => {
+  const ws = freshWorkspace();
+  const profile = mkdtempSync(join(tmpdir(), "clipy-ctl-profile-"));
+  const before = completeCalls;
+  const r = await runCli(
+    ["record", "--url", appBase, "--for", "2", "--user-data-dir", profile, "--json"],
+    ws,
+  );
+  assert.equal(r.code, 0, `record --user-data-dir should exit 0; got ${r.code}: ${r.stderr}`);
+  assert.ok(completeCalls > before, "the persistent-profile capture uploaded (complete called)");
+});
+
+await test("--user-data-dir + --storage-state is a usage error (exit 2)", async () => {
+  const ws = freshWorkspace();
+  const profile = mkdtempSync(join(tmpdir(), "clipy-ctl-profile2-"));
+  const r = await runCli(
+    ["record", "--url", appBase, "--user-data-dir", profile, "--storage-state", join(profile, "auth.json")],
+    ws,
+  );
+  assert.equal(r.code, 2, `expected exit 2, got ${r.code}: ${r.stderr}`);
+  assert.match(r.stderr, /mutually exclusive/);
+});
+
+await test("--user-data-dir on a locked profile (SingletonLock) is refused (exit 2)", async () => {
+  const ws = freshWorkspace();
+  const profile = mkdtempSync(join(tmpdir(), "clipy-ctl-locked-"));
+  writeFileSync(join(profile, "SingletonLock"), ""); // looks like a live Chrome profile
+  const r = await runCli(["record", "--url", appBase, "--user-data-dir", profile], ws);
+  assert.equal(r.code, 2, `expected exit 2, got ${r.code}: ${r.stderr}`);
+  assert.match(r.stderr, /live\/locked Chrome profile/);
 });
 
 appServer.close();

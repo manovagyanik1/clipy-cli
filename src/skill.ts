@@ -15,7 +15,7 @@ description: Read and create Clipy screen recordings. Use when the user shares a
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.8.0 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.8.1 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
@@ -103,6 +103,25 @@ work on both \`record\` and \`session start\` (web only; rejected on --source ma
   repeatable; without a Domain it's url-scoped to the target.
 - \`--local-storage "key=value"\` — repeatable; origin-guarded to the target.
 - \`--init-script <file>\` — a JS file run before every page's own scripts.
+- \`--user-data-dir <dir>\` — launch a PERSISTENT Chromium profile from \`dir\`
+  (its whole logged-in identity, not just injected storage). Web only; mutually
+  exclusive with --storage-state; --cookie/--local-storage/--init-script still
+  compose. Point it at a COPY or a dedicated profile — never your live Chrome's
+  default profile (Chrome locks it; Clipy refuses a dir with a SingletonLock).
+
+### The auth boundary (read this if a login won't stick)
+
+\`--storage-state\` seeds ONLY the cookies + localStorage the file CONTAINS — it
+cannot conjure a whole browser identity, so an app that also needs cross-origin
+or auth-host cookies (SSO, a separate API domain) can still bounce to /login.
+Three reliable ways to record a real logged-in app:
+1. Produce the state file with a REAL interactive login (it captures cross-domain
+   cookies): \`npx playwright open --save-storage=auth.json https://<login-host>\`,
+   sign in, close — then \`--storage-state auth.json\`.
+2. \`--user-data-dir <dedicated-profile>\` — a persistent profile you logged into
+   once (copy it out of your real Chrome, or make a throwaway profile).
+3. \`--source mac-screen --window "Chrome"\` — record your REAL logged-in Chrome
+   window (Mac app), no headless auth to reproduce at all.
 
 ## Session mode — you drive the app, Clipy records
 
@@ -152,10 +171,16 @@ A pass annotates the mark \`… [assert ✓ <observed>]\`; a fail annotates it
 assertion, it can never read as fact. \`--fail-mode warn\` (default) records the ✗
 and keeps going; \`--fail-mode abort\` DISCARDS the whole session (nothing uploaded,
 non-zero exit) so you never ship a clip that asserted its way into a broken state.
-If any assertions ran, a leading \`[verification] N assertion(s): P passed, F failed\`
-note opens the transcript. Assertions need a WEB session (rejected on --source
-mac-screen — there's no page to probe). Prefer asserting the specific claims a
-reviewer cares about over narrating them unverified.
+If any assertion was attempted, a leading \`[verification] N assertion(s): P passed,
+F failed[, K unverified]\` note opens the transcript.
+
+A mark is NEVER dropped: if the recording daemon can't be reached to evaluate an
+assertion (e.g. its event loop is briefly starved during a dev-server recompile),
+\`clipy mark\` still records the narration, tags it \`[ASSERT ⚠ could not evaluate —
+<reason>]\`, prints a loud ⚠, and exits 0 — an unverified claim is flagged as
+unverified (the K bucket), never passed off as a ✓. Assertions need a WEB session
+(rejected on --source mac-screen — there's no page to probe). Prefer asserting the
+specific claims a reviewer cares about over narrating them unverified.
 
 ### Before/after in one recording (clipy chapter)
 
@@ -178,9 +203,13 @@ If your driver script crashes, a plain \`session start\` keeps recording dead ai
 
 It starts the session, runs everything after \`--\` with inherited stdio, then: exit
 0 → \`session stop\` (upload); any non-zero exit or signal → \`session abort\` (discard)
-with the child's exit code propagated. The command runs with \`CLIPY_SESSION=1\` set
-(and \`CLIPY_CDP_URL=<cdpHttpUrl>\` when --expose-cdp). All session-start flags apply
-before the \`--\`.
+with the child's exit code propagated. The command runs with \`CLIPY_SESSION=1\`,
+\`CLIPY_SESSION_FILE=<path>\`, and (when --expose-cdp) \`CLIPY_CDP_URL=<cdpHttpUrl>\`.
+All session-start flags apply before the \`--\`.
+
+\`clipy mark\`/\`chapter\` find the session from \`CLIPY_SESSION_FILE\` first, then the
+current directory — so a driver you \`session run\` can shell out \`clipy mark\` from
+ANY cwd and still hit the right session (no "no recording session" surprise).
 
 ### Mark timing (backdating + in-page marks)
 
@@ -191,10 +220,26 @@ the state it describes. Backdate onto the recording clock:
     clipy mark "page loaded" --at 4         # absolute 4s on the recording clock
 
 When you drive over --expose-cdp, emit marks IN-PAGE with zero spawn latency by
-calling the bindings the daemon exposes:
+calling the bindings the daemon exposes (they run daemon-side with the page in
+hand — no \`clipy mark\` process, no shell-out latency):
 
     await page.evaluate(() => window.__clipyMark("clicked Export"));
     await page.evaluate(() => window.__clipyChapter("AFTER — fix applied"));
+
+\`__clipyMark\` takes the SAME assertions as the CLI, via a second options arg —
+evaluated daemon-side, annotated ✓/✗ identically:
+
+    await page.evaluate(() =>
+      window.__clipyMark("status is Active", {
+        assertSelector: ".status-badge", assertText: "Active",   // assertText needs assertSelector
+        assertUrl: "**/redemptions",                             // optional
+        failMode: "abort",                                       // optional; "warn" default
+      }),
+    );
+
+It returns the annotated result (\`{ tMs, text, assert }\`); \`assertText\` without
+\`assertSelector\` REJECTS so your driver sees the misuse, and \`failMode: "abort"\`
+discards the session just like the CLI flag.
 
 (While CDP is exposed the page's own scripts can call these too — same trust model as
 --expose-cdp itself.) \`clipy playwright-path\` prints the node_modules dir to resolve

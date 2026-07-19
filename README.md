@@ -146,6 +146,13 @@ to headless web capture on `record` and `session start`; they're rejected on
   (repeatable).
 - `--init-script <file>` — run a JS file in every page before its own scripts (e.g. to
   stub a feature flag or inject a token).
+- `--user-data-dir <dir>` — launch a **persistent** Chromium profile from `dir` instead
+  of an ephemeral context (`launchPersistentContext`), so the recording carries that
+  profile's whole logged-in identity. Web only; **mutually exclusive with
+  `--storage-state`** (a profile already carries its own storage). `--cookie` /
+  `--local-storage` / `--init-script` still compose. Point it at a **copy** or a
+  dedicated profile — never your live Chrome's default profile: Chrome locks a profile
+  while it's open, so Clipy refuses a dir that has a `SingletonLock`/`SingletonSocket`.
 
 ```bash
 # Reuse a saved Playwright login
@@ -155,7 +162,29 @@ clipy record --url https://app.example.com/dashboard --for 20 \
 # Or seed a token directly
 clipy record --url https://app.example.com/dashboard \
   --local-storage "authToken=eyJ…" --cookie "sid=abc; Domain=app.example.com; Secure"
+
+# Or record a persistent logged-in profile
+clipy record --url https://app.example.com/dashboard --for 20 \
+  --user-data-dir ./clipy-profile
 ```
+
+#### The auth boundary
+
+`--storage-state` seeds only the cookies and `localStorage` the **file contains** — it
+can't conjure a whole browser identity, so an app that also needs cross-origin or
+auth-host cookies (SSO, a separate API domain) can still bounce to `/login`. Three
+reliable ways to get a real logged-in recording:
+
+1. **Produce the state file with a real interactive login** (it captures cross-domain
+   cookies a hand-built file misses):
+   ```bash
+   npx playwright open --save-storage=auth.json https://login.example.com
+   # sign in, close the window, then:
+   clipy record --url https://app.example.com/dashboard --storage-state auth.json
+   ```
+2. **`--user-data-dir <dedicated-profile>`** — a persistent profile you logged into once.
+3. **`--source mac-screen --window "Chrome"`** — record your real, already-logged-in
+   Chrome window through the Mac app; there's no headless auth to reproduce at all.
 
 ## Session mode — you work, Clipy records
 
@@ -208,12 +237,28 @@ resolves Playwright from **its own** directory — if `require("playwright")` ca
 run the script with `NODE_PATH=$(clipy playwright-path) node driver.js`.
 
 **In-page marks (zero spawn latency).** While `--expose-cdp` is on, the daemon also exposes
-`window.__clipyMark("text")` and `window.__clipyChapter("label")` in the recorded page.
-Calling them from your driver (`page.evaluate(() => window.__clipyMark("clicked Export"))`)
-emits a mark or chapter *without* spawning a `clipy mark` process, so it lands exactly when
-your code runs. These marks land in the same transcript and count toward the same 200-mark
-cap. Note: while CDP is exposed the page's **own** scripts can call these too — that's the
-same trust boundary as `--expose-cdp` itself (any local process can already drive the
+`window.__clipyMark("text", opts?)` and `window.__clipyChapter("label")` in the recorded
+page. Calling them from your driver emits a mark/chapter *without* spawning a `clipy mark`
+process, so it lands exactly when your code runs, and it runs **daemon-side with the page in
+hand**. `__clipyMark`'s second argument takes the same assertions as the CLI flags —
+evaluated and annotated ✓/✗ identically:
+
+```js
+await page.evaluate(() => window.__clipyMark("clicked Export"));
+await page.evaluate(() =>
+  window.__clipyMark("status is Active", {
+    assertSelector: ".status-badge",
+    assertText: "Active",     // needs assertSelector — otherwise the call rejects
+    assertUrl: "**/redemptions", // optional
+    failMode: "abort",           // optional; "warn" is the default
+  }),
+);
+```
+
+It returns the annotated `{ tMs, text, assert }`; `failMode: "abort"` discards the session
+just like the flag. These marks land in the same transcript and count toward the same
+200-mark cap. Note: while CDP is exposed the page's **own** scripts can call these too —
+the same trust boundary as `--expose-cdp` itself (any local process can already drive the
 browser), so only enable it when you intend to drive the session.
 
 `session start` also accepts the same auth flags as `record`
@@ -256,8 +301,18 @@ freely — all provided checks must pass.
 `--fail-mode` decides what a failed assertion does: `warn` (default) records the `✗` and
 keeps recording; **`abort` discards the whole session** — nothing is uploaded and the CLI
 exits non-zero, so a driver that asserts its way to a broken state doesn't ship a misleading
-clip. If any assertions ran, a leading `[verification] N assertion(s): P passed, F failed`
-note is prepended at 0 ms, so the transcript and the `.md` context open with the scorecard.
+clip. If any assertion was attempted, a leading `[verification] N assertion(s): P passed,
+F failed[, K unverified]` note is prepended at 0 ms, so the transcript and the `.md` context
+open with the scorecard.
+
+**A mark is never dropped.** If the daemon can't be reached to evaluate an assertion — its
+event loop briefly starved during a heavy dev-server recompile, say — `clipy mark` doesn't
+fail and lose the note. It records the narration anyway, tags it
+`[ASSERT ⚠ could not evaluate — <reason>]`, prints a loud `⚠`, and exits 0. An unverified
+claim is flagged as unverified (the `K` in the tally), never silently promoted to a `✓`. If
+the daemon was only slow (not gone) and processes the same mark a moment later, a
+client-generated id dedups the two so the evaluated copy wins and the mark appears exactly
+once.
 
 Assertions evaluate against a real page, so they need a **web** session (they're rejected on
 `--source mac-screen`, which records the real screen with no page to probe).
@@ -288,11 +343,16 @@ clipy session run --url http://localhost:3000 --expose-cdp -- node driver.js
 
 It starts the session, runs everything after `--` with inherited stdio, and then: **exit 0
 → `session stop`** (upload + share link); **any non-zero exit or a signal → `session abort`**
-(discard) and the child's exit code is propagated. The command runs with `CLIPY_SESSION=1`
-in its environment (and `CLIPY_CDP_URL=<cdpHttpUrl>` when `--expose-cdp` is set, so the
-driver knows where to attach). `Ctrl-C` is forwarded to the child, then the session is
-discarded. All the `session start` flags (`--url`, `--title`, `--max`, `--type`,
-`--expose-cdp`, auth flags) apply before the `--`.
+(discard) and the child's exit code is propagated. The command runs with `CLIPY_SESSION=1`,
+`CLIPY_SESSION_FILE=<path>`, and (when `--expose-cdp`) `CLIPY_CDP_URL=<cdpHttpUrl>` in its
+environment. `Ctrl-C` is forwarded to the child, then the session is discarded. All the
+`session start` flags (`--url`, `--title`, `--max`, `--type`, `--expose-cdp`, auth flags)
+apply before the `--`.
+
+`clipy mark` / `clipy chapter` resolve the session from `CLIPY_SESSION_FILE` first and the
+current directory second — so a driver you launch with `session run` can shell out
+`clipy mark …` from **any working directory** and still hit the right session, instead of
+failing with "no recording session in this workspace".
 
 ### Backdating a mark
 
