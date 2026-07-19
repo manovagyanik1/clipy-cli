@@ -84,6 +84,111 @@ interface BridgeErr {
   error: { code: string; message: string };
 }
 
+// --- Capture-source targeting (record a window/display, not just the screen) --
+
+/** Mirrors the app's serde-tagged CaptureSourceDto: {type:"window",id} etc. */
+export type CaptureSource =
+  | { type: "display"; id: number }
+  | { type: "window"; id: number }
+  | { type: "area"; display_id: number; x: number; y: number; width: number; height: number };
+
+export interface BridgeDisplay {
+  id: number;
+  name: string;
+  width: number;
+  height: number;
+}
+
+export interface BridgeWindow {
+  id: number;
+  app_name: string;
+  title: string;
+  width: number;
+  height: number;
+}
+
+export interface BridgeSources {
+  displays: BridgeDisplay[];
+  windows: BridgeWindow[];
+}
+
+/** Enumerate capturable displays + windows from the running app. */
+export async function listSources(info: BridgeInfo): Promise<BridgeSources> {
+  const data = await bridgeRequest(info, "sources");
+  const displays = Array.isArray(data.displays) ? (data.displays as BridgeDisplay[]) : [];
+  const windows = Array.isArray(data.windows) ? (data.windows as BridgeWindow[]) : [];
+  return { displays, windows };
+}
+
+export function windowLabel(w: BridgeWindow): string {
+  return w.title ? `${w.app_name} — ${w.title}` : w.app_name;
+}
+
+/**
+ * Resolves --window/--display flags to a CaptureSource. A numeric value is
+ * treated as an id from `clipy sources`; anything else is a case-insensitive
+ * substring match on "app_name title" (windows) or name (displays). Ambiguity
+ * throws with the candidate list — ids are unstable across app launches, so
+ * silent guessing would record the wrong thing.
+ */
+export async function resolveCaptureSource(
+  info: BridgeInfo,
+  opts: { window?: string; display?: string },
+): Promise<{ source: CaptureSource; label: string }> {
+  if (opts.window && opts.display) {
+    throw new Error("--window and --display are mutually exclusive — pick one capture source");
+  }
+  const sources = await listSources(info);
+  if (opts.window) {
+    const q = opts.window.trim();
+    let matches: BridgeWindow[];
+    if (/^\d+$/.test(q)) {
+      matches = sources.windows.filter((w) => w.id === Number(q));
+    } else {
+      const needle = q.toLowerCase();
+      matches = sources.windows.filter((w) =>
+        `${w.app_name} ${w.title}`.toLowerCase().includes(needle),
+      );
+      // Several windows of several apps can match a loose substring; an exact
+      // app-name match ("Chrome") is almost always what the caller meant.
+      if (matches.length > 1) {
+        const exactApp = matches.filter((w) => w.app_name.toLowerCase() === needle);
+        if (exactApp.length >= 1) matches = exactApp;
+      }
+    }
+    if (matches.length === 0) {
+      const available = sources.windows.map((w) => `  ${w.id}  ${windowLabel(w)}`).join("\n");
+      throw new Error(
+        `no window matches "${q}". Available windows (clipy sources):\n${available || "  (none)"}`,
+      );
+    }
+    if (matches.length > 1) {
+      const list = matches.map((w) => `  ${w.id}  ${windowLabel(w)}`).join("\n");
+      throw new Error(`"${q}" matches ${matches.length} windows — use the id instead:\n${list}`);
+    }
+    return { source: { type: "window", id: matches[0].id }, label: windowLabel(matches[0]) };
+  }
+  if (opts.display) {
+    const q = opts.display.trim();
+    const matches = /^\d+$/.test(q)
+      ? sources.displays.filter((d) => d.id === Number(q))
+      : sources.displays.filter((d) => d.name.toLowerCase().includes(q.toLowerCase()));
+    if (matches.length === 0) {
+      const available = sources.displays.map((d) => `  ${d.id}  ${d.name}`).join("\n");
+      throw new Error(`no display matches "${q}". Available displays:\n${available || "  (none)"}`);
+    }
+    if (matches.length > 1) {
+      const list = matches.map((d) => `  ${d.id}  ${d.name}`).join("\n");
+      throw new Error(`"${q}" matches ${matches.length} displays — use the id instead:\n${list}`);
+    }
+    return {
+      source: { type: "display", id: matches[0].id },
+      label: matches[0].name || `display ${matches[0].id}`,
+    };
+  }
+  throw new Error("resolveCaptureSource called without --window or --display");
+}
+
 /** One request line in, one response line out. */
 export function bridgeRequest(
   info: BridgeInfo,

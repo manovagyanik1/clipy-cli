@@ -6,10 +6,11 @@
  * summaries, key moments) from the terminal, download the MP4s, or export
  * subtitles — without opening a browser.
  *
- * Auth: a personal API key (`clipy_sk_live_…`), minted at
- * https://clipy.online/settings/api-keys. `clipy login` stores it in
- * ~/.config/clipy/config.json (0600); CLIPY_API_KEY / --key override it.
- * Read-only: the CLI can never create, modify, or delete recordings.
+ * Auth: a personal API key (`clipy_sk_live_…`). `clipy login` opens your
+ * browser to approve this device (like `gh auth login`) and stores the key in
+ * ~/.config/clipy/config.json (0600); `--key`/`--paste` store a key you pasted
+ * from https://clipy.online/settings/api-keys instead. CLIPY_API_KEY / --key
+ * override the stored key. Read-only unless the key carries the "ingest" scope.
  */
 
 import { parseArgs } from "node:util";
@@ -23,10 +24,15 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createRequire } from "node:module";
 import { CLIPY_SKILL_MD } from "./skill.js";
+import { browserLogin, shouldUseManualLogin, type BrowserLoginResult } from "./browserLogin.js";
 import {
   BridgeUnavailableError,
   bridgeRequest,
+  listSources,
   readBridgeInfo,
+  resolveCaptureSource,
+  windowLabel,
+  type CaptureSource,
   type BridgeInfo,
 } from "./macBridge.js";
 
@@ -159,7 +165,7 @@ type Json = Record<string, unknown>;
 function requireKey(ctx: Ctx): string {
   if (ctx.apiKey) return ctx.apiKey;
   die(
-    `no API key. Run ${c.bold("clipy login")} (create a key at ${ctx.apiUrl}/settings/api-keys), or set CLIPY_API_KEY.`,
+    `no API key. Run ${c.bold("clipy login")} to approve this device in your browser, or set CLIPY_API_KEY.`,
   );
 }
 
@@ -326,7 +332,10 @@ ${c.bold("USAGE")}
   clipy <command> [arguments] [flags]
 
 ${c.bold("AUTH")}
-  login [--key <clipy_sk_live_…>]   Verify + store your API key (${c.dim("~/.config/clipy/config.json")})
+  login                             Approve this device in your browser (like ${c.dim("gh auth login")})
+  login --no-browser                Copy-code flow for SSH/headless: open the URL anywhere, paste the code back
+  login --key <clipy_sk_live_…>     Skip the browser: store a key you pasted
+  login --paste                     Prompt for a pasted key instead of the browser
   logout                            Delete the stored key
   whoami                            Check which key is active and that it works
 
@@ -363,6 +372,10 @@ ${c.bold("RECORD")} ${c.dim("(needs an API key with the \"ingest\" permission)")
 ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session per directory)")}
   ${c.dim("--source mac-screen on record/session records the REAL screen via the")}
   ${c.dim("running Clipy Mac app (consent-gated, indicator always visible).")}
+  ${c.dim("Target one window or display instead of the whole screen:")}
+  sources                           List capturable displays + windows (ids for --window/--display)
+    --window "<title|app|id>"       Record just that window (e.g. --window Chrome)
+    --display <id>                  Record a specific display
   session start --url <app> [--max <sec>] [--title <t>]
                                     Start recording in a background daemon and
                                     return immediately (auto-stops + uploads at
@@ -395,32 +408,116 @@ ${c.bold("EXIT CODES")}
   0 ok · 1 error · 2 usage · 3 artifact not ready (transcript/summary/wait)
 
 ${c.bold("SETUP")}
-  1. Create a key at ${c.cyan("https://clipy.online/settings/api-keys")}
-  2. ${c.bold("clipy login")}
-  3. ${c.bold("clipy list")}
+  1. ${c.bold("clipy login")}                approve this device in your browser
+  2. ${c.bold("clipy list")}                 (or: ${c.bold("clipy agents install claude")} to wire up a coding agent)
 
-Every command except ${c.bold("record")} and ${c.bold("session")}/${c.bold("mark")} is read-only. Only those
-create recordings, and only with a key that carries the "ingest" permission.
+Write commands — ${c.bold("record")}, ${c.bold("session")}/${c.bold("mark")}, and ${c.bold("transcript --replace")} — need a key
+with the "ingest" permission. Everything else is read-only.
 `;
 
-async function cmdLogin(ctx: Ctx, keyFlag: string | undefined): Promise<void> {
-  let key = keyFlag?.trim() || "";
-  if (!key) {
-    key = await promptHidden(
-      `Paste your Clipy API key (from ${ctx.apiUrl}/settings/api-keys): `,
+async function cmdLogin(
+  ctx: Ctx,
+  opts: { key?: string; paste?: boolean; noBrowser?: boolean },
+): Promise<void> {
+  const keyFlag = opts.key?.trim() || "";
+  // A pasted key, an explicit --paste, or a non-interactive stdout all take the
+  // paste path — without a terminal we can't run either interactive flow.
+  if (keyFlag || opts.paste || !process.stdout.isTTY) {
+    await loginWithPaste(ctx, keyFlag);
+    return;
+  }
+  // --no-browser, SSH sessions, and display-less Linux take the copy-code
+  // flow: this machine can't receive the loopback redirect (or can't open a
+  // browser at all), so the approval page shows a code to paste back here.
+  await loginWithBrowser(ctx, opts.noBrowser || shouldUseManualLogin());
+}
+
+/** Browser-approve flow (the default): open clipy.online, approve, store. */
+async function loginWithBrowser(ctx: Ctx, manual: boolean): Promise<void> {
+  process.stderr.write(
+    `${c.dim(manual ? "approve this device from a browser on any machine…" : "opening your browser to approve this device…")}\n`,
+  );
+  let result: BrowserLoginResult;
+  try {
+    result = await browserLogin({
+      apiUrl: ctx.apiUrl,
+      log: (m) => process.stderr.write(`${m}\n`),
+      manual,
+      promptCode: manual
+        ? () => promptVisible("Paste the approval code shown in the browser: ")
+        : undefined,
+    });
+  } catch (e) {
+    die(
+      `${(e as Error).message}\n` +
+        `You can log in with a pasted key instead: ${c.bold("clipy login --key <clipy_sk_live_…>")} ` +
+        `(create one at ${ctx.apiUrl}/settings/api-keys).`,
     );
+  }
+  // Browser-minted keys are stored BEFORE the verify round-trip: the secret
+  // was just delivered once and is unrecoverable — a transient network blip
+  // on the verify call must not lose it.
+  await storeAndVerifyKey(ctx, result.apiKey, { scopes: result.scopes, email: result.email }, { storeFirst: true });
+}
+
+/** Paste flow (fallback): take a key from --key or a hidden prompt, store it. */
+async function loginWithPaste(ctx: Ctx, keyFlag: string): Promise<void> {
+  let key = keyFlag;
+  if (!key) {
+    key = await promptHidden(`Paste your Clipy API key (from ${ctx.apiUrl}/settings/api-keys): `);
   }
   if (!key.startsWith("clipy_sk_live_")) {
     die("that doesn't look like a Clipy API key (expected it to start with clipy_sk_live_)");
   }
-  // Verify before storing.
-  const probe = { ...ctx, apiKey: key };
-  await apiJson(probe, "/api/v1/recordings?limit=1");
-  const cfg = readConfig();
-  cfg.apiKey = key;
-  if (ctx.apiUrl !== "https://clipy.online") cfg.apiUrl = ctx.apiUrl;
-  writeConfig(cfg);
-  process.stdout.write(`${c.green("✓")} key verified and saved to ${c.dim(configPath())}\n`);
+  // Pasted keys still verify first — the user has the secret in hand, and
+  // catching a typo'd/revoked key before storing it is the better failure.
+  await storeAndVerifyKey(ctx, key, {}, { storeFirst: false });
+}
+
+/** Store a key (0600) + verify it against the API, order per `storeFirst`. */
+async function storeAndVerifyKey(
+  ctx: Ctx,
+  key: string,
+  meta: { scopes?: string[]; email?: string },
+  opts: { storeFirst: boolean },
+): Promise<void> {
+  const store = (): void => {
+    const cfg = readConfig();
+    cfg.apiKey = key;
+    if (ctx.apiUrl !== "https://clipy.online") cfg.apiUrl = ctx.apiUrl;
+    writeConfig(cfg);
+  };
+  if (opts.storeFirst) {
+    store();
+    try {
+      await apiJson({ ...ctx, apiKey: key }, "/api/v1/recordings?limit=1");
+    } catch (e) {
+      process.stderr.write(
+        `${c.yellow("!")} key saved to ${configPath()}, but verifying it failed (${(e as Error).message}).\n` +
+          `  Check with: ${c.bold("clipy whoami")}\n`,
+      );
+      return;
+    }
+  } else {
+    await apiJson({ ...ctx, apiKey: key }, "/api/v1/recordings?limit=1");
+    store();
+  }
+  const bits: string[] = [];
+  if (meta.email) bits.push(meta.email);
+  if (meta.scopes?.length) bits.push(`scopes: ${meta.scopes.join(", ")}`);
+  const detail = bits.length ? ` ${c.dim(`(${bits.join(" · ")})`)}` : "";
+  process.stdout.write(`${c.green("✓")} logged in${detail} — key saved to ${c.dim(configPath())}\n`);
+}
+
+/** Plain visible readline prompt (for one-time codes the user just copied). */
+function promptVisible(question: string): Promise<string> {
+  return new Promise((resolvePrompt) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolvePrompt(answer.trim());
+    });
+  });
 }
 
 function promptHidden(question: string): Promise<string> {
@@ -1061,7 +1158,9 @@ async function uploadWebmToClipy(
   return {
     publicId,
     shareUrl: `${ctx.apiUrl}/video/${publicId}`,
-    contextUrl: `${ctx.apiUrl}/api/agent-context/${publicId}`,
+    // The friendly content-negotiated form: markdown to agents, a rendered
+    // page to browsers. Same document as /api/agent-context/<id>.
+    contextUrl: `${ctx.apiUrl}/video/${publicId}.md`,
     sizeBytes,
   };
 }
@@ -1342,19 +1441,39 @@ function cleanupSessionFiles(state: SessionState, file: string): void {
 
 // --- Mac bridge flows (--source mac-screen): the desktop app records -------
 
+/** Resolves --window/--display to a bridge capture source (null = app default,
+ *  i.e. the full primary display). die()s with the candidate list on no/ambiguous
+ *  match so the agent can correct itself. */
+async function resolveBridgeTarget(
+  info: BridgeInfo,
+  opts: { window?: string; display?: string },
+): Promise<{ source: CaptureSource; label: string } | null> {
+  if (!opts.window && !opts.display) return null;
+  try {
+    return await resolveCaptureSource(info, opts);
+  } catch (e) {
+    die((e as Error).message);
+  }
+}
+
 /** One-shot real-screen recording through the running Clipy app. */
 async function cmdRecordMac(opts: {
   forSec: number;
   name?: string;
   description?: string;
   notes: NarrationNote[];
+  window?: string;
+  display?: string;
   json: boolean;
 }): Promise<{ publicId: string; shareUrl: string }> {
   const info = readBridgeInfo();
   const log = (m: string) => {
     if (!opts.json) process.stderr.write(`${m}\n`);
   };
-  log(`${c.dim(`asking the Clipy app (v${info.appVersion}) to record the screen…`)}`);
+  const target = await resolveBridgeTarget(info, opts);
+  log(
+    `${c.dim(`asking the Clipy app (v${info.appVersion}) to record ${target?.label ?? "the screen"}…`)}`,
+  );
   await bridgeRequest(info, "start", {
     // The recording is stopped by us after forSec; maxSec is the safety net
     // in case this CLI process dies mid-wait.
@@ -1362,6 +1481,7 @@ async function cmdRecordMac(opts: {
     title: opts.name,
     description: opts.description,
     notes: opts.notes.map((n) => ({ startMs: n.startMs, text: n.text })),
+    ...(target ? { source: target.source } : {}),
   });
   log(`${c.dim(`recording for ${opts.forSec}s…`)}`);
   await new Promise((r) => setTimeout(r, opts.forSec * 1000));
@@ -1418,6 +1538,8 @@ async function cmdSessionStart(
     height: number;
     json: boolean;
     source: "web" | "mac-screen";
+    window?: string;
+    display?: string;
   },
 ): Promise<void> {
   if (opts.source === "mac-screen") {
@@ -1428,17 +1550,21 @@ async function cmdSessionStart(
     }
     const info = readBridgeInfo();
     const maxSec = Math.min(Math.max(1, opts.maxSec), SESSION_HARD_CAP_SEC);
+    const target = await resolveBridgeTarget(info, opts);
     await bridgeRequest(info, "start", {
       maxSec,
       title: opts.name,
       description: opts.description,
+      ...(target ? { source: target.source } : {}),
     });
     writeSessionState(file, macSessionState(info, maxSec));
     if (opts.json) {
-      printJson({ state: "recording", source: "mac-screen", maxSec });
+      printJson({ state: "recording", source: "mac-screen", maxSec, target: target?.label });
       return;
     }
-    process.stdout.write(`${c.green("✓")} the Clipy app is recording your screen (max ${maxSec}s)\n`);
+    process.stdout.write(
+      `${c.green("✓")} the Clipy app is recording ${target ? target.label : "your screen"} (max ${maxSec}s)\n`,
+    );
     process.stdout.write(
       `${c.dim("while it runs:")} clipy mark "what just happened"\n` +
         `${c.dim("when finished:")} clipy session stop   ${c.dim("· discard:")} clipy session abort\n`,
@@ -1691,13 +1817,54 @@ async function cmdSessionAbort(json: boolean): Promise<void> {
   else process.stdout.write(`${c.green("✓")} session aborted — nothing was uploaded\n`);
 }
 
-function cmdSessionStatus(json: boolean): void {
+async function cmdSessionStatus(json: boolean): Promise<void> {
   const file = sessionFilePath(process.cwd());
   const state = readSessionState(file);
   if (!state) {
     if (json) printJson({ state: "none" });
     else process.stdout.write(`${c.dim("no session in this workspace")}\n`);
     return;
+  }
+  if (state.kind === "mac" && state.state === "recording") {
+    // The stored pid is the desktop APP's, which outlives the recording — ask
+    // the bridge for the truth instead of inferring from process liveness.
+    try {
+      const status = await bridgeRequest(bridgeInfoFromSession(state), "status");
+      const session = status.agentSession as
+        | { elapsedSec?: number; maxSec?: number; marks?: number }
+        | null
+        | undefined;
+      if (!session) {
+        if (json) printJson({ state: "ended", url: state.url });
+        else
+          process.stdout.write(
+            `${c.bold("ended")} — the app finished this recording (auto-stop or Stop in the app).\n` +
+              `${c.dim("clear the session file with:")} clipy session abort\n`,
+          );
+        return;
+      }
+      if (json) {
+        printJson({
+          state: "recording",
+          url: state.url,
+          elapsedSec: session.elapsedSec ?? null,
+          maxSec: session.maxSec ?? state.maxSec,
+          marks: session.marks ?? null,
+        });
+        return;
+      }
+      process.stdout.write(
+        `${c.bold("recording")} — ${state.url} — ${session.elapsedSec ?? "?"}s elapsed (max ${session.maxSec ?? state.maxSec}s, ${session.marks ?? 0} marks)\n`,
+      );
+      return;
+    } catch {
+      if (json) printJson({ state: "dead", url: state.url });
+      else
+        process.stdout.write(
+          `${c.bold("dead")} — the Clipy app is not answering. ${c.dim("clear with:")} clipy session abort\n`,
+        );
+      return;
+    }
   }
   const alive = pidAlive(state.pid);
   const elapsed =
@@ -1918,7 +2085,12 @@ function skillPathFor(target: AgentTarget): string {
   }
 }
 
-function cmdAgents(sub: string | undefined, targetRaw: string | undefined, json: boolean): void {
+async function cmdAgents(
+  ctx: Ctx,
+  sub: string | undefined,
+  targetRaw: string | undefined,
+  json: boolean,
+): Promise<void> {
   if (sub === "status" || sub === undefined) {
     const status = AGENT_TARGETS.map((t) => {
       const p = skillPathFor(t);
@@ -1949,6 +2121,16 @@ function cmdAgents(sub: string | undefined, targetRaw: string | undefined, json:
   }
   const path = skillPathFor(target);
   if (sub === "install") {
+    // First-run onboarding: with no API key configured, sign in first so the
+    // installed skill can actually read + make recordings. Interactive
+    // terminals only — without a TTY (CI) set CLIPY_API_KEY instead. SSH and
+    // display-less Linux auto-route to the copy-code flow. An already-
+    // configured key is left untouched. loginWithBrowser die()s (with the
+    // paste fallback) if it fails.
+    if (!ctx.apiKey && process.stdout.isTTY && !json) {
+      process.stdout.write(`${c.dim("No Clipy API key found — signing you in first…")}\n`);
+      await loginWithBrowser(ctx, shouldUseManualLogin());
+    }
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, CLIPY_SKILL_MD);
     if (json) {
@@ -2022,7 +2204,7 @@ function cmdGuide(json: boolean): void {
       { code: 3, meaning: "artifact not ready yet (transcript/summary/wait)" },
     ],
     commands: [
-      cmdDoc("login", "clipy login [--key <key>]", "Verify + store an API key"),
+      cmdDoc("login", "clipy login [--no-browser] [--key <key>] [--paste]", "Approve this device in the browser (default). --no-browser (auto-detected on SSH and display-less Linux) prints the approval URL to open on any device and prompts for the code it shows. --key/--paste store a pasted key (also the automatic path when stdout is not a TTY)", ["--no-browser", "--key <key>", "--paste"]),
       cmdDoc("logout", "clipy logout", "Delete the stored key"),
       cmdDoc("whoami", "clipy whoami", "Check the active key"),
       cmdDoc("list", "clipy list [-n N] [--page P] [--status s,…] [--json]", "List recordings, newest first"),
@@ -2035,15 +2217,17 @@ function cmdGuide(json: boolean): void {
       cmdDoc("download", "clipy download <id> [-o path]", "Download the MP4"),
       cmdDoc("open", "clipy open <id>", "Open the share page in a browser"),
       cmdDoc("wait", "clipy wait <id> [--for transcript|summary|both] [--timeout sec]", "Block until artifacts are ready"),
-      cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--note '12: text']… [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript", ["--for", "--viewports", "--title", "--description", "--note", "--width", "--height", "--wait"]),
-      cmdDoc("session", "clipy session <start|stop|abort|status> [--url <url>] [--max sec]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s)"),
+      cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--note '12: text']… [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. With --source mac-screen: records the real screen via the Clipy Mac app; --window '<title|app|id>' or --display <id> target one window/display (ids from clipy sources)", ["--for", "--viewports", "--title", "--description", "--note", "--width", "--height", "--wait", "--source", "--window", "--display"]),
+      cmdDoc("session", "clipy session <start|stop|abort|status> [--url <url>] [--max sec] [--source web|mac-screen] [--window w] [--display d]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --window/--display (with --source mac-screen) record one window/display"),
       cmdDoc("mark", "clipy mark \"<text>\"", "Drop a live-timestamped note into the active session"),
-      cmdDoc("agents", "clipy agents <status|install|uninstall> <claude|codex|cursor>", "Install the bundled Clipy skill for a coding agent"),
+      cmdDoc("sources", "clipy sources [--json]", "List displays + windows the Clipy Mac app can capture — ids feed --window/--display"),
+      cmdDoc("agents", "clipy agents <status|install|uninstall> <claude|codex|cursor>", "Install the bundled Clipy skill for a coding agent; install triggers a browser login first when no key is configured (interactive terminals only)"),
       cmdDoc("guide", "clipy guide --json", "This manifest"),
       cmdDoc("mcp", "clipy mcp", "Run the Clipy MCP server (wraps npx -y @clipy/mcp)"),
     ],
     notes: [
       "Read commands accept a bare public id or the full https://clipy.online/video/<id> URL.",
+      "login opens a browser to approve this device (loopback redirect to 127.0.0.1); use --key/--paste or a piped key on headless boxes.",
       "record/session/mark/transcript --replace are the only write commands; they need a key with the 'ingest' permission.",
       "Headless captures have no audio: --note flags and session marks become the transcript, labeled agent-narration.",
       "Public recordings have an unauthenticated context document at https://clipy.online/video/<id>.md.",
@@ -2105,6 +2289,8 @@ async function main(): Promise<void> {
     options: {
       json: { type: "boolean", default: false },
       key: { type: "string" },
+      paste: { type: "boolean", default: false },
+      "no-browser": { type: "boolean", default: false },
       "api-url": { type: "string" },
       status: { type: "string" },
       page: { type: "string" },
@@ -2124,6 +2310,8 @@ async function main(): Promise<void> {
       max: { type: "string" },
       replace: { type: "string" },
       source: { type: "string" },
+      window: { type: "string" },
+      display: { type: "string" },
       width: { type: "string" },
       height: { type: "string" },
       wait: { type: "boolean", default: false },
@@ -2164,7 +2352,11 @@ async function main(): Promise<void> {
 
   switch (command) {
     case "login":
-      await cmdLogin(ctx, values.key as string | undefined);
+      await cmdLogin(ctx, {
+        key: values.key as string | undefined,
+        paste: Boolean(values.paste),
+        noBrowser: Boolean(values["no-browser"]),
+      });
       return;
     case "logout":
       cmdLogout();
@@ -2234,25 +2426,63 @@ async function main(): Promise<void> {
       cmdMcp();
       return;
     case "agents":
-      cmdAgents(rest[0], rest[1], json);
+      await cmdAgents(ctx, rest[0], rest[1], json);
       return;
     case "guide":
       cmdGuide(json);
       return;
+    case "sources": {
+      // Enumerate what the Mac app can capture, so --window/--display have ids.
+      try {
+        const sources = await listSources(readBridgeInfo());
+        if (json) {
+          printJson(sources);
+          return;
+        }
+        process.stdout.write(`${c.bold("DISPLAYS")}\n`);
+        for (const d of sources.displays) {
+          process.stdout.write(`  ${d.id}\t${d.name || "display"}\t${c.dim(`${d.width}×${d.height}`)}\n`);
+        }
+        process.stdout.write(`${c.bold("WINDOWS")}\n`);
+        for (const w of sources.windows) {
+          process.stdout.write(`  ${w.id}\t${windowLabel(w)}\t${c.dim(`${w.width}×${w.height}`)}\n`);
+        }
+        process.stdout.write(
+          `${c.dim('record one with: clipy record --source mac-screen --window "<title or id>"')}\n`,
+        );
+      } catch (e) {
+        die((e as Error).message);
+      }
+      return;
+    }
     case "record": {
       const source = String(values.source ?? "web");
       if (source !== "web" && source !== "mac-screen") {
         die("--source must be web (headless browser) or mac-screen (the Clipy Mac app)", 2);
       }
+      if ((values.window || values.display) && source !== "mac-screen") {
+        die("--window/--display record the real screen — add --source mac-screen", 2);
+      }
+      if (values.window && values.display) {
+        die("--window and --display are mutually exclusive — pick one capture source", 2);
+      }
       if (source === "mac-screen") {
         const noteFlags = (values.note as string[] | undefined) ?? [];
+        const forSec = num(values.for, 15);
+        // The app-side safety watchdog caps a bridge recording at 1800s; a
+        // longer --for would auto-stop at the cap while we kept waiting.
+        if (forSec > 1740) {
+          die("--for is capped at 1740s for --source mac-screen (the app auto-stops at 1800s)", 2);
+        }
         try {
           const result = await cmdRecordMac({
-            forSec: num(values.for, 15),
+            forSec,
             name:
               ((values.title as string | undefined) ?? (values.name as string | undefined))?.trim() ||
               undefined,
             description: (values.description as string | undefined)?.trim() || undefined,
+            window: (values.window as string | undefined)?.trim() || undefined,
+            display: (values.display as string | undefined)?.trim() || undefined,
             notes: noteFlags.map(parseNoteFlag),
             json,
           });
@@ -2300,12 +2530,20 @@ async function main(): Promise<void> {
         if (source !== "web" && source !== "mac-screen") {
           die("--source must be web (headless browser) or mac-screen (the Clipy Mac app)", 2);
         }
+        if ((values.window || values.display) && source !== "mac-screen") {
+          die("--window/--display record the real screen — add --source mac-screen", 2);
+        }
+        if (values.window && values.display) {
+          die("--window and --display are mutually exclusive — pick one capture source", 2);
+        }
         const url = (values.url as string | undefined)?.trim() || rest[1];
         if (!url && source === "web") {
           die("usage: clipy session start --url <http(s) url> [--max <sec>] [--source web|mac-screen]", 2);
         }
         await cmdSessionStart(ctx, {
           url: url || "mac-screen",
+          window: (values.window as string | undefined)?.trim() || undefined,
+          display: (values.display as string | undefined)?.trim() || undefined,
           name:
             ((values.title as string | undefined) ?? (values.name as string | undefined))?.trim() ||
             undefined,
@@ -2327,7 +2565,7 @@ async function main(): Promise<void> {
         return;
       }
       if (sub === "status" || sub === undefined) {
-        cmdSessionStatus(json);
+        await cmdSessionStatus(json);
         return;
       }
       die("usage: clipy session <start|stop|abort|status>", 2);

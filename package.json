@@ -1,6 +1,6 @@
 {
   "name": "@clipy/cli",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Command-line interface for Clipy — list, search, and read your screen recordings' transcripts, AI summaries, and key moments from the terminal.",
   "license": "MIT",
   "type": "module",
@@ -37,7 +37,8 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test:auth": "npm run build && node scripts/mock-auth-server.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -1,5 +1,9 @@
 # @clipy/cli
 
+> This repository is the public mirror of **`@clipy/cli`**. The package is developed in
+> the Clipy monorepo and synced here with each npm release — browse the source or file
+> issues here.
+
 [![npm version](https://img.shields.io/npm/v/%40clipy%2Fcli)](https://www.npmjs.com/package/@clipy/cli)
 [![license: MIT](https://img.shields.io/npm/l/%40clipy%2Fcli)](https://github.com/manovagyanik1/clipy-cli/blob/main/LICENSE)
 [![node >= 18](https://img.shields.io/node/v/%40clipy%2Fcli)](https://www.npmjs.com/package/@clipy/cli)
@@ -14,30 +18,44 @@ recording an instant share link, an AI transcript and summary, and
 [agent-readable context](https://clipy.online/for-agents) — so both humans and AI
 agents can act on what was recorded. This package is its terminal client.
 
-The read commands need the `recordings:read` scope, which every key gets by default. The
-recording commands — [`record`](#record) and the `session` flow (`session start`, `mark`,
-`session stop`) — need the key's `ingest` scope ("Record & upload"); a `recordings:read`-only
-key can read your recordings but can never create, edit, or delete them.
-
-> This repository is the public mirror of **`@clipy/cli`**. The package is developed in
-> the Clipy monorepo and synced here with each npm release — browse the source or file
-> issues here.
+The read commands are **read-only** with any key. The write commands —
+[`record`](#record), the `session`/`mark` flow, and `transcript --replace` — create
+recordings or replace a transcript, and work only with an `ingest`-scoped key.
 
 ```bash
-npx @clipy/cli list          # or: npm i -g @clipy/cli && clipy list
+npx @clipy/cli agents install claude   # browser-approve login + install the Clipy skill
 ```
 
 ## Setup
-
-1. Create a free API key at **https://clipy.online/settings/api-keys** (it looks like
-   `clipy_sk_live_…`). Copy it — it's shown only once.
-2. Log in (stores the key in `~/.config/clipy/config.json`, mode 0600):
 
 ```bash
 clipy login
 ```
 
-Or skip the stored login entirely and set `CLIPY_API_KEY` in your environment.
+`clipy login` opens your browser to approve this device — like `gh auth login` — and
+stores the key in `~/.config/clipy/config.json` (mode 0600). No copy-pasting a key.
+
+Wiring up a coding agent? One command does both the browser login and the skill install:
+
+```bash
+npx @clipy/cli agents install claude   # or: codex / cursor
+```
+
+**Prefer to paste a key you minted yourself?** Create one at
+**https://clipy.online/settings/api-keys** (it looks like `clipy_sk_live_…`) and store it
+without the browser:
+
+```bash
+clipy login --key clipy_sk_live_…      # or: clipy login --paste to be prompted
+```
+
+**On SSH or a display-less Linux box**, `clipy login` automatically switches to a
+copy-code flow (also available anywhere as `clipy login --no-browser`): it prints the
+approval URL for you to open on **any** device — your laptop, your phone — and after you
+click Approve the page shows a one-time code to paste back into the waiting terminal.
+The code alone is useless without the PKCE verifier held by that terminal, so it's safe
+to ferry by hand. Without a TTY at all (scripts, CI), use `CLIPY_API_KEY` or
+`clipy login --key`.
 
 ## Commands
 
@@ -114,6 +132,28 @@ Safety rails are built in: the session **auto-stops and uploads** at `--max <sec
 (default 600, hard cap 1800) so a forgotten session can never run away; `clipy session
 abort` discards everything; a crashed daemon is detected and cleared on the next command;
 corrupt captures are refused before upload, and a failed upload keeps the local file.
+
+## Record the real screen — a window, a display (Mac)
+
+`--source mac-screen` on `record` / `session start` records through the **running Clipy
+Mac app** (ScreenCaptureKit — real screen, real logged-in browser, not a headless page).
+First use shows a consent dialog in the app; the recording indicator is always visible.
+
+By default it captures the primary display. Target one window instead:
+
+```bash
+clipy sources                                   # list displays + windows with ids
+clipy session start --source mac-screen --window "Chrome" --title "Fix walkthrough"
+# … the agent drives the real, logged-in Chrome while Clipy records that window …
+clipy mark "reproduced the bug"
+clipy mark "fix applied — retesting"
+clipy session stop                              # uploads, prints the share link
+```
+
+`--window` takes a window id from `clipy sources`, or an app/title substring
+(case-insensitive; ambiguous matches list the candidates instead of guessing).
+`--display <id>` records a specific display. Both also work on one-shot
+`clipy record --source mac-screen --for 30`.
 
 ## Scripting
 
