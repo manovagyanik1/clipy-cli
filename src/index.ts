@@ -3008,24 +3008,69 @@ function echoedAudio(startResult: Record<string, unknown>): AudioChoice | null {
 }
 
 /**
+ * Bridge protocol version that introduced agent audio control — an honoured
+ * `audio` object and a mic that defaults OFF. Mirrors PROTOCOL_VERSION in
+ * desktop/src-tauri/src/agent_bridge.rs, whose own comment is the contract:
+ * below this, the app silently ignores the field and records with ITS defaults.
+ */
+const AUDIO_PROTOCOL_VERSION = 2;
+
+/**
+ * Warn BEFORE `start` when the running app can't honour the audio request.
+ * The timing is the entire point. The echo check below can only report what
+ * happened once the mic has already been live for the length of the recording,
+ * and a privacy flag must not fail open for that long. The discovery file
+ * carries protocolVersion, so we can say it while the camera is still off.
+ *
+ * Returns true when it fired, so the post-start check doesn't say it twice.
+ */
+function warnAudioUncontrollable(
+  protocolVersion: number,
+  requested: AudioChoice,
+  emit: (m: string) => void,
+): boolean {
+  if (protocolVersion >= AUDIO_PROTOCOL_VERSION) return false;
+  emit(
+    c.yellow(
+      `warning: this Clipy app speaks bridge protocol v${protocolVersion} and cannot apply audio settings ` +
+        `(needs v${AUDIO_PROTOCOL_VERSION}) — it will record with the APP's own defaults, so your ` +
+        `MICROPHONE MAY BE RECORDING. Update the Clipy app (https://clipy.online/download) to make ` +
+        `"${describeAudio(requested)}" take effect.`,
+    ),
+  );
+  return true;
+}
+
+/**
  * Report the audio that was actually applied, and warn loudly when the app did
  * not confirm it. The dangerous direction is the silent one: on a desktop build
  * that ignores the audio field, "mic off" is what we asked for and MIC ON is what
  * happens — so an unconfirmed request is a privacy warning, not a footnote.
+ *
+ * This is the second of two gates. `warnAudioUncontrollable` catches the known
+ * case from the version alone before recording starts; this catches the app that
+ * claims the protocol but doesn't echo, which is an anomaly rather than an old
+ * build. Both fail closed toward "assume the mic is live".
  */
 function reportAudio(
   requested: AudioChoice,
   applied: AudioChoice | null,
   emit: (m: string) => void,
+  alreadyWarned = false,
 ): AudioChoice {
+  // Same reasoning as warnAudioUncontrollable's emitter: the informational line
+  // may be suppressed under --json, the privacy warning may not.
+  const warn = (m: string) => process.stderr.write(`${m}\n`);
   if (!applied) {
-    emit(
-      c.yellow(
-        `warning: this Clipy app version did not confirm the audio settings — it predates agent audio control, ` +
-          `so it is using the APP's defaults and your MICROPHONE MAY BE RECORDING. ` +
-          `Update the Clipy app (https://clipy.online/download) to make "${describeAudio(requested)}" take effect.`,
-      ),
-    );
+    if (!alreadyWarned) {
+      warn(
+        c.yellow(
+          `warning: this Clipy app did not confirm the audio settings, so it may be recording with its ` +
+            `own defaults and your MICROPHONE MAY BE RECORDING. ` +
+            `Update the Clipy app (https://clipy.online/download) to make "${describeAudio(requested)}" take effect.`,
+        ),
+      );
+    }
     return requested;
   }
   emit(`${c.dim("audio:")} ${describeAudio(applied)}`);
@@ -3085,6 +3130,12 @@ async function cmdRecordMac(opts: {
       ),
     );
   }
+  // Before the camera turns on, not after — see warnAudioUncontrollable().
+  // Deliberately NOT `log`: a "your mic may be live" warning must survive
+  // --json, and stderr never corrupts the JSON on stdout.
+  const audioUncontrollable = warnAudioUncontrollable(info.protocolVersion, opts.audio, (m) =>
+    process.stderr.write(`${m}\n`),
+  );
   const notes = resolveNarrationNotes(opts.notes, [0]);
   const startResult = await bridgeRequest(info, "start", {
     // Explicit, never implicit: an absent field would fall through to the app's
@@ -3099,7 +3150,12 @@ async function cmdRecordMac(opts: {
     notes: notes.map((n) => ({ startMs: n.startMs, text: n.text })),
     ...(target ? { source: target.source } : {}),
   });
-  const appliedAudio = reportAudio(opts.audio, echoedAudio(startResult), log);
+  const appliedAudio = reportAudio(
+    opts.audio,
+    echoedAudio(startResult),
+    log,
+    audioUncontrollable,
+  );
   log(`${c.dim(`recording for ${opts.forSec}s…`)}`);
   await new Promise((r) => setTimeout(r, opts.forSec * 1000));
   log(`${c.dim("stopping + uploading…")}`);
@@ -3205,6 +3261,10 @@ async function cmdSessionStart(
         `${c.yellow("note: --type is not applied to --source mac-screen recordings yet (needs a Clipy app update)")}\n`,
       );
     }
+    // Before the camera turns on, not after — see warnAudioUncontrollable().
+    const audioUncontrollable = warnAudioUncontrollable(info.protocolVersion, opts.audio, (m) =>
+      process.stderr.write(`${m}\n`),
+    );
     const startResult = await bridgeRequest(info, "start", {
       // Explicit, never implicit — see reportAudio(): an absent field falls
       // through to the app's interactive defaults (mic ON) on older builds.
@@ -3216,8 +3276,11 @@ async function cmdSessionStart(
       ...(target ? { source: target.source } : {}),
     });
     writeSessionState(file, macSessionState(info, maxSec));
-    const appliedAudio = reportAudio(opts.audio, echoedAudio(startResult), (m) =>
-      process.stderr.write(`${m}\n`),
+    const appliedAudio = reportAudio(
+      opts.audio,
+      echoedAudio(startResult),
+      (m) => process.stderr.write(`${m}\n`),
+      audioUncontrollable,
     );
     if (opts.json) {
       printJson({

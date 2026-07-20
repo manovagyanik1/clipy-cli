@@ -15,7 +15,7 @@ description: Read and create Clipy screen recordings. Use when the user shares a
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.8.5 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.8.6 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
@@ -202,8 +202,8 @@ Attach the values YOU observed and your verdict:
 Renders as \`… [≈ ASSERT driver-attested; observed=<your values>]\` (pass) or
 \`… [≈ FAILED driver-attested; observed=…]\` (fail) — a HEDGE glyph, never ✓/✗:
 those are reserved for marks Clipy itself checked, so a skim tells the two apart
-by shape before you read a word. Both
-flags are required together, and a mark carries exactly ONE provenance — combining
+by shape before you read a word. Both flags are required together, and a mark
+carries exactly ONE provenance — combining
 them with --assert-* is a usage error. Works in EVERY session type, including
 \`--source mac-screen\`.
 
@@ -369,21 +369,40 @@ Note the title is read at START time; if you switch tabs mid-recording the camer
 follows the window, not your driver.
 - On \`clipy record --source mac-screen\`, \`--for\` is capped at 1740s (the app
   auto-stops at 1800s).
-- AUDIO: agent screen recordings do NOT capture the microphone. Default is system
-  audio ON, mic OFF — an agent recording on someone's behalf is not the same
-  consent as that person clicking Record, and nobody asked for the room (or
-  whatever call they're on) to be recorded; your narration rides on marks, not
-  speech. \`--mic\` opts in, \`--no-system-audio\` opts out of system audio. Both
-  are mac-screen only (headless captures are silent — passing them on the web path
-  is a usage error). The resolved config is printed (\`audio: system on, mic off\`)
-  and returned as a sibling \`audio\` in --json. If the Clipy app is too old to
-  handle audio control it will NOT echo a config back, and the CLI warns that the
-  app's own defaults are in force and the mic may be recording — believe the
-  warning and update the app.
 - If a human presses Stop inside the app during your session, \`session stop\` /
   \`mark\` return a \`stopped_from_app\` error — the recording was already uploaded
   by the app, so treat it as done: fetch the share/context link rather than
   retrying.
+
+### THE MICROPHONE IS OFF BY DEFAULT — KEEP IT THAT WAY UNLESS ASKED
+
+Agent screen recordings do NOT capture the microphone. The default is system audio
+ON, mic OFF, and that asymmetry is deliberate: system audio captures the machine,
+the mic captures the ROOM. A person clicking Record chose to be heard. You starting
+a recording on their behalf is not that same consent, and nobody asked for their
+call, their kitchen, or whoever else is nearby to be on a shareable link. Your
+narration rides on marks, not speech, so the mic buys the recording nothing by
+default.
+
+- \`--mic\` opts in. Only pass it when the user asked for their voice in the
+  recording — treat it as an instruction to obtain, never a default you restore
+  because audio "seems better".
+- \`--no-system-audio\` opts out of system audio.
+- Both are \`--source mac-screen\` ONLY. Headless web captures record no audio at
+  all, so passing either on the web path is a usage error (exit 2) rather than a
+  silently ignored flag.
+
+The resolved config is printed (\`audio: system on, mic off\`) and returned as a
+sibling \`audio\` object in \`--json\`. Read it rather than assuming your flags won:
+
+- If the Clipy app is too old to control audio, the CLI warns BEFORE recording
+  starts that the app's own defaults are in force and the mic may be live.
+- If the app claims audio control but never confirms what it applied, you get the
+  same warning after start.
+
+Either way the warning means the same thing: WE DO NOT KNOW that the mic is off.
+Believe it, tell the user, and update the app — do not report a recording as
+mic-free on the strength of the flag you passed.
 
 ## Rules for recording (follow strictly)
 

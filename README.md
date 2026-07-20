@@ -362,7 +362,7 @@ The leading `[verification]` note reports the two provenances as **separate segm
 never pools them:
 
 ```text
-[verification] 2 clipy-verified: 1 passed, 1 failed, 1 unverified · 3 driver-attested: 2 passed, 1 failed
+[verification] 3 clipy-verified: 1 passed, 1 failed, 1 unverified · 3 driver-attested: 2 passed, 1 failed
 ```
 
 An empty segment is omitted; with only clipy-verified marks the rendering stays the legacy
@@ -461,9 +461,14 @@ you clicking Record, and nobody asked for the room (or whatever call you're on) 
 captured; agent narration rides on marks, not speech. `--mic` opts in; `--no-system-audio`
 opts out of system audio. Both are mac-screen only — headless web captures are silent, so
 passing them on the web path is a usage error. The resolved config is printed
-(`audio: system on, mic off`) and returned as a sibling `audio` field in `--json`. If your
-Clipy app predates agent audio control it won't echo a config back, and the CLI warns that
-the app's defaults are in force and **your mic may be recording** — update the app.
+(`audio: system on, mic off`) and returned as a sibling `audio` field in `--json`.
+
+Two things can go wrong, and both fail closed toward "assume the mic is live". If your Clipy
+app is too old to control audio at all, the CLI says so **before recording starts** — the
+timing is the point, since a warning printed after the fact is an autopsy on a mic that was
+already open. If a new-enough app never confirms what it applied, you get the same warning
+after start. Either way the message means **we do not know that the mic is off**: believe it
+and update the app rather than trusting the flag you passed.
 
 `--window` takes a window id from `clipy sources`, or an app/title substring
 (case-insensitive; ambiguous matches list the candidates instead of guessing).

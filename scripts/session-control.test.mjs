@@ -1028,9 +1028,12 @@ await test("session start --source mac-screen prints the resolved surface promin
 
 // --- Audio: agent recordings must not take the microphone --------------------
 
-/** Spin a mock bridge; `echoAudio:false` simulates a desktop build that predates
- *  agent audio control (it ignores the field and echoes nothing back). */
-async function withMockBridge(echoAudio, fn) {
+/** Spin a mock bridge. `echoAudio:false` simulates an app that ignores the audio
+ *  field and echoes nothing back; `protocolVersion` is what the discovery file
+ *  advertises. The two are separable on purpose — a v1 app is caught before the
+ *  camera starts, and a v2 app that fails to echo is caught after, and we want
+ *  both gates under test rather than one standing in for the other. */
+async function withMockBridge({ echoAudio, protocolVersion = echoAudio ? 2 : 1 }, fn) {
   const WINDOW = { id: 7, app_name: "Chrome", title: "Dashboard", width: 800, height: 600 };
   const sockPath = join(mkdtempSync(join(tmpdir(), "clipy-audio-sock-")), "bridge.sock");
   let lastStart = null;
@@ -1064,7 +1067,7 @@ async function withMockBridge(echoAudio, fn) {
   const bridgeFile = join(mkdtempSync(join(tmpdir(), "clipy-audio-bridge-")), "agent-bridge.json");
   writeFileSync(
     bridgeFile,
-    JSON.stringify({ socketPath: sockPath, token: "t", pid: process.pid, appVersion: "0.1.41", protocolVersion: 1 }),
+    JSON.stringify({ socketPath: sockPath, token: "t", pid: process.pid, appVersion: "0.1.41", protocolVersion }),
   );
   try {
     return await fn(bridgeFile, () => lastStart);
@@ -1075,7 +1078,7 @@ async function withMockBridge(echoAudio, fn) {
 
 await test("mac-screen defaults to mic OFF, system audio on — and says so", async () => {
   const ws = freshWorkspace();
-  await withMockBridge(true, async (bridgeFile, lastStart) => {
+  await withMockBridge({ echoAudio: true }, async (bridgeFile, lastStart) => {
     const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
     try {
       const r = await runCli(["session", "start", "--source", "mac-screen", "--window", "7", "--json"], { cwd: ws.cwd, env });
@@ -1102,7 +1105,7 @@ await test("mac-screen defaults to mic OFF, system audio on — and says so", as
 
 await test("--mic opts in and --no-system-audio opts out, both reaching the bridge", async () => {
   const ws = freshWorkspace();
-  await withMockBridge(true, async (bridgeFile, lastStart) => {
+  await withMockBridge({ echoAudio: true }, async (bridgeFile, lastStart) => {
     const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
     try {
       const r = await runCli(
@@ -1124,9 +1127,35 @@ await test("--mic opts in and --no-system-audio opts out, both reaching the brid
 
 // The dangerous case: an old app ignores the audio field and uses ITS defaults
 // (mic ON). We can't fix that from here, but we must never let it pass silently.
-await test("an app that does not echo audio triggers a mic-may-be-recording warning", async () => {
+//
+// Gate 1 — the app's protocol version says up front it can't honour the request.
+// This one has to fire BEFORE `start`, because after `start` the mic has already
+// been live for the whole recording and the warning is an autopsy. The wording is
+// the proof of timing: it is derived from the discovery file alone, so it cannot
+// have been produced by a start response.
+await test("an app too old to control audio warns before the recording starts", async () => {
   const ws = freshWorkspace();
-  await withMockBridge(false, async (bridgeFile) => {
+  await withMockBridge({ echoAudio: false, protocolVersion: 1 }, async (bridgeFile) => {
+    const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
+    try {
+      const r = await runCli(["session", "start", "--source", "mac-screen", "--window", "7", "--json"], { cwd: ws.cwd, env });
+      assert.equal(r.code, 0, `start should still proceed: ${r.stderr}`);
+      assert.match(r.stderr, /cannot apply audio settings/, `expected the pre-start warning: ${r.stderr}`);
+      assert.match(r.stderr, /MICROPHONE MAY BE RECORDING/, "warning names the actual risk");
+      // One warning, not two — the post-start check must not repeat it.
+      assert.doesNotMatch(r.stderr, /did not confirm the audio settings/, "warned once, not twice");
+    } finally {
+      await runCli(["session", "abort"], { cwd: ws.cwd, env }).catch(() => {});
+    }
+  });
+});
+
+// Gate 2 — the app claims the protocol but doesn't echo what it applied. That's
+// an anomaly rather than an old build, and it fails closed the same way: we do
+// not get to assume the mic is off just because we asked nicely.
+await test("an app that claims audio control but never confirms it still warns", async () => {
+  const ws = freshWorkspace();
+  await withMockBridge({ echoAudio: false, protocolVersion: 2 }, async (bridgeFile) => {
     const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
     try {
       const r = await runCli(["session", "start", "--source", "mac-screen", "--window", "7", "--json"], { cwd: ws.cwd, env });
