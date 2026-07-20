@@ -33,7 +33,7 @@
 
 import { createServer } from "node:http";
 import { spawnSync, spawn, execSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -631,6 +631,215 @@ await test("--user-data-dir on a locked profile (SingletonLock) is refused (exit
   const r = await runCli(["record", "--url", appBase, "--user-data-dir", profile], ws);
   assert.equal(r.code, 2, `expected exit 2, got ${r.code}: ${r.stderr}`);
   assert.match(r.stderr, /live\/locked Chrome profile/);
+});
+
+// --- NEW-6: --profile-directory (copy the named profile so selection works) --
+
+// (a) The named profile is COPIED into a scratch root's Default → the recording
+// carries that identity; the real root is never opened/written; the copy is loud
+// and cleaned up. Playwright ignores --profile-directory in-place, so this is the
+// only way to select a named profile.
+await test("--profile-directory copies the named profile so the recording carries its identity; real root untouched + cleaned up", async () => {
+  const ws = freshWorkspace();
+  const realRoot = mkdtempSync(join(tmpdir(), "clipy-ctl-realroot-"));
+  let cdpBrowser = null;
+  try {
+    const { chromium } = globalRequire("playwright");
+    // Seed a marker in the root's Default, then RENAME Default → "Profile 7" so
+    // realRoot looks like a real multi-profile Chrome user-data root.
+    let seed = await chromium.launchPersistentContext(realRoot, { headless: true, args: ["--no-sandbox"] });
+    let sp = seed.pages()[0] ?? (await seed.newPage());
+    await sp.goto(appBase, { waitUntil: "load" });
+    await sp.evaluate(() => localStorage.setItem("clipyProfileMarker", "identity-P7"));
+    await new Promise((r) => setTimeout(r, 300));
+    await seed.close();
+    renameSync(join(realRoot, "Default"), join(realRoot, "Profile 7"));
+
+    const beforeEntries = readdirSync(realRoot).sort().join(",");
+
+    const start = await runCli(
+      ["session", "start", "--url", appBase, "--max", "30", "--user-data-dir", realRoot, "--profile-directory", "Profile 7", "--expose-cdp", "--json"],
+      ws,
+    );
+    assert.equal(start.code, 0, `session start (profile copy) failed (${start.code}): ${start.stderr}`);
+    assert.match(start.stderr, /copying profile 'Profile 7'/, `expected the loud copy disclosure: ${start.stderr}`);
+    // False-identity guard: on macOS a copied Chrome profile can open signed out
+    // (Keychain key mismatch), so copy mode must say so BEFORE recording.
+    if (process.platform === "darwin") {
+      assert.match(
+        start.stderr,
+        /may not decrypt under the recorder's Chromium/,
+        `expected the macOS Keychain warning before recording: ${start.stderr}`,
+      );
+    }
+
+    const scratchRoot = readSessionState(ws.configHome).profileScratchRoot;
+    assert.ok(scratchRoot && existsSync(scratchRoot), `a profile scratch root should exist during the session: ${scratchRoot}`);
+
+    // The recording browser must carry the copied identity.
+    const cdpHttpUrl = JSON.parse(start.stdout).cdpHttpUrl;
+    cdpBrowser = await chromium.connectOverCDP(cdpHttpUrl);
+    const rpage = cdpBrowser.contexts()[0].pages()[0];
+    await rpage.goto(appBase, { waitUntil: "load" }); // ensure loaded on the seeded origin
+    const marker = await rpage.evaluate(() => localStorage.getItem("clipyProfileMarker"));
+    assert.equal(marker, "identity-P7", `the recording must load the copied profile's identity; got ${JSON.stringify(marker)}`);
+    await cdpBrowser.close();
+    cdpBrowser = null;
+
+    const stop = await runCli(["session", "stop", "--json"], ws);
+    assert.equal(stop.code, 0, `session stop failed (${stop.code}): ${stop.stderr}`);
+
+    // The real root is never opened or written: same entries, no blank Default.
+    assert.equal(readdirSync(realRoot).sort().join(","), beforeEntries, "the real user-data root's entries must be unchanged");
+    assert.ok(!existsSync(join(realRoot, "Default")), "no blank Default may be created inside the real root");
+    // The scratch copy is cleaned up after stop.
+    assert.ok(!existsSync(scratchRoot), `the profile scratch root must be removed after stop: ${scratchRoot}`);
+  } finally {
+    if (cdpBrowser) await cdpBrowser.close().catch(() => {});
+    await runCli(["session", "abort"], ws).catch(() => {});
+  }
+});
+
+// (b) --user-data-dir pointed AT a profile subdir is refused with the root hint.
+await test("--user-data-dir at a profile subdir is refused (exit 2) with a root+profile-directory hint", async () => {
+  const ws = freshWorkspace();
+  const realRoot = mkdtempSync(join(tmpdir(), "clipy-ctl-subdir-"));
+  const profileSub = join(realRoot, "Profile 12");
+  mkdirSync(profileSub, { recursive: true });
+  writeFileSync(join(profileSub, "Preferences"), "{}"); // looks like a profile dir
+  const r = await runCli(["record", "--url", appBase, "--user-data-dir", profileSub], ws);
+  assert.equal(r.code, 2, `expected exit 2, got ${r.code}: ${r.stderr}`);
+  assert.match(r.stderr, /Chrome PROFILE directory, not a user-data root/);
+  assert.match(r.stderr, /--profile-directory/);
+});
+
+// (d) --profile-directory without --user-data-dir is a usage error.
+await test("--profile-directory without --user-data-dir is a usage error (exit 2)", async () => {
+  const ws = freshWorkspace();
+  const r = await runCli(["record", "--url", appBase, "--profile-directory", "Profile 12"], ws);
+  assert.equal(r.code, 2, `expected exit 2, got ${r.code}: ${r.stderr}`);
+  assert.match(r.stderr, /--profile-directory names a profile inside --user-data-dir/);
+});
+
+// --- Driver-attested marks (Clipy is a recorder, not a driver) --------------
+
+// The two provenances are labeled and tallied in SEPARATE segments — a
+// driver-attested claim can never be read as a Clipy verification.
+await test("driver-attested marks render + tally in their own segment, never pooled with clipy-verified", async () => {
+  const ws = freshWorkspace();
+  lastComplete = null;
+  try {
+    const start = await runCli(["session", "start", "--url", appBase, "--max", "30"], ws);
+    assert.equal(start.code, 0, `session start failed (${start.code}): ${start.stderr}`);
+
+    const cp = await runCli(["mark", "clipy pass", "--assert-selector", "#t", "--assert-text", "Hello"], ws);
+    assert.equal(cp.code, 0, `clipy pass mark: ${cp.stderr}`);
+    const cf = await runCli(["mark", "clipy fail", "--assert-selector", "#nope"], ws);
+    assert.equal(cf.code, 0, `clipy fail mark: ${cf.stderr}`);
+    const dp = await runCli(["mark", "driver pass", "--observed", "status=Active, rows=3", "--verdict", "pass", "--json"], ws);
+    assert.equal(dp.code, 0, `driver pass mark: ${dp.stderr}`);
+    const dpJson = JSON.parse(dp.stdout);
+    assert.ok(dpJson.text.includes("[ASSERT ✓ driver-attested; observed=status=Active, rows=3]"), `driver-attested rendering: ${dpJson.text}`);
+    assert.equal(dpJson.assert.attested, true, "the --json payload marks it attested");
+    const df = await runCli(["mark", "driver fail", "--observed", "status=Pending", "--verdict", "fail"], ws);
+    assert.equal(df.code, 0, `driver fail mark: ${df.stderr}`);
+
+    const stop = await runCli(["session", "stop", "--json"], ws);
+    assert.equal(stop.code, 0, `session stop failed (${stop.code}): ${stop.stderr}`);
+
+    const notes = lastComplete?.narration?.notes ?? [];
+    const texts = notes.map((n) => n.text);
+    // Clipy-verified marks carry the explicit provenance label.
+    assert.ok(noteText(notes, "clipy pass").text.includes("[assert ✓ verified-by-clipy;"), `clipy pass label: ${noteText(notes, "clipy pass")?.text}`);
+    assert.ok(noteText(notes, "clipy fail").text.includes("[ASSERT ✗ verified-by-clipy;"), `clipy fail label: ${noteText(notes, "clipy fail")?.text}`);
+    // Driver-attested marks carry theirs, with the observed values.
+    assert.ok(noteText(notes, "driver pass").text.includes("[ASSERT ✓ driver-attested; observed=status=Active, rows=3]"), `driver pass: ${noteText(notes, "driver pass")?.text}`);
+    assert.ok(noteText(notes, "driver fail").text.includes("[ASSERT ✗ driver-attested; observed=status=Pending]"), `driver fail: ${noteText(notes, "driver fail")?.text}`);
+    // Segmented tally — the two kinds are counted separately.
+    assert.equal(
+      notes[0].text,
+      "[verification] 2 clipy-verified: 1 passed, 1 failed · 2 driver-attested: 1 passed, 1 failed",
+      `segmented tally, got: ${notes[0]?.text} (all: ${JSON.stringify(texts)})`,
+    );
+  } finally {
+    await runCli(["session", "abort"], ws).catch(() => {});
+  }
+});
+
+// Evidence is OPT-IN: a plain-narration recording (demo, walkthrough) is
+// first-class and must stay COMPLETELY quiet — no [verification] note, no warning.
+await test("a session with zero assertions produces no [verification] note and no warnings", async () => {
+  const ws = freshWorkspace();
+  lastComplete = null;
+  try {
+    const start = await runCli(["session", "start", "--url", appBase, "--max", "30"], ws);
+    assert.equal(start.code, 0, `session start failed (${start.code}): ${start.stderr}`);
+    const m1 = await runCli(["mark", "walking through the settings page"], ws);
+    assert.equal(m1.code, 0, `plain mark: ${m1.stderr}`);
+    const ch = await runCli(["chapter", "AFTER"], ws);
+    assert.equal(ch.code, 0, `chapter: ${ch.stderr}`);
+    const m2 = await runCli(["mark", "and here is the export button"], ws);
+    assert.equal(m2.code, 0, `plain mark 2: ${m2.stderr}`);
+    const stop = await runCli(["session", "stop", "--json"], ws);
+    assert.equal(stop.code, 0, `session stop failed (${stop.code}): ${stop.stderr}`);
+
+    const notes = lastComplete?.narration?.notes ?? [];
+    const texts = notes.map((n) => n.text);
+    assert.ok(notes.length > 0, "the narration is still recorded");
+    assert.ok(
+      !texts.some((t) => typeof t === "string" && t.includes("[verification]")),
+      `a no-assertion session must not emit a [verification] note: ${JSON.stringify(texts)}`,
+    );
+    // …and no assertion annotation of EITHER provenance anywhere in the payload.
+    assert.ok(
+      !texts.some((t) => typeof t === "string" && /\[assert |\[ASSERT /.test(t)),
+      `a no-assertion session must carry no assert/ASSERT annotations: ${JSON.stringify(texts)}`,
+    );
+    for (const [label, r] of [["start", start], ["mark", m1], ["chapter", ch], ["mark2", m2], ["stop", stop]]) {
+      assert.ok(!/warning:|⚠/.test(r.stderr), `${label} must not warn about missing assertions: ${r.stderr}`);
+    }
+  } finally {
+    await runCli(["session", "abort"], ws).catch(() => {});
+  }
+});
+
+await test("driver-attested + --assert-* on one mark is a usage error (one provenance per mark)", async () => {
+  const ws = freshWorkspace();
+  const r = await runCli(
+    ["mark", "mixed", "--observed", "x=1", "--verdict", "pass", "--assert-selector", "#t"],
+    ws,
+  );
+  assert.equal(r.code, 2, `expected exit 2, got ${r.code}: ${r.stderr}`);
+  assert.match(r.stderr, /different provenances/);
+});
+
+await test("--verdict without --observed (and vice versa) is a usage error (exit 2)", async () => {
+  const ws = freshWorkspace();
+  const noObserved = await runCli(["mark", "claim", "--verdict", "pass"], ws);
+  assert.equal(noObserved.code, 2, `expected exit 2, got ${noObserved.code}: ${noObserved.stderr}`);
+  assert.match(noObserved.stderr, /--observed and --verdict go together/);
+  const noVerdict = await runCli(["mark", "claim", "--observed", "x=1"], ws);
+  assert.equal(noVerdict.code, 2, `expected exit 2, got ${noVerdict.code}: ${noVerdict.stderr}`);
+  assert.match(noVerdict.stderr, /--observed and --verdict go together/);
+  const badVerdict = await runCli(["mark", "claim", "--observed", "x=1", "--verdict", "maybe"], ws);
+  assert.equal(badVerdict.code, 2, `expected exit 2, got ${badVerdict.code}: ${badVerdict.stderr}`);
+  assert.match(badVerdict.stderr, /--verdict must be pass or fail/);
+});
+
+// --- Bare --user-data-dir at a real Chrome root: warn, don't refuse ----------
+
+await test("bare --user-data-dir at a real-looking Chrome root warns (in-place) but proceeds", async () => {
+  const ws = freshWorkspace();
+  const realish = mkdtempSync(join(tmpdir(), "clipy-ctl-realish-"));
+  writeFileSync(join(realish, "Local State"), "{}");
+  mkdirSync(join(realish, "Default"), { recursive: true });
+  writeFileSync(join(realish, "Default", "Preferences"), "{}");
+  const before = completeCalls;
+  const r = await runCli(["record", "--url", appBase, "--for", "2", "--user-data-dir", realish, "--json"], ws);
+  assert.equal(r.code, 0, `should still proceed; got ${r.code}: ${r.stderr}`);
+  assert.match(r.stderr, /opens your real Chrome Default profile in place/, `expected the in-place warning: ${r.stderr}`);
+  assert.match(r.stderr, /--profile-directory/, "the warning points at the safer flag");
+  assert.ok(completeCalls > before, "it still records and uploads");
 });
 
 appServer.close();

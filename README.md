@@ -128,12 +128,27 @@ agent-context — clearly marked as agent narration, never passed off as speech-
 
 ### Recording a logged-in app
 
-To record an authenticated SPA, seed the session **before** the browser navigates —
-Clipy applies all of these to the Playwright context ahead of the first page load, so the
-app's route guard sees the auth state on first paint (seeding `localStorage` *after*
-visiting a guarded route loses that race and bounces you to `/login`). These flags apply
-to headless web capture on `record` and `session start`; they're rejected on
-`--source mac-screen` (which records the real, already-logged-in screen).
+**If something is driving the browser — prefer that.** Clipy is a recorder, not a driver.
+When an agent (or you) drives a real, already-logged-in browser, don't hand Clipy the
+credentials at all: record the real screen and attach evidence as you go.
+
+```bash
+clipy session start --source mac-screen --window "Chrome" --title "PR-1234 verification"
+clipy mark "redemptions tab active" --observed "tab=Redemptions, rows=14" --verdict pass
+clipy chapter "AFTER — fix applied"
+clipy session stop
+```
+
+No auth to reproduce, no credentials in flags, and the recording shows the real app.
+
+**The flags below are the agentless / CI fallback** — for a one-shot `clipy record` in CI,
+or a headless session nothing is steering, where Clipy needs its own logged-in context.
+Seed the session **before** the browser navigates — Clipy applies all of these to the
+Playwright context ahead of the first page load, so the app's route guard sees the auth
+state on first paint (seeding `localStorage` *after* visiting a guarded route loses that
+race and bounces you to `/login`). They apply to headless web capture on `record` and
+`session start`; they're rejected on `--source mac-screen` (which records the real,
+already-logged-in screen).
 
 - `--storage-state <file>` — a Playwright [`storageState`](https://playwright.dev/docs/auth)
   JSON (cookies + per-origin `localStorage`), passed straight to `browser.newContext()`.
@@ -146,19 +161,30 @@ to headless web capture on `record` and `session start`; they're rejected on
   (repeatable).
 - `--init-script <file>` — run a JS file in every page before its own scripts (e.g. to
   stub a feature flag or inject a token).
-- `--user-data-dir <dir>` — launch a **persistent** Chromium profile from `dir` instead
-  of an ephemeral context (`launchPersistentContext`), so the recording carries that
-  profile's whole logged-in identity. Web only; **mutually exclusive with
-  `--storage-state`** (a profile already carries its own storage). `--cookie` /
-  `--local-storage` / `--init-script` still compose. Chrome locks a profile while it's
-  open, so Clipy refuses a dir that has a `SingletonLock`/`SingletonSocket`. Two ways to
-  point it at a real logged-in profile:
-  - **Quit Chrome, then point at the real profile dir.** No copy needed and you record
-    with full identity — but the recorder writes to that profile, so quit Chrome first
-    (that's what clears the `Singleton*` locks) and expect it to have your live session.
-  - **Copy the profile out and strip the locks** (`cp -R "<profile>" ./clipy-profile &&
-    rm -f ./clipy-profile/Singleton*`) for isolation from your live browser, at the cost
-    of duplicating a (large) profile dir. The profile owner's call.
+- `--user-data-dir <dir>` — launch a **persistent** Chromium profile from the user-data
+  **root** `dir` (`launchPersistentContext`), so the recording carries that profile's
+  whole logged-in identity. Web only; **mutually exclusive with `--storage-state`** (a
+  profile already carries its own storage). `--cookie` / `--local-storage` / `--init-script`
+  still compose. Pass the **root**, not a profile subdir — Clipy refuses a `Default`/`Profile N`
+  directory and tells you the parent dir + `--profile-directory` to use. In direct mode
+  (no `--profile-directory`) it also refuses a live-locked root (`SingletonLock`/`SingletonSocket`).
+- `--profile-directory "<name>"` — with `--user-data-dir`, select a **named** profile
+  (e.g. `Profile 12`, from `chrome://version` → "Profile Path"). Because Playwright can't
+  select a named profile in place, Clipy **copies** that profile into a temporary recording
+  root and launches the copy — **loudly** (it prints what it's copying and the size). Your
+  real profile is never opened or written, and the copy is deleted after upload. No need to
+  quit Chrome (Clipy warns if it's running, since in-use databases may copy inconsistently —
+  quit it for a guaranteed-clean copy).
+
+> **⚠ macOS: a copied Chrome profile can open silently signed out.** Chrome encrypts its
+> cookies with a Keychain key scoped to *Chrome Safe Storage*; the recorder runs
+> Playwright's **Chromium**, which reads *Chromium Safe Storage*. So a copied real-Chrome
+> profile may open looking like you — bookmarks, preferences, `localStorage` all intact —
+> while every cookie-based login is gone. `localStorage`/`Preferences`-based sessions
+> survive; cookie sessions may not. Clipy prints this warning before recording whenever
+> copy mode runs on macOS. **If the recording lands logged out, this is why** — use
+> `--source mac-screen` with your real browser, or the agent-driven path (drive your own
+> browser and attach evidence with `--observed`/`--verdict`).
 
 ```bash
 # Reuse a saved Playwright login
@@ -169,9 +195,10 @@ clipy record --url https://app.example.com/dashboard --for 20 \
 clipy record --url https://app.example.com/dashboard \
   --local-storage "authToken=eyJ…" --cookie "sid=abc; Domain=app.example.com; Secure"
 
-# Or record a persistent logged-in profile
+# Or record your real logged-in Chrome profile (copied, never modified)
 clipy record --url https://app.example.com/dashboard --for 20 \
-  --user-data-dir ./clipy-profile
+  --user-data-dir "$HOME/Library/Application Support/Google/Chrome" \
+  --profile-directory "Profile 12"
 ```
 
 #### The auth boundary
@@ -188,7 +215,9 @@ reliable ways to get a real logged-in recording:
    # sign in, close the window, then:
    clipy record --url https://app.example.com/dashboard --storage-state auth.json
    ```
-2. **`--user-data-dir <dedicated-profile>`** — a persistent profile you logged into once.
+2. **Your real Chrome profile, copied:** `--user-data-dir "<chrome user-data root>"
+   --profile-directory "<name>"` (name from `chrome://version`). Clipy copies that profile
+   to a temp root and records the copy — no manual export, and your real profile is untouched.
 3. **`--source mac-screen --window "Chrome"`** — record your real, already-logged-in
    Chrome window through the Mac app; there's no headless auth to reproduce at all.
 
@@ -276,13 +305,33 @@ Safety rails are built in: the session **auto-stops and uploads** at `--max <sec
 abort` discards everything; a crashed daemon is detected and cleared on the next command;
 corrupt captures are refused before upload, and a failed upload keeps the local file.
 
-### Assertion marks — recordings as evidence
+### Evidence marks — two provenances, never pooled
 
 A plain mark is an unverified claim: an agent can write `clipy mark "the Redemptions
 tab is active"` whether or not it is, and the transcript reads as authoritative either
-way. Assertion marks fix that. The recording daemon owns the live Playwright page, so it
-can **check the claim against the real DOM** and annotate the mark with what it actually
-observed — a false claim can't pass as fact.
+way. Evidence marks fix that — in one of two ways, and Clipy **labels which**, so a
+claim you attested can never be read as something Clipy checked.
+
+**Driver-attested — you brought the browser.** Clipy is a recorder, not a driver: when
+you're driving a real browser with your own tooling (or recording the screen), attach the
+values you observed and your verdict.
+
+```bash
+clipy mark "redemptions tab active" --observed "tab=Redemptions, rows=14" --verdict pass
+clipy mark "totals still stale"     --observed "total=\$0.00 (expected \$412.50)" --verdict fail
+```
+
+Stored as `redemptions tab active [ASSERT ✓ driver-attested; observed=tab=Redemptions, rows=14]`
+(or `✗`). Both flags are required together, a mark carries exactly **one** provenance
+(mixing with `--assert-*` is a usage error), and this works in **every** session type —
+including `--source mac-screen`.
+
+> **The honesty rule:** driver-attested means Clipy vouches that the agent **said** it,
+> not that Clipy verified it. Put real observed values in `--observed` — the point of the
+> ledger is that a reviewer can check the attestation against the video.
+
+**Clipy-verified — Clipy owns the page.** In a headless web session the daemon owns the
+live Playwright page, so it can check the claim against the real DOM itself:
 
 ```bash
 # Assert a URL (globs: ** = anything, * = any non-slash segment, no * = substring)
@@ -292,24 +341,32 @@ clipy mark "opened the redemptions tab" --assert-url "**/redemptions"
 clipy mark "status flipped to Active" --assert-selector ".status-badge" --assert-text "Active"
 ```
 
-- **Pass** → the mark is stored as `status flipped to Active [assert ✓ .status-badge="Active"]`
+- **Pass** → `status flipped to Active [assert ✓ verified-by-clipy; .status-badge="Active"]`
   and the CLI prints a green `✓`.
-- **Fail** → it's stored as
-  `status flipped to Active [ASSERT ✗ expected "Active"; observed .status-badge="Pending"]`
+- **Fail** → `status flipped to Active [ASSERT ✗ verified-by-clipy; expected "Active"; observed .status-badge="Pending"]`
   and the CLI prints a red `✗`. The wrong claim is preserved *as a failed assertion*, not
   as a fact.
 
 `--assert-selector <css>` checks an element matches (its trimmed text becomes the
 `observed` value); `--assert-text <substr>` requires that element's text to contain a
 substring (it needs a selector); `--assert-url <glob>` matches the page URL. Combine them
-freely — all provided checks must pass.
+freely — all provided checks must pass. These need a Clipy-owned page, so they're rejected
+on `--source mac-screen` (use `--observed`/`--verdict` there).
 
 `--fail-mode` decides what a failed assertion does: `warn` (default) records the `✗` and
 keeps recording; **`abort` discards the whole session** — nothing is uploaded and the CLI
 exits non-zero, so a driver that asserts its way to a broken state doesn't ship a misleading
-clip. If any assertion was attempted, a leading `[verification] N assertion(s): P passed,
-F failed[, K unverified]` note is prepended at 0 ms, so the transcript and the `.md` context
-open with the scorecard.
+clip.
+
+The leading `[verification]` note reports the two provenances as **separate segments** and
+never pools them:
+
+```text
+[verification] 2 clipy-verified: 1 passed, 1 failed, 1 unverified · 3 driver-attested: 2 passed, 1 failed
+```
+
+An empty segment is omitted; with only clipy-verified marks the rendering stays the legacy
+`N assertion(s): P passed, F failed[, K unverified]`.
 
 **A mark is never dropped, and a late verdict never rewrites it.** If the daemon can't be
 reached to evaluate an assertion — its event loop briefly starved during a heavy dev-server
