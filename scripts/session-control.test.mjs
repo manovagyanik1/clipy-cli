@@ -32,6 +32,7 @@
  */
 
 import { createServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { spawnSync, spawn, execSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -908,6 +909,244 @@ await test("clipy transcript --srt/--json still work (line-per-entry didn't brea
   const parsed = JSON.parse(j.stdout);
   assert.equal(parsed.status, "ready", "json passthrough intact");
   assert.ok(parsed.transcript.plaintext.length > 0, "raw plaintext still available via --json");
+});
+
+// --- Capture-source reporting (mac-screen) ----------------------------------
+// Driver-attested evidence proves what the DRIVER saw; nothing tied it to what
+// the CAMERA saw. `session start` must report the surface it actually resolved,
+// read LIVE from the app, so a caller driving a background tab catches the
+// mismatch immediately instead of after the recording is spent.
+await test("session start --source mac-screen reports the resolved capture source (live title) in --json and stdout", async () => {
+  const ws = freshWorkspace();
+  const WINDOW = { id: 157, app_name: "Chrome", title: "Redemptions · Admin", width: 1440, height: 900 };
+  const sockPath = join(mkdtempSync(join(tmpdir(), "clipy-src-sock-")), "bridge.sock");
+  // Mock agent bridge: one JSON request line in, one response line out.
+  const bridge = createNetServer((conn) => {
+    let buf = "";
+    conn.on("data", (d) => {
+      buf += d;
+      const nl = buf.indexOf("\n");
+      if (nl === -1) return;
+      const req = JSON.parse(buf.slice(0, nl));
+      const reply = (data) => conn.end(`${JSON.stringify({ ok: true, data })}\n`);
+      if (req.cmd === "sources") return reply({ displays: [], windows: [WINDOW] });
+      // The real bridge echoes the RESOLVED audio config; mirror that.
+      if (req.cmd === "start")
+        return reply({
+          started: true,
+          audio: {
+            includeSystemAudio: req.audio?.includeSystemAudio ?? true,
+            includeMic: req.audio?.includeMic ?? false,
+            micDeviceId: null,
+          },
+        });
+      if (req.cmd === "status") return reply({ appVersion: "0.1.41", protocolVersion: 1, agentSession: null });
+      return reply({});
+    });
+  });
+  await new Promise((r) => bridge.listen(sockPath, r));
+  const bridgeFile = join(mkdtempSync(join(tmpdir(), "clipy-src-bridge-")), "agent-bridge.json");
+  writeFileSync(
+    bridgeFile,
+    JSON.stringify({ socketPath: sockPath, token: "t", pid: process.pid, appVersion: "0.1.41", protocolVersion: 1 }),
+  );
+  const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
+  try {
+    const start = await runCli(
+      ["session", "start", "--source", "mac-screen", "--window", "157", "--json"],
+      { cwd: ws.cwd, env },
+    );
+    assert.equal(start.code, 0, `mac session start failed (${start.code}): ${start.stderr}`);
+    const out = JSON.parse(start.stdout);
+    assert.ok(out.source, `--json must carry a source descriptor: ${start.stdout}`);
+    assert.equal(out.source.kind, "window", "kind is reported");
+    assert.equal(out.source.id, 157, "id is reported");
+    assert.ok(out.source.title && out.source.title.length > 0, "title is non-empty (never fabricated, never blank)");
+    assert.equal(out.source.title, WINDOW.title, "title matches what the bridge reported LIVE");
+
+    // …and `clipy sources --json` exposes the SAME shape, so a caller can compare
+    // its pick against the camera without transforming either side.
+    const srcs = await runCli(["sources", "--json"], { cwd: ws.cwd, env });
+    assert.equal(srcs.code, 0, `sources --json failed: ${srcs.stderr}`);
+    const listed = JSON.parse(srcs.stdout).windows[0].source;
+    // Identity fields must match field-for-field; the reported capture adds only
+    // the caller-facing `note` (kept off listing rows so it isn't repeated N times).
+    assert.deepEqual(
+      { kind: listed.kind, id: listed.id, title: listed.title, app: listed.app },
+      { kind: out.source.kind, id: out.source.id, title: out.source.title, app: out.source.app },
+      "sources --json descriptor is directly comparable to the reported capture",
+    );
+    assert.ok(out.source.note && /never focus or foreground/.test(out.source.note), "source carries the guidance note");
+  } finally {
+    await runCli(["session", "abort"], { cwd: ws.cwd, env }).catch(() => {});
+    bridge.close();
+  }
+});
+
+await test("session start --source mac-screen prints the resolved surface prominently, before the usage hints", async () => {
+  const ws = freshWorkspace();
+  const WINDOW = { id: 42, app_name: "Simulator", title: "iPhone 15 — Checkout", width: 390, height: 844 };
+  const sockPath = join(mkdtempSync(join(tmpdir(), "clipy-src-sock2-")), "bridge.sock");
+  const bridge = createNetServer((conn) => {
+    let buf = "";
+    conn.on("data", (d) => {
+      buf += d;
+      if (buf.indexOf("\n") === -1) return;
+      const req = JSON.parse(buf.slice(0, buf.indexOf("\n")));
+      const reply = (data) => conn.end(`${JSON.stringify({ ok: true, data })}\n`);
+      if (req.cmd === "sources") return reply({ displays: [], windows: [WINDOW] });
+      return reply({
+        started: true,
+        audio: {
+          includeSystemAudio: req.audio?.includeSystemAudio ?? true,
+          includeMic: req.audio?.includeMic ?? false,
+          micDeviceId: null,
+        },
+      });
+    });
+  });
+  await new Promise((r) => bridge.listen(sockPath, r));
+  const bridgeFile = join(mkdtempSync(join(tmpdir(), "clipy-src-bridge2-")), "agent-bridge.json");
+  writeFileSync(
+    bridgeFile,
+    JSON.stringify({ socketPath: sockPath, token: "t", pid: process.pid, appVersion: "0.1.41", protocolVersion: 1 }),
+  );
+  const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
+  try {
+    const start = await runCli(["session", "start", "--source", "mac-screen", "--window", "Simulator"], { cwd: ws.cwd, env });
+    assert.equal(start.code, 0, `mac session start failed: ${start.stderr}`);
+    const idx = start.stdout.indexOf('recording window: "iPhone 15 — Checkout" (id 42)');
+    assert.ok(idx !== -1, `expected the resolved-surface line: ${start.stdout}`);
+    const hintIdx = start.stdout.indexOf("while it runs:");
+    assert.ok(hintIdx === -1 || idx < hintIdx, "the surface line comes BEFORE the usage hints");
+    assert.match(start.stdout, /never brings it to the front for you/, "states Clipy will not foreground it");
+  } finally {
+    await runCli(["session", "abort"], { cwd: ws.cwd, env }).catch(() => {});
+    bridge.close();
+  }
+});
+
+// --- Audio: agent recordings must not take the microphone --------------------
+
+/** Spin a mock bridge; `echoAudio:false` simulates a desktop build that predates
+ *  agent audio control (it ignores the field and echoes nothing back). */
+async function withMockBridge(echoAudio, fn) {
+  const WINDOW = { id: 7, app_name: "Chrome", title: "Dashboard", width: 800, height: 600 };
+  const sockPath = join(mkdtempSync(join(tmpdir(), "clipy-audio-sock-")), "bridge.sock");
+  let lastStart = null;
+  const bridge = createNetServer((conn) => {
+    let buf = "";
+    conn.on("data", (d) => {
+      buf += d;
+      if (buf.indexOf("\n") === -1) return;
+      const req = JSON.parse(buf.slice(0, buf.indexOf("\n")));
+      const reply = (data) => conn.end(`${JSON.stringify({ ok: true, data })}\n`);
+      if (req.cmd === "sources") return reply({ displays: [], windows: [WINDOW] });
+      if (req.cmd === "start") {
+        lastStart = req;
+        return reply(
+          echoAudio
+            ? {
+                started: true,
+                audio: {
+                  includeSystemAudio: req.audio?.includeSystemAudio ?? true,
+                  includeMic: req.audio?.includeMic ?? false,
+                  micDeviceId: null,
+                },
+              }
+            : { started: true },
+        );
+      }
+      return reply({});
+    });
+  });
+  await new Promise((r) => bridge.listen(sockPath, r));
+  const bridgeFile = join(mkdtempSync(join(tmpdir(), "clipy-audio-bridge-")), "agent-bridge.json");
+  writeFileSync(
+    bridgeFile,
+    JSON.stringify({ socketPath: sockPath, token: "t", pid: process.pid, appVersion: "0.1.41", protocolVersion: 1 }),
+  );
+  try {
+    return await fn(bridgeFile, () => lastStart);
+  } finally {
+    bridge.close();
+  }
+}
+
+await test("mac-screen defaults to mic OFF, system audio on — and says so", async () => {
+  const ws = freshWorkspace();
+  await withMockBridge(true, async (bridgeFile, lastStart) => {
+    const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
+    try {
+      const r = await runCli(["session", "start", "--source", "mac-screen", "--window", "7", "--json"], { cwd: ws.cwd, env });
+      assert.equal(r.code, 0, `start failed: ${r.stderr}`);
+      // The privacy default must be EXPLICIT on the wire, not implied by omission.
+      assert.deepEqual(
+        { s: lastStart().audio.includeSystemAudio, m: lastStart().audio.includeMic },
+        { s: true, m: false },
+        "default request is system audio on, mic OFF",
+      );
+      const out = JSON.parse(r.stdout);
+      assert.deepEqual(
+        { s: out.audio.includeSystemAudio, m: out.audio.includeMic },
+        { s: true, m: false },
+        "--json reports the applied audio as a sibling field",
+      );
+      assert.equal(out.source.kind, "window", "source stays the surface descriptor, audio is separate");
+      assert.match(r.stderr, /audio: system on, mic off/, `terminal states the audio: ${r.stderr}`);
+    } finally {
+      await runCli(["session", "abort"], { cwd: ws.cwd, env }).catch(() => {});
+    }
+  });
+});
+
+await test("--mic opts in and --no-system-audio opts out, both reaching the bridge", async () => {
+  const ws = freshWorkspace();
+  await withMockBridge(true, async (bridgeFile, lastStart) => {
+    const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
+    try {
+      const r = await runCli(
+        ["session", "start", "--source", "mac-screen", "--window", "7", "--mic", "--no-system-audio", "--json"],
+        { cwd: ws.cwd, env },
+      );
+      assert.equal(r.code, 0, `start failed: ${r.stderr}`);
+      assert.deepEqual(
+        { s: lastStart().audio.includeSystemAudio, m: lastStart().audio.includeMic },
+        { s: false, m: true },
+        "explicit flags reach the bridge",
+      );
+      assert.match(r.stderr, /audio: system off, mic ON/, `terminal states mic is live: ${r.stderr}`);
+    } finally {
+      await runCli(["session", "abort"], { cwd: ws.cwd, env }).catch(() => {});
+    }
+  });
+});
+
+// The dangerous case: an old app ignores the audio field and uses ITS defaults
+// (mic ON). We can't fix that from here, but we must never let it pass silently.
+await test("an app that does not echo audio triggers a mic-may-be-recording warning", async () => {
+  const ws = freshWorkspace();
+  await withMockBridge(false, async (bridgeFile) => {
+    const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
+    try {
+      const r = await runCli(["session", "start", "--source", "mac-screen", "--window", "7", "--json"], { cwd: ws.cwd, env });
+      assert.equal(r.code, 0, `start should still proceed: ${r.stderr}`);
+      assert.match(r.stderr, /did not confirm the audio settings/, `expected the warning: ${r.stderr}`);
+      assert.match(r.stderr, /MICROPHONE MAY BE RECORDING/, "warning names the actual risk");
+    } finally {
+      await runCli(["session", "abort"], { cwd: ws.cwd, env }).catch(() => {});
+    }
+  });
+});
+
+await test("--mic / --no-system-audio on the web path is a usage error (exit 2)", async () => {
+  const ws = freshWorkspace();
+  const a = await runCli(["record", "--url", appBase, "--mic"], ws);
+  assert.equal(a.code, 2, `expected exit 2, got ${a.code}: ${a.stderr}`);
+  assert.match(a.stderr, /--source mac-screen only/);
+  const b = await runCli(["session", "start", "--url", appBase, "--no-system-audio"], ws);
+  assert.equal(b.code, 2, `expected exit 2, got ${b.code}: ${b.stderr}`);
+  assert.match(b.stderr, /headless web captures record no audio/);
 });
 
 appServer.close();

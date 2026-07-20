@@ -455,10 +455,43 @@ clipy mark "fix applied — retesting"
 clipy session stop                              # uploads, prints the share link
 ```
 
+**Agent recordings don't take your microphone.** On `--source mac-screen` the default is
+**system audio on, mic off** — an agent recording on your behalf isn't the same consent as
+you clicking Record, and nobody asked for the room (or whatever call you're on) to be
+captured; agent narration rides on marks, not speech. `--mic` opts in; `--no-system-audio`
+opts out of system audio. Both are mac-screen only — headless web captures are silent, so
+passing them on the web path is a usage error. The resolved config is printed
+(`audio: system on, mic off`) and returned as a sibling `audio` field in `--json`. If your
+Clipy app predates agent audio control it won't echo a config back, and the CLI warns that
+the app's defaults are in force and **your mic may be recording** — update the app.
+
 `--window` takes a window id from `clipy sources`, or an app/title substring
 (case-insensitive; ambiguous matches list the candidates instead of guessing).
 `--display <id>` records a specific display. Both also work on one-shot
 `clipy record --source mac-screen --for 30`.
+
+#### Confirm the camera before you burn six minutes
+
+On start Clipy prints the surface it actually resolved, read live from the app:
+
+```text
+recording window: "Redemptions · Admin — Chrome" (id 157)
+```
+
+`session start --json` and `record --json` carry the same as `source: {kind, id, title}`,
+in the **same shape** as each entry's `source` in `clipy sources --json`, so you can
+compare what you picked against what the camera reports without transforming either.
+
+**Check it against the surface you're driving, and abort on a mismatch.** Driver-attested
+marks prove what *you* observed — they say nothing about what the camera saw. If you drive
+a background tab of the recorded window, you get a truthful "10 passed" tally over footage
+of a different tab: worse than no evidence, because the tally vouches for the wrong footage.
+
+**Clipy will never bring a window or tab to the front for you.** It can't know which
+tab/page/simulator you mean, and on `--source mac-screen` it may not be recording a browser
+at all — focusing the right surface is the caller's job. Do it before `session start`, then
+confirm with the reported title. (That title is read at start time; the camera follows the
+window, so switching tabs mid-recording changes what's filmed without changing the title.)
 
 ## Scripting
 

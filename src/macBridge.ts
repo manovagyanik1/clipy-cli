@@ -337,6 +337,63 @@ export function windowLabel(w: BridgeWindow): string {
 }
 
 /**
+ * A structured description of the surface the CAMERA is actually pointed at,
+ * read LIVE from the running app at resolve time (never carried over from an
+ * earlier `clipy sources` listing — staleness is the whole point).
+ *
+ * Why this exists: driver-attested evidence proves what the DRIVER observed.
+ * Nothing tied that to what the camera saw, so a driver working a background tab
+ * could produce a truthful "10 passed" tally over footage of something else —
+ * worse than unverified, because the tally vouches for the wrong footage.
+ * Reporting the resolved surface lets the caller catch the mismatch in second
+ * one instead of minute six.
+ *
+ * NOT SOLVED HERE, DELIBERATELY: Clipy does not activate/foreground the target.
+ * It cannot know which tab/page/simulator/window the driver means (on
+ * --source mac-screen we may not be recording a browser at all), and taking
+ * control of the surface would re-import the browser-ownership premise 0.8.3
+ * removed. Focusing the right surface is the caller's job; ours is to say
+ * plainly what we're filming. Please don't reopen this.
+ */
+export interface ResolvedSource {
+  /** CLOSED SET, shared with @clipy/mcp. Names WHAT THE CAMERA IS POINTED AT,
+   *  never the transport — "mac-screen" is a transport and is deliberately not a
+   *  kind here. ("headless_browser" is the MCP's owned-page capture.) */
+  kind: "window" | "display" | "headless_browser";
+  /** OMITTED when there genuinely isn't one (never null, never synthesized) — a
+   *  fabricated identifier is the exact false-confidence this field prevents. */
+  id?: number;
+  /** The live title at resolve time. Windows fall back to the app name; displays
+   *  to their name, else id + bounds. Never empty, never fabricated — and OMITTED
+   *  entirely when no specific surface was resolved (the app's default capture),
+   *  for the same reason `id` is: a guessed label is worse than a missing one. */
+  title?: string;
+  /** Windows only — the owning application. */
+  app?: string;
+}
+
+export function describeWindow(w: BridgeWindow): ResolvedSource {
+  return {
+    kind: "window",
+    id: w.id,
+    // A window can legitimately have no title (some app shells); naming the app
+    // is honest, inventing a title would not be.
+    title: w.title || w.app_name || `window ${w.id}`,
+    app: w.app_name,
+  };
+}
+
+export function describeDisplay(d: BridgeDisplay): ResolvedSource {
+  return {
+    kind: "display",
+    id: d.id,
+    // Displays have no title; fall back to the name, then the identifier +
+    // bounds, so the field is never an empty string.
+    title: d.name || `display ${d.id} (${d.width}×${d.height})`,
+  };
+}
+
+/**
  * Resolves --window/--display flags to a CaptureSource. A numeric value is
  * treated as an id from `clipy sources`; anything else is a case-insensitive
  * substring match on "app_name title" (windows) or name (displays). Ambiguity
@@ -346,7 +403,7 @@ export function windowLabel(w: BridgeWindow): string {
 export async function resolveCaptureSource(
   info: BridgeInfo,
   opts: { window?: string; display?: string },
-): Promise<{ source: CaptureSource; label: string }> {
+): Promise<{ source: CaptureSource; label: string; resolved: ResolvedSource }> {
   if (opts.window && opts.display) {
     throw new Error("--window and --display are mutually exclusive — pick one capture source");
   }
@@ -378,7 +435,11 @@ export async function resolveCaptureSource(
       const list = matches.map((w) => `  ${w.id}  ${windowLabel(w)}`).join("\n");
       throw new Error(`"${q}" matches ${matches.length} windows — use the id instead:\n${list}`);
     }
-    return { source: { type: "window", id: matches[0].id }, label: windowLabel(matches[0]) };
+    return {
+      source: { type: "window", id: matches[0].id },
+      label: windowLabel(matches[0]),
+      resolved: describeWindow(matches[0]),
+    };
   }
   if (opts.display) {
     const q = opts.display.trim();
@@ -396,6 +457,7 @@ export async function resolveCaptureSource(
     return {
       source: { type: "display", id: matches[0].id },
       label: matches[0].name || `display ${matches[0].id}`,
+      resolved: describeDisplay(matches[0]),
     };
   }
   throw new Error("resolveCaptureSource called without --window or --display");

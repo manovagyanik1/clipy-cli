@@ -42,6 +42,9 @@ import {
   bridgeAppOutdated,
   MIN_BRIDGE_APP_VERSION,
   type CaptureSource,
+  type ResolvedSource,
+  describeWindow,
+  describeDisplay,
   type BridgeInfo,
   type BridgeDiagnostics,
 } from "./macBridge.js";
@@ -410,10 +413,20 @@ ${c.bold("RECORD")} ${c.dim("(needs an API key with the \"ingest\" permission)")
 ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session per directory)")}
   ${c.dim("--source mac-screen on record/session records the REAL screen via the")}
   ${c.dim("running Clipy Mac app (consent-gated, indicator always visible).")}
+  ${c.dim("On start it prints the resolved surface — recording window: \"<title>\" (id N).")}
+  ${c.dim("CONFIRM that matches what you are driving: attested marks prove what YOU saw,")}
+  ${c.dim("not what the camera saw. Clipy never fronts a window/tab for you.")}
   ${c.dim("Target one window or display instead of the whole screen:")}
-  sources                           List capturable displays + windows (ids for --window/--display)
+  sources [--json]                  List capturable displays + windows (ids for --window/--display).
+                                    --json gives each entry a "source" {kind,id,title}
+                                    matching what session start/record report, so you
+                                    can compare pick-vs-camera directly
     --window "<title|app|id>"       Record just that window (e.g. --window Chrome)
     --display <id>                  Record a specific display
+    --mic                           Opt IN to microphone capture (default: mic OFF —
+                                    an agent recording for you is not the same consent
+                                    as you clicking Record, so we never take the room)
+    --no-system-audio               Opt OUT of system audio (default: system audio ON)
   session start --url <app> [--max <sec>] [--title <t>] [--type <kind>] [--expose-cdp]
                                     Start recording in a background daemon and
                                     return immediately (auto-stops + uploads at
@@ -2934,7 +2947,7 @@ async function evaluateAssertion(page: PwPage, assert: MarkAssert): Promise<Asse
 async function resolveBridgeTarget(
   info: BridgeInfo,
   opts: { window?: string; display?: string },
-): Promise<{ source: CaptureSource; label: string } | null> {
+): Promise<{ source: CaptureSource; label: string; resolved: ResolvedSource } | null> {
   if (!opts.window && !opts.display) return null;
   try {
     return await resolveCaptureSource(info, opts);
@@ -2943,8 +2956,85 @@ async function resolveBridgeTarget(
   }
 }
 
+/** The `source` object reported by `session start --json` / `record --json`:
+ *  the identity descriptor plus the caller-facing guidance note. Kept a SIBLING
+ *  of `audio` and shaped exactly like each entry's `source` in
+ *  `clipy sources --json` (plus `note`), so a caller can compare its pick against
+ *  what the camera reports field-for-field. */
+type CaptureSourceResult = (ResolvedSource & { note: string }) | null;
+
+const CAPTURE_SOURCE_NOTE =
+  "compare this against the surface your driver is acting on; Clipy will never focus or foreground a window/tab for you";
+
+/** Build the reported capture source. With no --window/--display the Mac app
+ *  records its default, which IS a display capture — so the kind is "display"
+ *  (never "mac-screen", which names the transport). We don't know WHICH display
+ *  without resolving one, so id/title are omitted rather than guessed. */
+function captureSourceResult(resolved: ResolvedSource | undefined): CaptureSourceResult {
+  if (resolved) return { ...resolved, note: CAPTURE_SOURCE_NOTE };
+  return { kind: "display", note: CAPTURE_SOURCE_NOTE };
+}
+
+/**
+ * Audio for an agent-initiated screen recording. The DEFAULT IS MIC OFF: an
+ * agent recording on your behalf is not the same consent as you clicking Record,
+ * and nobody asked for the room — or whatever call you're on — to be captured.
+ * Agent narration rides on marks, not speech, so the mic buys nothing by default.
+ * System audio stays on (it captures the machine, not the room). Mirrors
+ * agent_audio_options() in desktop/src-tauri/src/agent_bridge.rs.
+ */
+interface AudioChoice {
+  includeSystemAudio: boolean;
+  includeMic: boolean;
+}
+
+/** Human-readable resolved audio, e.g. "system on, mic off". */
+function describeAudio(a: AudioChoice): string {
+  return `system ${a.includeSystemAudio ? "on" : "off"}, mic ${a.includeMic ? "ON" : "off"}`;
+}
+
+/**
+ * Read the audio config the APP echoed back from `start` (agent_bridge.rs echoes
+ * the resolved options). Returns null when the app didn't echo — which is exactly
+ * how we detect a desktop build that predates agent audio handling and silently
+ * ignored our request. Capability detection beats a hardcoded version compare:
+ * it reports what actually happened rather than what a version number implies.
+ */
+function echoedAudio(startResult: Record<string, unknown>): AudioChoice | null {
+  const a = startResult.audio as { includeSystemAudio?: unknown; includeMic?: unknown } | undefined;
+  if (!a || typeof a !== "object") return null;
+  if (typeof a.includeSystemAudio !== "boolean" || typeof a.includeMic !== "boolean") return null;
+  return { includeSystemAudio: a.includeSystemAudio, includeMic: a.includeMic };
+}
+
+/**
+ * Report the audio that was actually applied, and warn loudly when the app did
+ * not confirm it. The dangerous direction is the silent one: on a desktop build
+ * that ignores the audio field, "mic off" is what we asked for and MIC ON is what
+ * happens — so an unconfirmed request is a privacy warning, not a footnote.
+ */
+function reportAudio(
+  requested: AudioChoice,
+  applied: AudioChoice | null,
+  emit: (m: string) => void,
+): AudioChoice {
+  if (!applied) {
+    emit(
+      c.yellow(
+        `warning: this Clipy app version did not confirm the audio settings — it predates agent audio control, ` +
+          `so it is using the APP's defaults and your MICROPHONE MAY BE RECORDING. ` +
+          `Update the Clipy app (https://clipy.online/download) to make "${describeAudio(requested)}" take effect.`,
+      ),
+    );
+    return requested;
+  }
+  emit(`${c.dim("audio:")} ${describeAudio(applied)}`);
+  return applied;
+}
+
 /** One-shot real-screen recording through the running Clipy app. */
 async function cmdRecordMac(opts: {
+  audio: AudioChoice;
   forSec: number;
   name?: string;
   description?: string;
@@ -2953,7 +3043,12 @@ async function cmdRecordMac(opts: {
   window?: string;
   display?: string;
   json: boolean;
-}): Promise<{ publicId: string; shareUrl: string }> {
+}): Promise<{
+  publicId: string;
+  shareUrl: string;
+  source: CaptureSourceResult;
+  audio: AudioChoice;
+}> {
   // A real-screen capture is one continuous take — there are no viewport passes
   // to anchor pass-scoped notes against.
   const macMaxRef = maxPassRef(opts.notes);
@@ -2971,6 +3066,13 @@ async function cmdRecordMac(opts: {
   log(
     `${c.dim(`asking the Clipy app (v${info.appVersion}) to record ${target?.label ?? "the screen"}…`)}`,
   );
+  // Name the surface the camera resolved to, live, before the capture burns time.
+  if (target) {
+    log(
+      `${c.bold(`recording ${target.resolved.kind}:`)} "${target.resolved.title}" (id ${target.resolved.id})\n` +
+        `${c.dim("confirm that is the surface you are driving — Clipy never brings it to the front for you.")}`,
+    );
+  }
   // --type on the mac path: the current Clipy app doesn't forward recordingKind
   // from the bridge to its raw-upload/complete call (its AgentCompleteExtras has
   // no such field — desktop follow-up). We still send it (serde ignores unknown
@@ -2984,7 +3086,10 @@ async function cmdRecordMac(opts: {
     );
   }
   const notes = resolveNarrationNotes(opts.notes, [0]);
-  await bridgeRequest(info, "start", {
+  const startResult = await bridgeRequest(info, "start", {
+    // Explicit, never implicit: an absent field would fall through to the app's
+    // interactive defaults on older builds (mic ON) — see reportAudio().
+    audio: { includeSystemAudio: opts.audio.includeSystemAudio, includeMic: opts.audio.includeMic },
     // The recording is stopped by us after forSec; maxSec is the safety net
     // in case this CLI process dies mid-wait.
     maxSec: Math.min(opts.forSec + 60, 1800),
@@ -2994,6 +3099,7 @@ async function cmdRecordMac(opts: {
     notes: notes.map((n) => ({ startMs: n.startMs, text: n.text })),
     ...(target ? { source: target.source } : {}),
   });
+  const appliedAudio = reportAudio(opts.audio, echoedAudio(startResult), log);
   log(`${c.dim(`recording for ${opts.forSec}s…`)}`);
   await new Promise((r) => setTimeout(r, opts.forSec * 1000));
   log(`${c.dim("stopping + uploading…")}`);
@@ -3001,6 +3107,12 @@ async function cmdRecordMac(opts: {
   return {
     publicId: String(result.publicId ?? ""),
     shareUrl: String(result.shareUrl ?? ""),
+    // The surface the camera actually filmed, for `record --json`.
+    source: captureSourceResult(target?.resolved),
+    // Sibling, NOT inside `source`: audio is a property of the capture, not of
+    // the surface — folding it in would muddy `source` and break its shape
+    // parity with `clipy sources --json` entries.
+    audio: appliedAudio,
   };
 }
 
@@ -3074,6 +3186,7 @@ async function cmdSessionStart(
     auth: AuthCapture;
     userDataDir?: string;
     profileDirectory?: string;
+    audio: AudioChoice;
   },
 ): Promise<void> {
   if (opts.source === "mac-screen") {
@@ -3092,7 +3205,10 @@ async function cmdSessionStart(
         `${c.yellow("note: --type is not applied to --source mac-screen recordings yet (needs a Clipy app update)")}\n`,
       );
     }
-    await bridgeRequest(info, "start", {
+    const startResult = await bridgeRequest(info, "start", {
+      // Explicit, never implicit — see reportAudio(): an absent field falls
+      // through to the app's interactive defaults (mic ON) on older builds.
+      audio: { includeSystemAudio: opts.audio.includeSystemAudio, includeMic: opts.audio.includeMic },
       maxSec,
       title: opts.name,
       description: opts.description,
@@ -3100,13 +3216,35 @@ async function cmdSessionStart(
       ...(target ? { source: target.source } : {}),
     });
     writeSessionState(file, macSessionState(info, maxSec));
+    const appliedAudio = reportAudio(opts.audio, echoedAudio(startResult), (m) =>
+      process.stderr.write(`${m}\n`),
+    );
     if (opts.json) {
-      printJson({ state: "recording", source: "mac-screen", maxSec, target: target?.label });
+      printJson({
+        state: "recording",
+        // The transport, kept as a top-level string so callers that parsed the
+        // old `source: "mac-screen"` still find it — `source` is now the
+        // structured object describing what the camera points at.
+        captureMode: "mac-screen",
+        maxSec,
+        target: target?.label,
+        source: captureSourceResult(target?.resolved),
+        audio: appliedAudio,
+      });
       return;
     }
     process.stdout.write(
       `${c.green("✓")} the Clipy app is recording ${target ? target.label : "your screen"} (max ${maxSec}s)\n`,
     );
+    // Say plainly what the camera is filming, BEFORE the usage hints. A driver
+    // working a background tab of this window would otherwise discover the
+    // mismatch only after the recording is spent.
+    if (target) {
+      process.stdout.write(
+        `${c.bold(`recording ${target.resolved.kind}:`)} "${target.resolved.title}" (id ${target.resolved.id})\n` +
+          `${c.dim("confirm that is the surface you are driving — Clipy never brings it to the front for you.")}\n`,
+      );
+    }
     process.stdout.write(
       `${c.dim("while it runs:")} clipy mark "what just happened"\n` +
         `${c.dim("when finished:")} clipy session stop   ${c.dim("· discard:")} clipy session abort\n`,
@@ -4607,7 +4745,7 @@ async function cmdAgents(
 // contract changes.
 // ---------------------------------------------------------------------------
 
-const GUIDE_SCHEMA_VERSION = 10;
+const GUIDE_SCHEMA_VERSION = 11;
 
 function cmdGuide(json: boolean): void {
   if (!json) {
@@ -4666,7 +4804,7 @@ function cmdGuide(json: boolean): void {
       cmdDoc("chapter", "clipy chapter \"<label>\" [--json]", "Mark a BEFORE/AFTER section boundary in the active recording (stored as '=== CHAPTER: <label> ==='). The PR-review shape: demo the base branch, run `clipy chapter \"AFTER — fix applied\"`, swap branches + restart the dev server, demo the fix — one video carrying both states. Works on web + --source mac-screen sessions.", ["--json"]),
       cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails", ["--json"]),
       cmdDoc("playwright-path", "clipy playwright-path [--json]", "Print the node_modules directory of the Playwright this CLI resolves, so your own --expose-cdp driver scripts can load the same copy: NODE_PATH=$(clipy playwright-path) node driver.js. Exits 1 (empty stdout) if Playwright is unresolvable. --json prints {path, nodeModulesDir, source}", ["--json"]),
-      cmdDoc("sources", "clipy sources [--json]", "List displays + windows the Clipy Mac app can capture — ids feed --window/--display"),
+      cmdDoc("sources", "clipy sources [--json]", "List displays + windows the Clipy Mac app can capture — ids feed --window/--display. --json gives each entry a `source` {kind,id,title} in the SAME shape session start/record report for the resolved capture, so a caller can compare what it picked against what the camera reports without transforming either."),
       cmdDoc("agents", "clipy agents <status|install|uninstall> <claude|codex|cursor>", "Install the bundled Clipy skill for a coding agent; install triggers a browser login first when no key is configured (interactive terminals only)"),
       cmdDoc("guide", "clipy guide --json", "This manifest"),
       cmdDoc("mcp", "clipy mcp", "Run the Clipy MCP server (wraps npx -y @clipy/mcp)"),
@@ -4678,6 +4816,8 @@ function cmdGuide(json: boolean): void {
       "Headless captures have no audio: --note flags and session marks become the transcript, labeled agent-narration.",
       "--note is absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text'); pass-scoped notes anchor to the real start of a --viewports pass, so they don't drift when load time shifts the pass boundaries. A malformed pass note (e.g. 'pass2 text' with no colon) is a usage error, not silently demoted.",
       "--type declares what a recording IS (bug_report/feature_request/product_demo/walkthrough_tutorial/feedback_review/discussion_talk/other, plus short aliases) so the AI summary doesn't misread a demo as a bug report. Applied on web today; --source mac-screen support is pending a Clipy app update.",
+      "AUDIO on --source mac-screen: agent screen recordings do NOT capture the microphone by default (system audio ON, mic OFF). An agent recording on your behalf is not the same consent as a human clicking Record — nobody asked for the room, or whatever call you are on, to be captured — and agent narration rides on marks, not speech. Opt in with --mic; opt out of system audio with --no-system-audio. Both are --source mac-screen only: headless web captures are silent, so passing them on the web path is a usage error (exit 2). The resolved config is printed (`audio: system on, mic off`) and returned as a sibling `audio` {includeSystemAudio, includeMic} in --json — sibling, not inside `source`, because audio is a property of the capture, not of the surface. IMPORTANT: the CLI reports the config the APP echoed back, and if the app does not echo one (a desktop build predating agent audio control) it WARNS that the app is using its own defaults and the microphone may be recording — update the Clipy app to make the setting take effect.",
+      "CONFIRM THE CAMERA on --source mac-screen. `session start` and `record` print the surface they resolved, read LIVE from the app at start time — `recording window: \"<title>\" (id 157)` — and `session start --json` / `record --json` carry it as `source: {kind, id, title}`, the SAME shape each entry's `source` takes in `clipy sources --json`, so a caller can compare its pick against the camera with a direct object comparison. Check it and abort on mismatch: driver-attested marks prove what the DRIVER observed and say nothing about what the camera saw, so driving a background tab of the recorded window yields a truthful 'N passed' tally over footage of something else — worse than no evidence, because the tally vouches for the wrong footage. Clipy will NEVER activate or foreground a window/tab: it cannot know which tab/page/simulator you mean (on mac-screen it may not be recording a browser at all), so focusing the right surface is the caller's job, done before session start. The reported title is read at START time; the camera follows the window, so a mid-recording tab switch changes what is filmed without changing the title.",
       "Clipy is a RECORDER, not a driver. When you drive the browser yourself (the usual agent case), the primary path is: record the real app (--source mac-screen --window '<app>', or your own driven browser) and attach evidence with driver-attested marks — `clipy mark \"<claim>\" --observed \"<values you read>\" --verdict pass|fail` — plus `clipy chapter` for before/after. Clipy holds the ledger; it does not drive. The owned-browser auth flags (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script) are the AGENTLESS/CI fallback for when nothing is driving and Clipy needs its own logged-in context. Provenance is never pooled: driver-attested marks render '[≈ ASSERT driver-attested; observed=…]' / '[≈ FAILED …]' (hedge glyph) and clipy-evaluated ones '[assert ✓ verified-by-clipy; …]' / '[ASSERT ✗ verified-by-clipy; …]' (✓/✗ are reserved for what Clipy itself checked), and the [verification] note counts them in separate segments. The honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it.",
       "Assertion marks are the differentiator: assert what you claim. `clipy mark \"X\" --assert-selector '.status' --assert-text Active` records X only alongside the live-page truth — the daemon runs the check against its Playwright page and annotates the mark ✓/✗ with what it actually observed, so a false claim cannot pass as fact in the transcript. --fail-mode abort turns a failed assertion into a discarded session (nothing uploaded, non-zero exit). Assertions need a web session and the daemon's control endpoint (started by clipy 0.6+); they are rejected on --source mac-screen.",
       "A mark is NEVER dropped, and a late verdict never rewrites it. If the daemon can't be reached to evaluate an assertion (its event loop briefly starved during a dev-server recompile), `clipy mark` records the narration anyway tagged '[ASSERT ⚠ clipy could not evaluate — <reason>]', prints a loud ⚠, and exits 0 — an unverified claim is flagged, never promoted to a ✓. The tally's third bucket counts these: '[verification] N assertion(s): P passed, F failed, K unverified' (the ', K unverified' clause is omitted when K=0). That ⚠ is the MARK OF RECORD: if the daemon was only slow and evaluates the same claim later, that verdict judged a LATER page state, so it does NOT overwrite the ⚠ — it's recorded as a separate '[late check of \"…\" — evaluated Ns after the claim: …]' note at its own time and counts toward none of P/F/K. Plain non-asserted marks the daemon later processes are just deduped (exactly once).",
@@ -4775,6 +4915,8 @@ async function main(): Promise<void> {
       output: { type: "string", short: "o" },
       srt: { type: "boolean", default: false },
       "marks-only": { type: "boolean", default: false },
+      mic: { type: "boolean", default: false },
+      "no-system-audio": { type: "boolean", default: false },
       vtt: { type: "boolean", default: false },
       for: { type: "string" },
       timeout: { type: "string" },
@@ -4881,6 +5023,15 @@ async function main(): Promise<void> {
     }
     return pd;
   };
+  // Audio applies only to real-screen capture. Headless Playwright captures are
+  // SILENT, so accepting these there would imply audio we cannot record.
+  const audioFlagsPresent = Boolean(values.mic || values["no-system-audio"]);
+  const audioChoice = (): AudioChoice => ({
+    includeSystemAudio: !values["no-system-audio"],
+    includeMic: Boolean(values.mic),
+  });
+  const webAudioGuard =
+    "--mic/--no-system-audio apply to --source mac-screen only — headless web captures record no audio at all, so there is nothing to turn on or off";
   const macAuthGuard = "auth state (--storage-state/--user-data-dir/--cookie/--local-storage/--init-script) applies to headless web capture — --source mac-screen records the real, already-logged-in screen";
 
   switch (command) {
@@ -4975,7 +5126,14 @@ async function main(): Promise<void> {
       try {
         const sources = await listSources(readBridgeInfo());
         if (json) {
-          printJson(sources);
+          // Each entry carries the SAME `source` descriptor shape that
+          // `session start --json` / `record --json` report for the resolved
+          // capture, so a caller can compare "what I picked" against "what the
+          // camera reports" with a direct object comparison — no transforming.
+          printJson({
+            displays: sources.displays.map((d) => ({ ...d, source: describeDisplay(d) })),
+            windows: sources.windows.map((w) => ({ ...w, source: describeWindow(w) })),
+          });
           return;
         }
         process.stdout.write(`${c.bold("DISPLAYS")}\n`);
@@ -5006,6 +5164,7 @@ async function main(): Promise<void> {
         die("--window and --display are mutually exclusive — pick one capture source", 2);
       }
       if (source === "mac-screen" && authFlagsPresent) die(macAuthGuard, 2);
+      if (source !== "mac-screen" && audioFlagsPresent) die(webAudioGuard, 2);
       const recordingKind = values.type ? requireRecordingKind(String(values.type)) : undefined;
       if (source === "mac-screen") {
         const noteFlags = (values.note as string[] | undefined) ?? [];
@@ -5017,6 +5176,7 @@ async function main(): Promise<void> {
         }
         try {
           const result = await cmdRecordMac({
+            audio: audioChoice(),
             forSec,
             name:
               ((values.title as string | undefined) ?? (values.name as string | undefined))?.trim() ||
@@ -5032,7 +5192,7 @@ async function main(): Promise<void> {
             await waitForArtifacts(ctx, result.publicId).catch(() => {});
           }
           if (json) {
-            printJson({ id: result.publicId, shareUrl: result.shareUrl });
+            printJson({ id: result.publicId, shareUrl: result.shareUrl, source: result.source });
           } else {
             process.stdout.write(`${c.green("✓")} recorded — ${c.bold(result.shareUrl)}\n`);
             process.stdout.write(
@@ -5086,6 +5246,7 @@ async function main(): Promise<void> {
           die("--window and --display are mutually exclusive — pick one capture source", 2);
         }
         if (source === "mac-screen" && authFlagsPresent) die(macAuthGuard, 2);
+        if (source !== "mac-screen" && audioFlagsPresent) die(webAudioGuard, 2);
         const url = (values.url as string | undefined)?.trim() || positionalUrl;
         if (!url && source === "web") {
           die("usage: clipy session start --url <http(s) url> [--max <sec>] [--source web|mac-screen]", 2);
@@ -5108,6 +5269,7 @@ async function main(): Promise<void> {
           auth: authCapture(),
           userDataDir: userDataDir(),
           profileDirectory: profileDirectory(),
+          audio: audioChoice(),
         };
       };
       if (sub === "start") {

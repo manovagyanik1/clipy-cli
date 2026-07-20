@@ -15,7 +15,7 @@ description: Read and create Clipy screen recordings. Use when the user shares a
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.8.4 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.8.5 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
@@ -343,8 +343,43 @@ time.
   case-insensitive app/title substring; ambiguous matches list candidates).
   \`--display <id>\` targets a whole display. The two are mutually exclusive;
   default is the primary display.
+
+### CONFIRM THE CAMERA BEFORE YOU BURN SIX MINUTES
+
+On start, Clipy prints the surface it resolved, read live from the app:
+
+    recording window: "Redemptions · Admin — Chrome" (id 157)
+
+\`session start --json\` / \`record --json\` carry the same thing as
+\`source: {kind, id, title}\`, in the SAME shape as each entry's \`source\` in
+\`clipy sources --json\` — so you can compare what you picked against what the
+camera reports with a direct object comparison.
+
+CHECK IT AGAINST THE SURFACE YOU ARE DRIVING, AND ABORT ON MISMATCH. Driver-attested
+marks prove what YOU observed; they say nothing about what the camera saw. Drive a
+background tab of the recorded window and you get a truthful "10 passed" tally over
+footage of something else — worse than no evidence, because the tally vouches for the
+wrong footage. One comparison at second one beats discovering it at minute six.
+
+Clipy will NEVER bring a window or tab to the front for you. It cannot know which
+tab/page/simulator you mean, and on --source mac-screen it may not be recording a
+browser at all. Focusing the right surface is YOUR job — do it before \`session start\`
+(e.g. activate the tab with your own tooling), then confirm with the reported title.
+Note the title is read at START time; if you switch tabs mid-recording the camera
+follows the window, not your driver.
 - On \`clipy record --source mac-screen\`, \`--for\` is capped at 1740s (the app
   auto-stops at 1800s).
+- AUDIO: agent screen recordings do NOT capture the microphone. Default is system
+  audio ON, mic OFF — an agent recording on someone's behalf is not the same
+  consent as that person clicking Record, and nobody asked for the room (or
+  whatever call they're on) to be recorded; your narration rides on marks, not
+  speech. \`--mic\` opts in, \`--no-system-audio\` opts out of system audio. Both
+  are mac-screen only (headless captures are silent — passing them on the web path
+  is a usage error). The resolved config is printed (\`audio: system on, mic off\`)
+  and returned as a sibling \`audio\` in --json. If the Clipy app is too old to
+  handle audio control it will NOT echo a config back, and the CLI warns that the
+  app's own defaults are in force and the mic may be recording — believe the
+  warning and update the app.
 - If a human presses Stop inside the app during your session, \`session stop\` /
   \`mark\` return a \`stopped_from_app\` error — the recording was already uploaded
   by the app, so treat it as done: fetch the share/context link rather than
