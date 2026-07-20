@@ -3511,22 +3511,31 @@ async function runSessionDaemon(file: string): Promise<void> {
   // in-page __clipyMark/__clipyChapter bindings. Kept in memory (like autoMarks)
   // and merged at stop. A hard 200 cap here is the server limit; storeDaemonMark
   // refuses past it so `clipy mark` gets an error rather than a silent drop.
-  const daemonMarks: NarrationNote[] = [];
-  const storeDaemonMark = (note: NarrationNote): boolean => {
+  // Each carries its client id + eval metadata so the merge can (a) dedup a file
+  // copy the client wrote after its call timed out, and (b) when a TIMED-OUT
+  // ASSERTION was later evaluated here, keep the client's honest ⚠ mark of record
+  // and re-stamp this late evaluation as a separate "late check" at its own time
+  // (never backdate a late verdict onto the earlier claim). P/F/K is computed at
+  // merge from marks of record only, so a late check can't launder a ⚠ into F.
+  interface DaemonMark {
+    startMs: number;
+    text: string;
+    id?: string;
+    /** ms-from-recordStart when the daemon actually evaluated (for late-check). */
+    evalAtMs?: number;
+    /** the original (unannotated) claim text, for the late-check message. */
+    claim?: string;
+    /** present iff this mark carried an assertion — counts toward P/F at merge. */
+    assertOutcome?: { passed: boolean; expected: string; observed: string };
+  }
+  const daemonMarks: DaemonMark[] = [];
+  const storeDaemonMark = (m: DaemonMark): boolean => {
     if (daemonMarks.length >= 200) return false;
-    daemonMarks.push(note);
+    daemonMarks.push(m);
     return true;
   };
-  // Assertion tallies → the leading [verification] note at stop.
-  let assertRan = 0;
-  let assertPassed = 0;
-  let assertFailed = 0;
   // A failed --fail-mode=abort assertion sets this; the main loop discards.
   let controlSignal: "abort" | null = null;
-  // Client-generated ids of marks/chapters we processed over HTTP — so at merge
-  // we can drop a file duplicate the client wrote after its call timed out but
-  // the daemon actually completed it.
-  const processedMarkIds = new Set<string>();
 
   mkdirSync(state.tmpDir, { recursive: true });
   let browser: PwBrowser | null = null;
@@ -3628,27 +3637,45 @@ async function runSessionDaemon(file: string): Promise<void> {
         typeof m.atMs === "number" && Number.isFinite(m.atMs)
           ? Math.max(0, Math.round(m.atMs))
           : Math.max(0, Date.now() - recordStart);
+      const evalAtMs = Math.max(0, Date.now() - recordStart);
       let annotated = text;
-      let assertOut: { passed: boolean; observed: string } | undefined;
+      let assertOut: { passed: boolean; observed: string; driftSec?: number } | undefined;
+      let assertOutcome: { passed: boolean; expected: string; observed: string } | undefined;
       let aborted = false;
       if (m.assert && typeof m.assert === "object") {
         // evaluateAssertion throws if the page is unresponsive — the HTTP path
         // turns that into a 5xx (the CLI then records a ⚠ UNVERIFIED file mark),
         // and the in-page path rejects to the driver.
         const ev = await evaluateAssertion(page, m.assert);
-        assertRan++;
-        if (ev.passed) assertPassed++;
-        else assertFailed++;
         annotated = ev.passed
           ? `${text} [assert ✓ ${ev.observed}]`
           : `${text} [ASSERT ✗ expected ${ev.expected}; observed ${ev.observed}]`;
         assertOut = { passed: ev.passed, observed: ev.observed };
+        assertOutcome = { passed: ev.passed, expected: ev.expected, observed: ev.observed };
         if (!ev.passed && m.assert.failMode === "abort") aborted = true;
+        // Backdated assertion divergence: a --at/--ago mark is stamped in the past
+        // but the assertion judged the LIVE page. If the verdict was observed more
+        // than 2s from the backdated position, keep the mark where the agent put it
+        // but say so in the text (and expose a signed drift), so the ✓/✗ isn't read
+        // as describing the page at the backdated moment. Live-clock asserted marks
+        // (no atMs) and backdated PLAIN marks get nothing.
+        if (m.atMs != null) {
+          const driftMs = evalAtMs - tMs; // + = observed AFTER the backdated stamp
+          if (Math.abs(driftMs) > 2000) {
+            const n = Math.round(Math.abs(driftMs) / 1000);
+            const dir = driftMs >= 0 ? "after" : "before";
+            annotated += ` (assertion observed ${n}s ${dir} this backdated mark — the verdict describes the page at observation time)`;
+            assertOut.driftSec = Math.round(driftMs / 1000); // signed, for --json
+          }
+        }
       }
-      if (!storeDaemonMark({ startMs: tMs, text: annotated })) {
+      // Store the provisional mark of record at the claim time. The merge decides
+      // whether it stays the record (no client timeout) or becomes a late check
+      // (the client already wrote a ⚠ mark of record for this id). P/F is counted
+      // at merge from assertOutcome, so a late eval never lands in the tally.
+      if (!storeDaemonMark({ startMs: tMs, text: annotated, id: m.id, evalAtMs, claim: text, assertOutcome })) {
         throw new Error("mark limit reached (200 marks per recording)");
       }
-      if (m.id) processedMarkIds.add(m.id);
       if (aborted) controlSignal = "abort";
       return {
         tMs,
@@ -3664,9 +3691,12 @@ async function runSessionDaemon(file: string): Promise<void> {
     // daemon-side assertion + annotation as the CLI flags, at ZERO spawn cost.
     // NOTE: while CDP is exposed the page's own scripts can call these too —
     // within the existing --expose-cdp trust model (documented in the README).
+    // The bindings are exposed under *Impl names and re-declared with explicit
+    // arity below, so an agent probing window.__clipyMark.length sees 2 (not the
+    // 0 an exposeBinding wrapper reports).
     if (wantCdp) {
       await context
-        .exposeBinding("__clipyMark", async (_src, ...args) => {
+        .exposeBinding("__clipyMarkImpl", async (_src, ...args) => {
           if (recordStart === 0) return { skipped: true };
           const o = (args[1] ?? {}) as {
             assertSelector?: string;
@@ -3692,7 +3722,7 @@ async function runSessionDaemon(file: string): Promise<void> {
         })
         .catch((e: Error) => log(`__clipyMark binding failed: ${e.message}`));
       await context
-        .exposeBinding("__clipyChapter", (_src, ...args) => {
+        .exposeBinding("__clipyChapterImpl", (_src, ...args) => {
           if (recordStart === 0) return;
           const label = String(args[0] ?? "").trim();
           if (label) {
@@ -3700,6 +3730,15 @@ async function runSessionDaemon(file: string): Promise<void> {
           }
         })
         .catch((e: Error) => log(`__clipyChapter binding failed: ${e.message}`));
+      // Declared-arity wrappers so window.__clipyMark.length === 2 / __clipyChapter
+      // === 1 (they resolve the *Impl bindings lazily, at call time).
+      await context
+        .addInitScript({
+          content:
+            "window.__clipyMark = (text, opts) => window.__clipyMarkImpl(text, opts);\n" +
+            "window.__clipyChapter = (label) => window.__clipyChapterImpl(label);",
+        })
+        .catch((e: Error) => log(`in-page binding wrappers failed: ${e.message}`));
     }
 
     // Local control endpoint: `clipy mark`/`chapter` POST here so the daemon —
@@ -3720,15 +3759,21 @@ async function runSessionDaemon(file: string): Promise<void> {
         id: typeof body.id === "string" ? body.id : undefined,
       });
 
-    /** POST /chapter → a === CHAPTER === mark at the live clock. */
+    /** POST /chapter → a === CHAPTER === mark at the live clock. Carries its
+     *  client id so a timed-out-but-processed chapter dedups against the file. */
     const handleChapter = (body: Json): Json => {
       const label = typeof body.label === "string" ? body.label.trim() : "";
       if (!label) throw new Error("chapter label is required");
       const tMs = Math.max(0, Date.now() - recordStart);
-      if (!storeDaemonMark({ startMs: tMs, text: `=== CHAPTER: ${label} ===` })) {
+      if (
+        !storeDaemonMark({
+          startMs: tMs,
+          text: `=== CHAPTER: ${label} ===`,
+          id: typeof body.id === "string" ? body.id : undefined,
+        })
+      ) {
         throw new Error("mark limit reached (200 marks per recording)");
       }
-      if (typeof body.id === "string" && body.id) processedMarkIds.add(body.id);
       return { tMs };
     };
 
@@ -3881,32 +3926,76 @@ async function runSessionDaemon(file: string): Promise<void> {
     if (browser) await browser.close().catch(() => {});
     browser = null;
 
-    // Merge marks from three sources: the file (fallback path, written by
-    // `clipy mark` when the control endpoint was unreachable), the daemon-side
-    // marks (control endpoint + in-page bindings, already assertion-annotated),
-    // and the [auto] instrumentation marks.
+    // Merge marks. The FILE is the mark of record: `clipy mark` writes there when
+    // its control call fails, and a timed-out ASSERTION is recorded ⚠-unverified.
+    // That ⚠ is authoritative — if the daemon later evaluated the same mark, that
+    // late verdict must NOT overwrite the ⚠ (it judged a LATER page state), so we
+    // keep the ⚠ and re-stamp the late evaluation as a self-describing "late check"
+    // at its own time. K counts the ⚠; the late check counts toward neither P/F/K.
     const fileMarks: NarrationNote[] = [];
-    let assertUnverified = 0;
+    const unverifiedClaimById = new Map<string, number>(); // id → claim time (ms)
+    const abandonedIds = new Set<string>(); // any id the client wrote to the file
+    let assertUnverified = 0; // K
     try {
       for (const line of readFileSync(state.marksPath, "utf8").split("\n")) {
         if (!line.trim()) continue;
         const m = JSON.parse(line) as { tMs?: number; text?: string; id?: string; unverified?: boolean };
         if (typeof m.tMs !== "number" || typeof m.text !== "string" || !m.text.trim()) continue;
-        // Dedup: the daemon already processed this mark over HTTP (the client's
-        // control call timed out, but the daemon completed it) — keep the daemon's
-        // evaluated copy, drop this file duplicate.
-        if (m.id && processedMarkIds.has(m.id)) continue;
-        fileMarks.push({ startMs: Math.max(0, Math.round(m.tMs)), text: m.text.trim() });
-        if (m.unverified) assertUnverified++; // ⚠ marks the CLI recorded but couldn't verify
+        const startMs = Math.max(0, Math.round(m.tMs));
+        fileMarks.push({ startMs, text: m.text.trim() }); // the mark of record, verbatim
+        if (m.id) {
+          abandonedIds.add(m.id);
+          if (m.unverified) {
+            unverifiedClaimById.set(m.id, startMs);
+            assertUnverified++;
+          }
+        }
       }
     } catch {
       // no marks file — fine
     }
-    let notes = [...fileMarks, ...daemonMarks, ...autoMarks].sort((a, b) => a.startMs - b.startMs);
-    // If any assertion was ATTEMPTED (evaluated pass/fail OR recorded ⚠-unverified),
-    // prepend a 0ms verification summary so it LEADS the transcript (a stable sort
-    // keeps it ahead of other 0ms marks). The K-unverified clause is omitted when
-    // K=0 so existing renderings don't churn.
+
+    // Resolve the daemon marks against the file marks of record.
+    const resolvedDaemon: NarrationNote[] = [];
+    let assertPassed = 0;
+    let assertFailed = 0;
+    for (const dm of daemonMarks) {
+      if (dm.id && unverifiedClaimById.has(dm.id)) {
+        // The client already recorded a ⚠ mark of record for this assertion; this
+        // daemon copy is a LATE evaluation. Emit it as a separate, honestly-timed
+        // "late check" annotation (not counted in P/F/K).
+        const claimMs = unverifiedClaimById.get(dm.id) as number;
+        const evalAt = Math.max(0, dm.evalAtMs ?? dm.startMs);
+        const afterSec = Math.max(0, Math.round((evalAt - claimMs) / 1000));
+        const oc = dm.assertOutcome;
+        const verdict = oc
+          ? oc.passed
+            ? `✓ ${oc.observed}`
+            : `✗ expected ${oc.expected}; observed ${oc.observed}`
+          : "(no result)";
+        resolvedDaemon.push({
+          startMs: evalAt,
+          text: `[late check of "${dm.claim ?? ""}" — evaluated ${afterSec}s after the claim: ${verdict}]`,
+        });
+        continue;
+      }
+      if (dm.id && abandonedIds.has(dm.id)) {
+        // A plain mark/chapter the client already wrote to the file — dedup, the
+        // file copy is the mark of record. (Exactly once.)
+        continue;
+      }
+      resolvedDaemon.push({ startMs: dm.startMs, text: dm.text });
+      if (dm.assertOutcome) {
+        if (dm.assertOutcome.passed) assertPassed++;
+        else assertFailed++;
+      }
+    }
+
+    let notes = [...fileMarks, ...resolvedDaemon, ...autoMarks].sort((a, b) => a.startMs - b.startMs);
+    // If any ORIGINAL assertion was attempted (evaluated pass/fail, or recorded
+    // ⚠-unverified), prepend a 0ms verification summary so it LEADS the transcript
+    // (a stable sort keeps it ahead of other 0ms marks). The K clause is omitted
+    // when K=0 so existing renderings don't churn. Late checks don't count.
     const assertN = assertPassed + assertFailed + assertUnverified;
     if (assertN > 0) {
       const tally =
@@ -4065,7 +4154,7 @@ async function cmdAgents(
 // contract changes.
 // ---------------------------------------------------------------------------
 
-const GUIDE_SCHEMA_VERSION = 6;
+const GUIDE_SCHEMA_VERSION = 7;
 
 function cmdGuide(json: boolean): void {
   if (!json) {
@@ -4137,10 +4226,10 @@ function cmdGuide(json: boolean): void {
       "--note is absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text'); pass-scoped notes anchor to the real start of a --viewports pass, so they don't drift when load time shifts the pass boundaries. A malformed pass note (e.g. 'pass2 text' with no colon) is a usage error, not silently demoted.",
       "--type declares what a recording IS (bug_report/feature_request/product_demo/walkthrough_tutorial/feedback_review/discussion_talk/other, plus short aliases) so the AI summary doesn't misread a demo as a bug report. Applied on web today; --source mac-screen support is pending a Clipy app update.",
       "Assertion marks are the differentiator: assert what you claim. `clipy mark \"X\" --assert-selector '.status' --assert-text Active` records X only alongside the live-page truth — the daemon runs the check against its Playwright page and annotates the mark ✓/✗ with what it actually observed, so a false claim cannot pass as fact in the transcript. --fail-mode abort turns a failed assertion into a discarded session (nothing uploaded, non-zero exit). Assertions need a web session and the daemon's control endpoint (started by clipy 0.6+); they are rejected on --source mac-screen.",
-      "A mark is NEVER dropped. If the daemon can't be reached to evaluate an assertion (its event loop briefly starved during a dev-server recompile), `clipy mark` records the narration anyway tagged '[ASSERT ⚠ could not evaluate — <reason>]', prints a loud ⚠, and exits 0 — an unverified claim is flagged, never promoted to a ✓. The tally's third bucket counts these: '[verification] N assertion(s): P passed, F failed, K unverified' (the ', K unverified' clause is omitted when K=0). Every mark carries a client id so a slow-but-not-gone daemon that later processes the same mark dedups the two — the evaluated copy wins and the mark appears exactly once.",
+      "A mark is NEVER dropped, and a late verdict never rewrites it. If the daemon can't be reached to evaluate an assertion (its event loop briefly starved during a dev-server recompile), `clipy mark` records the narration anyway tagged '[ASSERT ⚠ could not evaluate — <reason>]', prints a loud ⚠, and exits 0 — an unverified claim is flagged, never promoted to a ✓. The tally's third bucket counts these: '[verification] N assertion(s): P passed, F failed, K unverified' (the ', K unverified' clause is omitted when K=0). That ⚠ is the MARK OF RECORD: if the daemon was only slow and evaluates the same claim later, that verdict judged a LATER page state, so it does NOT overwrite the ⚠ — it's recorded as a separate '[late check of \"…\" — evaluated Ns after the claim: …]' note at its own time and counts toward none of P/F/K. Plain non-asserted marks the daemon later processes are just deduped (exactly once).",
       "clipy chapter \"<label>\" splits one recording into BEFORE/AFTER sections for PR-review-style demos: record the base branch, `clipy chapter \"AFTER — fix applied\"`, swap branches + restart, record the fix. One video carries both states.",
       "clipy session run [start flags] -- <command…> is the crash-safe wrapper: it starts a session, runs your driver command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), and guarantees cleanup — exit 0 uploads, any non-zero exit or signal discards and propagates the code. Use it so a crashing driver never records dead air to the max ceiling.",
-      "clipy mark --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now — a `clipy mark` spawn lands ~100-300ms late, so backdate to align a mark with the state it describes. When driving over --expose-cdp, call window.__clipyMark(text, opts?) / window.__clipyChapter(label) IN-PAGE (page.evaluate) to emit marks/chapters with zero spawn latency, evaluated daemon-side with the page in hand. __clipyMark's opts {assertSelector, assertText, assertUrl, failMode} run the SAME assertions as the CLI flags (assertText requires assertSelector or the call rejects; failMode 'abort' discards the session); it returns the annotated {tMs, text, assert}. While CDP is exposed the page's own scripts can call these too (within the existing --expose-cdp trust model).",
+      "clipy mark --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now — a `clipy mark` spawn lands ~100-300ms late, so backdate to align a mark with the state it describes. Backdating an ASSERTED mark: it lands at the backdated time but the assertion judges the LIVE page, so if the verdict was observed >2s from the backdated position the text gains '(assertion observed Ns after this backdated mark — the verdict describes the page at observation time)' and --json carries a signed assert.driftSec; live-clock asserted marks and backdated plain marks are unaffected. When driving over --expose-cdp, call window.__clipyMark(text, opts?) / window.__clipyChapter(label) IN-PAGE (page.evaluate) to emit marks/chapters with zero spawn latency, evaluated daemon-side with the page in hand. __clipyMark's opts {assertSelector, assertText, assertUrl, failMode} run the SAME assertions as the CLI flags (assertText requires assertSelector or the call rejects; failMode 'abort' discards the session); it returns the annotated {tMs, text, assert}. While CDP is exposed the page's own scripts can call these too (within the existing --expose-cdp trust model).",
       "session --expose-cdp (web, opt-in) publishes a CDP endpoint (cdpHttpUrl) in `session start`/`session status` output and the 0600 session state file; connect with playwright.connectOverCDP() to drive the recorded page. Off by default (any local process could attach); CLIPY_DISABLE_CDP=1 forces it off.",
       "Driving an --expose-cdp session: connect with playwright.connectOverCDP(cdpHttpUrl); the recorded page is browser.contexts()[0].pages()[0] (a fresh context/page you open is NOT captured); page.viewportSize() is null over a CDP attach; resize with a CDP session's Emulation.setDeviceMetricsOverride, not setViewportSize. Your own driver script resolves Playwright from its own cwd — run it as NODE_PATH=$(clipy playwright-path) node driver.js if require('playwright') can't find it.",
       "Auth for headless web capture (record + session start): --storage-state <playwright storageState JSON> is passed straight to Playwright's newContext; --cookie / --local-storage / --init-script are applied to the context BEFORE the first navigation, so a logged-in SPA's route guard sees the state on first paint (seeding it after navigating loses that race). --cookie without a Domain is url-scoped to the target; with a Domain it is domain-scoped. --local-storage pairs are origin-guarded to the target. All four are web-only and are rejected on --source mac-screen, which records the real, already-signed-in screen. The storage-state file may hold live credentials; the CLI never prints its contents and the session state file that carries these specs is chmod 0600.",

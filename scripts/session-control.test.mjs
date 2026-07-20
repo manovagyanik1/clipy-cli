@@ -381,6 +381,13 @@ await test("in-page __clipyMark(text, opts) evaluates assertions daemon-side (�
     cdpBrowser = await chromium.connectOverCDP(cdpHttpUrl);
     const page = cdpBrowser.contexts()[0].pages()[0];
 
+    // The bindings report declared arity (2 / 1) so an agent probing the bridge
+    // sees the real signature, not the 0 an exposeBinding wrapper reports.
+    const markArity = await page.evaluate(() => window.__clipyMark.length);
+    assert.equal(markArity, 2, `window.__clipyMark.length should be 2, got ${markArity}`);
+    const chapterArity = await page.evaluate(() => window.__clipyChapter.length);
+    assert.equal(chapterArity, 1, `window.__clipyChapter.length should be 1, got ${chapterArity}`);
+
     // Passing assertion (#t contains Hello) → ✓-annotated, returned to the driver.
     const passRes = await page.evaluate(() =>
       window.__clipyMark("in-page hello", { assertSelector: "#t", assertText: "Hello" }),
@@ -460,10 +467,12 @@ await test("unreachable control endpoint → asserted mark recorded ⚠ UNVERIFI
 });
 
 // (2) A daemon that STALLS then catches up (kill -STOP / -CONT, the real recompile
-// scenario): the client times out and writes a ⚠ safety-net mark, but the daemon
-// eventually processes the same HTTP mark — so dedup (client id) keeps the daemon's
-// evaluated copy and the mark appears EXACTLY ONCE. Never lost, never duplicated.
-await test("SIGSTOP then SIGCONT: a slow-daemon mark is never lost and never duplicated", async () => {
+// scenario). The client times out and writes a ⚠ mark of record + a plain mark.
+// When the daemon resumes and processes both HTTP calls late: the ⚠ is NOT
+// overwritten by the late verdict (which judged a later page state) — instead the
+// late evaluation is a SEPARATE late-check note at its own time, K still counts the
+// ⚠, and the plain mark is deduped to exactly one.
+await test("SIGSTOP/SIGCONT: ⚠ is the mark of record; a late eval becomes a separate late-check, plain mark exactly-once", async () => {
   const ws = freshWorkspace();
   lastComplete = null;
   let daemonPid = 0;
@@ -479,26 +488,53 @@ await test("SIGSTOP then SIGCONT: a slow-daemon mark is never lost and never dup
       console.log(`    (skipping — SIGSTOP unavailable: ${e.message})`);
       return;
     }
-    const m = await runCli(["mark", "slow daemon mark", "--assert-selector", "#t", "--assert-text", "Hello"], {
-      cwd: ws.cwd,
-      env: { ...ws.env, CLIPY_CONTROL_TIMEOUT_MS: "1000" },
-    });
-    assert.equal(m.code, 0, `a slow-daemon mark must still exit 0, got ${m.code}: ${m.stderr}`);
-    assert.match(m.stderr, /UNVERIFIED/, `client should report ⚠ after the timeout: ${m.stderr}`);
+    // Freeze → both calls time out on the client and fall back to the file.
+    const shortTimeout = { cwd: ws.cwd, env: { ...ws.env, CLIPY_CONTROL_TIMEOUT_MS: "800" } };
+    const asserted = await runCli(
+      ["mark", "slow assert claim", "--assert-selector", "#t", "--assert-text", "Hello"],
+      shortTimeout,
+    );
+    assert.equal(asserted.code, 0, `a slow asserted mark must exit 0, got ${asserted.code}: ${asserted.stderr}`);
+    assert.match(asserted.stderr, /UNVERIFIED/, `client should report ⚠ after the timeout: ${asserted.stderr}`);
+    const plain = await runCli(["mark", "slow plain claim"], shortTimeout);
+    assert.equal(plain.code, 0, `a slow plain mark must exit 0, got ${plain.code}: ${plain.stderr}`);
 
+    // Resume and give the daemon a moment to process the buffered HTTP requests.
     process.kill(daemonPid, "SIGCONT");
     stopped = false;
+    await new Promise((r) => setTimeout(r, 2000));
 
     const stop = await runCli(["session", "stop", "--json"], ws);
     assert.equal(stop.code, 0, `session stop failed (${stop.code}): ${stop.stderr}`);
 
     const notes = lastComplete?.narration?.notes ?? [];
-    const hits = notes.filter((n) => typeof n.text === "string" && n.text.includes("slow daemon mark"));
-    assert.equal(
-      hits.length,
-      1,
-      `the mark must appear EXACTLY once (never lost, never duplicated); got ${hits.length}: ${JSON.stringify(hits.map((h) => h.text))}`,
+    const texts = notes.map((n) => n.text);
+
+    // (a) the ⚠ mark of record survives VERBATIM (exactly one, carrying ⚠).
+    const warnHits = notes.filter((n) => n.text.includes("slow assert claim") && n.text.includes("[ASSERT ⚠"));
+    assert.equal(warnHits.length, 1, `the ⚠ mark must survive verbatim exactly once: ${JSON.stringify(texts)}`);
+
+    // (b) the late evaluation is a SEPARATE late-check note at a LATER timestamp,
+    // referencing the original claim — it must NOT have overwritten the ⚠.
+    const late = notes.find((n) => n.text.includes('[late check of "slow assert claim"'));
+    assert.ok(late, `a separate late-check note must reference the claim: ${JSON.stringify(texts)}`);
+    assert.ok(
+      late.startMs > warnHits[0].startMs,
+      `the late check (${late.startMs}ms) must be timestamped AFTER the claim (${warnHits[0].startMs}ms)`,
     );
+    // and it must not read as a plain verdict on the original mark:
+    assert.ok(!warnHits[0].text.includes("[assert ✓") && !warnHits[0].text.includes("[ASSERT ✗"), "the ⚠ mark must not be rewritten into a ✓/✗");
+
+    // (c) the tally counts the ⚠ in K and does NOT count the late eval in P/F.
+    assert.match(
+      notes[0].text,
+      /^\[verification\] 1 assertion\(s\): 0 passed, 0 failed, 1 unverified$/,
+      `tally must count the ⚠ in K, not the late eval: ${notes[0]?.text}`,
+    );
+
+    // (d) the plain (non-asserted) mark appears EXACTLY once (deduped).
+    const plainHits = notes.filter((n) => n.text.includes("slow plain claim"));
+    assert.equal(plainHits.length, 1, `the plain mark must appear exactly once: ${JSON.stringify(plainHits.map((h) => h.text))}`);
   } finally {
     if (stopped && daemonPid) {
       try {
@@ -507,6 +543,58 @@ await test("SIGSTOP then SIGCONT: a slow-daemon mark is never lost and never dup
         // already gone
       }
     }
+    await runCli(["session", "abort"], ws).catch(() => {});
+  }
+});
+
+// --- Backdated assertion divergence: a --at/--ago verdict describes the LIVE
+// page, not the backdated moment. Over the 2s threshold the mark stays where the
+// agent put it but gets a disclaimer + signed drift; under it, nothing.
+await test("backdated + assertion over 2s gets a divergence disclaimer + signed drift; under 2s does not", async () => {
+  const ws = freshWorkspace();
+  lastComplete = null;
+  try {
+    const start = await runCli(["session", "start", "--url", appBase, "--max", "60"], ws);
+    assert.equal(start.code, 0, `session start failed (${start.code}): ${start.stderr}`);
+    // Let the clock advance so the backdate is a real gap, not clamped to ~0.
+    await new Promise((r) => setTimeout(r, 4000));
+
+    // --ago 10 → stamped well in the past, assertion observed now (drift > 2s).
+    const far = await runCli(
+      ["mark", "backdated far", "--ago", "10", "--assert-selector", "#t", "--assert-text", "Hello", "--json"],
+      ws,
+    );
+    assert.equal(far.code, 0, `backdated asserted mark should exit 0: ${far.stderr}`);
+    const farJson = JSON.parse(far.stdout);
+    assert.ok(farJson.text.includes("[assert ✓"), `the verdict must stay intact: ${farJson.text}`);
+    assert.ok(farJson.text.includes("(assertion observed"), `expected a divergence disclaimer: ${farJson.text}`);
+    assert.ok(
+      typeof farJson.assert.driftSec === "number" && farJson.assert.driftSec >= 2,
+      `expected a signed drift ≥ 2s: ${JSON.stringify(farJson.assert)}`,
+    );
+    const farStamp = farJson.tMs;
+
+    // --ago 1 → below the 2s threshold, no disclaimer, no drift field.
+    const near = await runCli(
+      ["mark", "backdated near", "--ago", "1", "--assert-selector", "#t", "--assert-text", "Hello", "--json"],
+      ws,
+    );
+    assert.equal(near.code, 0, `near-backdated mark should exit 0: ${near.stderr}`);
+    const nearJson = JSON.parse(near.stdout);
+    assert.ok(nearJson.text.includes("[assert ✓"), `verdict intact: ${nearJson.text}`);
+    assert.ok(!nearJson.text.includes("(assertion observed"), `no disclaimer under 2s: ${nearJson.text}`);
+    assert.ok(nearJson.assert.driftSec === undefined, `no drift field under 2s: ${JSON.stringify(nearJson.assert)}`);
+
+    const stop = await runCli(["session", "stop", "--json"], ws);
+    assert.equal(stop.code, 0, `session stop failed (${stop.code}): ${stop.stderr}`);
+
+    const notes = lastComplete?.narration?.notes ?? [];
+    const farNote = noteText(notes, "backdated far");
+    assert.ok(farNote && farNote.text.includes("(assertion observed"), `the disclaimer must persist in the transcript: ${farNote?.text}`);
+    // The mark stays at its backdated position (earlier than the near mark).
+    const nearNote = noteText(notes, "backdated near");
+    assert.ok(farNote.startMs <= farStamp + 5 && farNote.startMs < nearNote.startMs, `backdated stamp preserved (${farNote?.startMs}ms) and precedes the near mark (${nearNote?.startMs}ms)`);
+  } finally {
     await runCli(["session", "abort"], ws).catch(() => {});
   }
 });

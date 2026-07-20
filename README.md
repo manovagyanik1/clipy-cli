@@ -150,9 +150,15 @@ to headless web capture on `record` and `session start`; they're rejected on
   of an ephemeral context (`launchPersistentContext`), so the recording carries that
   profile's whole logged-in identity. Web only; **mutually exclusive with
   `--storage-state`** (a profile already carries its own storage). `--cookie` /
-  `--local-storage` / `--init-script` still compose. Point it at a **copy** or a
-  dedicated profile — never your live Chrome's default profile: Chrome locks a profile
-  while it's open, so Clipy refuses a dir that has a `SingletonLock`/`SingletonSocket`.
+  `--local-storage` / `--init-script` still compose. Chrome locks a profile while it's
+  open, so Clipy refuses a dir that has a `SingletonLock`/`SingletonSocket`. Two ways to
+  point it at a real logged-in profile:
+  - **Quit Chrome, then point at the real profile dir.** No copy needed and you record
+    with full identity — but the recorder writes to that profile, so quit Chrome first
+    (that's what clears the `Singleton*` locks) and expect it to have your live session.
+  - **Copy the profile out and strip the locks** (`cp -R "<profile>" ./clipy-profile &&
+    rm -f ./clipy-profile/Singleton*`) for isolation from your live browser, at the cost
+    of duplicating a (large) profile dir. The profile owner's call.
 
 ```bash
 # Reuse a saved Playwright login
@@ -305,14 +311,17 @@ clip. If any assertion was attempted, a leading `[verification] N assertion(s): 
 F failed[, K unverified]` note is prepended at 0 ms, so the transcript and the `.md` context
 open with the scorecard.
 
-**A mark is never dropped.** If the daemon can't be reached to evaluate an assertion — its
-event loop briefly starved during a heavy dev-server recompile, say — `clipy mark` doesn't
-fail and lose the note. It records the narration anyway, tags it
-`[ASSERT ⚠ could not evaluate — <reason>]`, prints a loud `⚠`, and exits 0. An unverified
-claim is flagged as unverified (the `K` in the tally), never silently promoted to a `✓`. If
-the daemon was only slow (not gone) and processes the same mark a moment later, a
-client-generated id dedups the two so the evaluated copy wins and the mark appears exactly
-once.
+**A mark is never dropped, and a late verdict never rewrites it.** If the daemon can't be
+reached to evaluate an assertion — its event loop briefly starved during a heavy dev-server
+recompile, say — `clipy mark` doesn't fail and lose the note. It records the narration
+anyway, tags it `[ASSERT ⚠ could not evaluate — <reason>]`, prints a loud `⚠`, and exits 0.
+An unverified claim is flagged as unverified (the `K` in the tally), never silently promoted
+to a `✓`. That ⚠ is the **mark of record**: if the daemon was only slow (not gone) and
+evaluates the same claim a moment later, that verdict judged a *later* page state, so it does
+**not** overwrite the ⚠. It's recorded as a separate, honestly-timestamped
+`[late check of "…" — evaluated Ns after the claim: …]` note at the moment it actually ran,
+and it counts toward neither passed, failed, nor unverified. (Plain, non-asserted marks that
+the daemon later processes are simply deduped — they appear exactly once.)
 
 Assertions evaluate against a real page, so they need a **web** session (they're rejected on
 `--source mac-screen`, which records the real screen with no page to probe).
@@ -363,6 +372,14 @@ the state it describes. Backdate it onto the recording clock:
 clipy mark "the toast appeared" --ago 2     # 2 seconds before now
 clipy mark "page finished loading" --at 4   # at an absolute 4s on the recording clock
 ```
+
+Backdating an **asserted** mark is a subtlety: the mark lands at the backdated time, but the
+assertion still judges the **live** page (the daemon can't rewind). When the verdict was
+observed more than 2 s from the backdated position, the mark stays where you put it and the
+text gains `(assertion observed Ns after this backdated mark — the verdict describes the page
+at observation time)`, with a signed `assert.driftSec` in `--json` — so a ✓/✗ is never read
+as describing the earlier moment. Live-clock asserted marks and backdated plain marks are
+unaffected.
 
 ## Record the real screen — a window, a display (Mac)
 

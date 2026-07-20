@@ -15,7 +15,7 @@ description: Read and create Clipy screen recordings. Use when the user shares a
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.8.1 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.8.2 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
@@ -178,9 +178,13 @@ A mark is NEVER dropped: if the recording daemon can't be reached to evaluate an
 assertion (e.g. its event loop is briefly starved during a dev-server recompile),
 \`clipy mark\` still records the narration, tags it \`[ASSERT ⚠ could not evaluate —
 <reason>]\`, prints a loud ⚠, and exits 0 — an unverified claim is flagged as
-unverified (the K bucket), never passed off as a ✓. Assertions need a WEB session
-(rejected on --source mac-screen — there's no page to probe). Prefer asserting the
-specific claims a reviewer cares about over narrating them unverified.
+unverified (the K bucket), never passed off as a ✓. That ⚠ is the MARK OF RECORD:
+if the daemon was only slow and evaluates the same claim a moment later, that late
+verdict does NOT overwrite the ⚠ (it judged a later page state) — it's recorded as a
+separate \`[late check of "…" — evaluated Ns after the claim: …]\` note at its own
+time, and it counts toward neither passed/failed/unverified. Assertions need a WEB
+session (rejected on --source mac-screen — there's no page to probe). Prefer
+asserting the specific claims a reviewer cares about over narrating them unverified.
 
 ### Before/after in one recording (clipy chapter)
 
@@ -218,6 +222,14 @@ the state it describes. Backdate onto the recording clock:
 
     clipy mark "toast appeared" --ago 2     # 2s before now
     clipy mark "page loaded" --at 4         # absolute 4s on the recording clock
+
+Backdating an ASSERTED mark: the mark lands at the backdated time, but the assertion
+judges the LIVE page (the daemon can't rewind). If the verdict was observed >2s from
+the backdated position, the mark stays put and its text gains \`(assertion observed Ns
+after this backdated mark — the verdict describes the page at observation time)\` plus a
+signed \`assert.driftSec\` in --json — so a ✓/✗ isn't misread as describing the earlier
+moment. So: assert on the LIVE clock, and reserve --at/--ago for narration you're
+backdating without a claim (or accept the disclaimer).
 
 When you drive over --expose-cdp, emit marks IN-PAGE with zero spawn latency by
 calling the bindings the daemon exposes (they run daemon-side with the page in
