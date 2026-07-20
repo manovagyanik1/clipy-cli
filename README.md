@@ -59,7 +59,7 @@ to ferry by hand. Without a TTY at all (scripts, CI), use `CLIPY_API_KEY` or
 clipy list [-n 20] [--page 2] [--status ready,processing] [--json]
 clipy search <query>                 # full-text search titles + descriptions
 clipy show <id|share-url>            # metadata + share link
-clipy transcript <id> [--srt|--vtt]  # plaintext, or export subtitles
+clipy transcript <id> [--marks-only] # one entry per line, timestamped (--srt/--vtt to export)
 clipy summary <id>                   # TL;DR, key points, action items
 clipy moments <id>                   # key moments: timestamps, captions, click coords
 clipy context <id>                   # the full agent-context bundle as markdown
@@ -321,7 +321,7 @@ clipy mark "redemptions tab active" --observed "tab=Redemptions, rows=14" --verd
 clipy mark "totals still stale"     --observed "total=\$0.00 (expected \$412.50)" --verdict fail
 ```
 
-Stored as `redemptions tab active [ASSERT ✓ driver-attested; observed=tab=Redemptions, rows=14]`
+Stored as `redemptions tab active [≈ ASSERT driver-attested; observed=tab=Redemptions, rows=14]`
 (or `✗`). Both flags are required together, a mark carries exactly **one** provenance
 (mixing with `--assert-*` is a usage error), and this works in **every** session type —
 including `--source mac-screen`.
@@ -371,7 +371,7 @@ An empty segment is omitted; with only clipy-verified marks the rendering stays 
 **A mark is never dropped, and a late verdict never rewrites it.** If the daemon can't be
 reached to evaluate an assertion — its event loop briefly starved during a heavy dev-server
 recompile, say — `clipy mark` doesn't fail and lose the note. It records the narration
-anyway, tags it `[ASSERT ⚠ could not evaluate — <reason>]`, prints a loud `⚠`, and exits 0.
+anyway, tags it `[ASSERT ⚠ clipy could not evaluate — <reason>]`, prints a loud `⚠`, and exits 0.
 An unverified claim is flagged as unverified (the `K` in the tally), never silently promoted
 to a `✓`. That ⚠ is the **mark of record**: if the daemon was only slow (not gone) and
 evaluates the same claim a moment later, that verdict judged a *later* page state, so it does

@@ -108,6 +108,28 @@ const ingestServer = createServer(async (req, res) => {
     res.writeHead(200, json).end("{}");
     return;
   }
+  // A ready narration transcript, for the `clipy transcript` rendering tests.
+  if (u.pathname === "/api/v1/recordings/tscript/transcript") {
+    res.writeHead(200, json).end(
+      JSON.stringify({
+        recordingId: "tscript",
+        status: "ready",
+        transcript: {
+          language: "en",
+          wordCount: 12,
+          plaintext:
+            "[verification] 1 driver-attested: 1 passed, 0 failed opened the settings page [auto] navigated to http://x/settings totals look right [≈ ASSERT driver-attested; observed=total=412.50]",
+          segments: [
+            { start: 0, end: 0, text: "[verification] 1 driver-attested: 1 passed, 0 failed" },
+            { start: 2.5, end: 3, text: "opened the settings page" },
+            { start: 4, end: 4.5, text: "[auto] navigated to http://x/settings" },
+            { start: 9, end: 9.5, text: "totals look right [≈ ASSERT driver-attested; observed=total=412.50]" },
+          ],
+        },
+      }),
+    );
+    return;
+  }
   res.writeHead(404, { "Content-Type": "text/plain" }).end("not found");
 });
 await new Promise((r) => ingestServer.listen(0, "127.0.0.1", r));
@@ -459,7 +481,11 @@ await test("unreachable control endpoint → asserted mark recorded ⚠ UNVERIFI
     const notes = lastComplete?.narration?.notes ?? [];
     const mark = noteText(notes, "cannot verify this");
     assert.ok(mark, `the un-droppable mark must be in the transcript: ${JSON.stringify(notes.map((n) => n.text))}`);
-    assert.ok(mark.text.includes("[ASSERT ⚠"), `the mark must carry the ⚠ unverified tag: ${mark.text}`);
+    // Exact lane-named form — locks byte-parity with the MCP's unverified string.
+    assert.ok(
+      mark.text.includes("[ASSERT ⚠ clipy could not evaluate"),
+      `the mark must carry the lane-named ⚠ tag: ${mark.text}`,
+    );
     assert.match(notes[0].text, /^\[verification\].*\bunverified\b/, `tally must show the K bucket: ${notes[0]?.text}`);
   } finally {
     await runCli(["session", "abort"], ws).catch(() => {});
@@ -511,7 +537,9 @@ await test("SIGSTOP/SIGCONT: ⚠ is the mark of record; a late eval becomes a se
     const texts = notes.map((n) => n.text);
 
     // (a) the ⚠ mark of record survives VERBATIM (exactly one, carrying ⚠).
-    const warnHits = notes.filter((n) => n.text.includes("slow assert claim") && n.text.includes("[ASSERT ⚠"));
+    const warnHits = notes.filter(
+      (n) => n.text.includes("slow assert claim") && n.text.includes("[ASSERT ⚠ clipy could not evaluate"),
+    );
     assert.equal(warnHits.length, 1, `the ⚠ mark must survive verbatim exactly once: ${JSON.stringify(texts)}`);
 
     // (b) the late evaluation is a SEPARATE late-check note at a LATER timestamp,
@@ -739,7 +767,7 @@ await test("driver-attested marks render + tally in their own segment, never poo
     const dp = await runCli(["mark", "driver pass", "--observed", "status=Active, rows=3", "--verdict", "pass", "--json"], ws);
     assert.equal(dp.code, 0, `driver pass mark: ${dp.stderr}`);
     const dpJson = JSON.parse(dp.stdout);
-    assert.ok(dpJson.text.includes("[ASSERT ✓ driver-attested; observed=status=Active, rows=3]"), `driver-attested rendering: ${dpJson.text}`);
+    assert.ok(dpJson.text.includes("[≈ ASSERT driver-attested; observed=status=Active, rows=3]"), `driver-attested rendering: ${dpJson.text}`);
     assert.equal(dpJson.assert.attested, true, "the --json payload marks it attested");
     const df = await runCli(["mark", "driver fail", "--observed", "status=Pending", "--verdict", "fail"], ws);
     assert.equal(df.code, 0, `driver fail mark: ${df.stderr}`);
@@ -753,8 +781,8 @@ await test("driver-attested marks render + tally in their own segment, never poo
     assert.ok(noteText(notes, "clipy pass").text.includes("[assert ✓ verified-by-clipy;"), `clipy pass label: ${noteText(notes, "clipy pass")?.text}`);
     assert.ok(noteText(notes, "clipy fail").text.includes("[ASSERT ✗ verified-by-clipy;"), `clipy fail label: ${noteText(notes, "clipy fail")?.text}`);
     // Driver-attested marks carry theirs, with the observed values.
-    assert.ok(noteText(notes, "driver pass").text.includes("[ASSERT ✓ driver-attested; observed=status=Active, rows=3]"), `driver pass: ${noteText(notes, "driver pass")?.text}`);
-    assert.ok(noteText(notes, "driver fail").text.includes("[ASSERT ✗ driver-attested; observed=status=Pending]"), `driver fail: ${noteText(notes, "driver fail")?.text}`);
+    assert.ok(noteText(notes, "driver pass").text.includes("[≈ ASSERT driver-attested; observed=status=Active, rows=3]"), `driver pass: ${noteText(notes, "driver pass")?.text}`);
+    assert.ok(noteText(notes, "driver fail").text.includes("[≈ FAILED driver-attested; observed=status=Pending]"), `driver fail: ${noteText(notes, "driver fail")?.text}`);
     // Segmented tally — the two kinds are counted separately.
     assert.equal(
       notes[0].text,
@@ -790,10 +818,11 @@ await test("a session with zero assertions produces no [verification] note and n
       !texts.some((t) => typeof t === "string" && t.includes("[verification]")),
       `a no-assertion session must not emit a [verification] note: ${JSON.stringify(texts)}`,
     );
-    // …and no assertion annotation of EITHER provenance anywhere in the payload.
+    // …and no assertion annotation of EITHER provenance anywhere in the payload
+    // (clipy-verified ✓/✗/⚠ forms, or the driver-attested hedge form).
     assert.ok(
-      !texts.some((t) => typeof t === "string" && /\[assert |\[ASSERT /.test(t)),
-      `a no-assertion session must carry no assert/ASSERT annotations: ${JSON.stringify(texts)}`,
+      !texts.some((t) => typeof t === "string" && /\[assert |\[ASSERT |\[≈ /.test(t)),
+      `a no-assertion session must carry no assert/ASSERT/≈ annotations: ${JSON.stringify(texts)}`,
     );
     for (const [label, r] of [["start", start], ["mark", m1], ["chapter", ch], ["mark2", m2], ["stop", stop]]) {
       assert.ok(!/warning:|⚠/.test(r.stderr), `${label} must not warn about missing assertions: ${r.stderr}`);
@@ -840,6 +869,45 @@ await test("bare --user-data-dir at a real-looking Chrome root warns (in-place) 
   assert.match(r.stderr, /opens your real Chrome Default profile in place/, `expected the in-place warning: ${r.stderr}`);
   assert.match(r.stderr, /--profile-directory/, "the warning points at the safer flag");
   assert.ok(completeCalls > before, "it still records and uploads");
+});
+
+// --- Transcript readability -------------------------------------------------
+
+await test("clipy transcript renders one entry per line, timestamp-prefixed (not one run-on paragraph)", async () => {
+  const ws = freshWorkspace();
+  const r = await runCli(["transcript", "tscript"], ws);
+  assert.equal(r.code, 0, `transcript should exit 0; got ${r.code}: ${r.stderr}`);
+  const lines = r.stdout.trimEnd().split("\n");
+  assert.equal(lines.length, 4, `one line per entry, got ${lines.length}: ${JSON.stringify(lines)}`);
+  // Chronological, each prefixed with its timestamp.
+  assert.match(lines[0], /^\s*0:00\s+\[verification\] 1 driver-attested/, `line 0: ${lines[0]}`);
+  assert.match(lines[1], /^\s*0:02\s+opened the settings page$/, `line 1: ${lines[1]}`);
+  assert.match(lines[2], /^\s*0:04\s+\[auto\] navigated to/, `line 2: ${lines[2]}`);
+  assert.match(lines[3], /^\s*0:09\s+totals look right \[≈ ASSERT driver-attested;/, `line 3: ${lines[3]}`);
+});
+
+await test("clipy transcript --marks-only drops [auto] instrumentation lines", async () => {
+  const ws = freshWorkspace();
+  const r = await runCli(["transcript", "tscript", "--marks-only"], ws);
+  assert.equal(r.code, 0, `transcript --marks-only should exit 0; got ${r.code}: ${r.stderr}`);
+  const lines = r.stdout.trimEnd().split("\n");
+  assert.equal(lines.length, 3, `[auto] line dropped, got ${lines.length}: ${JSON.stringify(lines)}`);
+  assert.ok(!r.stdout.includes("[auto]"), `no [auto] lines remain: ${r.stdout}`);
+  // …and the narration + evidence lines survive untouched.
+  assert.ok(r.stdout.includes("opened the settings page"), "narration kept");
+  assert.ok(r.stdout.includes("[≈ ASSERT driver-attested;"), "attested mark kept");
+});
+
+await test("clipy transcript --srt/--json still work (line-per-entry didn't break exports)", async () => {
+  const ws = freshWorkspace();
+  const srt = await runCli(["transcript", "tscript", "--srt"], ws);
+  assert.equal(srt.code, 0, `--srt should exit 0: ${srt.stderr}`);
+  assert.match(srt.stdout, /^1\n00:00:00,000 --> 00:00:00,000/, `srt cue shape: ${srt.stdout.slice(0, 80)}`);
+  const j = await runCli(["transcript", "tscript", "--json"], ws);
+  assert.equal(j.code, 0, `--json should exit 0: ${j.stderr}`);
+  const parsed = JSON.parse(j.stdout);
+  assert.equal(parsed.status, "ready", "json passthrough intact");
+  assert.ok(parsed.transcript.plaintext.length > 0, "raw plaintext still available via --json");
 });
 
 appServer.close();

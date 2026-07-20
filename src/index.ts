@@ -361,8 +361,11 @@ ${c.bold("RECORDINGS")}
                                     List your recordings (newest first)
   search <query> [--json]           Full-text search titles + descriptions
   show <id|url> [--json]            One recording's metadata + share link
-  transcript <id> [--srt|--vtt|--json]
-                                    Print the transcript (plaintext by default)
+  transcript <id> [--marks-only] [--srt|--vtt|--json]
+                                    Print the transcript — one entry per line,
+                                    timestamp-prefixed. --marks-only drops [auto]
+                                    instrumentation lines (navigations, console
+                                    errors), leaving the narration you wrote
   summary <id> [--json]             AI summary: TL;DR, key points, action items
   moments <id> [--json]             Key moments (timestamps + captions + click coords)
   context <id>                      Full agent-context bundle as markdown
@@ -683,7 +686,12 @@ async function cmdShow(ctx: Ctx, id: string, json: boolean): Promise<void> {
   for (const [k, v] of kv) process.stdout.write(`${c.dim(k.padEnd(w))}  ${v}\n`);
 }
 
-async function cmdTranscript(ctx: Ctx, id: string, fmt: "text" | "srt" | "vtt" | "json"): Promise<void> {
+async function cmdTranscript(
+  ctx: Ctx,
+  id: string,
+  fmt: "text" | "srt" | "vtt" | "json",
+  marksOnly = false,
+): Promise<void> {
   const pid = encodeURIComponent(normalizeId(id, ctx));
   const body = await apiJson(ctx, `/api/v1/recordings/${pid}/transcript`);
   const status = String(body.status ?? "unknown");
@@ -699,7 +707,29 @@ async function cmdTranscript(ctx: Ctx, id: string, fmt: "text" | "srt" | "vtt" |
   // The ready payload nests under `transcript`; accept top-level too.
   const t = (body.transcript ?? body) as { plaintext?: string; segments?: Segment[] };
   if (fmt === "text") {
-    process.stdout.write(`${String(t.plaintext ?? "")}\n`);
+    // One entry per line, timestamp-prefixed, chronological — from the same
+    // `segments` the --srt/--vtt paths use. An agent-narration transcript is a
+    // list of discrete marks/[auto] entries, and concatenating them into one
+    // run-on paragraph made it unreadable without piping through sed. Timestamped
+    // lines are also how every transcript UI renders speech, so this is the
+    // default for both kinds; `--json` still carries the raw `plaintext` for any
+    // script that wants the old shape, and a transcript with no segments (or a
+    // plaintext-only replacement) falls back to it.
+    const segments = (t.segments ?? []) as Segment[];
+    if (!segments.length) {
+      process.stdout.write(`${String(t.plaintext ?? "")}\n`);
+      return;
+    }
+    const lines = segments
+      .map((s) => ({ start: Number(s.start) || 0, text: String(s.text ?? "").trim() }))
+      .filter((s) => s.text)
+      // --marks-only drops [auto] instrumentation (navigations, console errors),
+      // leaving the narration a human actually wrote.
+      .filter((s) => !(marksOnly && s.text.startsWith("[auto]")))
+      // FLOOR, never round: a transcript timestamp is a seek target, so it must
+      // never point past the entry it labels (2.5s must read 0:02, not 0:03).
+      .map((s) => `${c.dim(fmtDuration(Math.floor(s.start)).padStart(7))}  ${s.text}`);
+    process.stdout.write(lines.length ? `${lines.join("\n")}\n` : "");
     return;
   }
   const segments = (t.segments ?? []) as Segment[];
@@ -2741,9 +2771,13 @@ function verifiedMarkAnnotation(passed: boolean, expected: string, observed: str
 }
 
 /** Annotation for a mark the DRIVER attested — Clipy records the claim and the
- *  agent's observed values, and never presents it as its own verification. */
+ *  agent's observed values, and never presents it as its own verification.
+ *  TYPOGRAPHIC PROVENANCE: this leads with a HEDGE glyph (≈), never ✓/✗, because
+ *  the eye reads shape before text — a skimmed column must yield "verified,
+ *  verified, attested, attested" without reading the trailing label. Clipy-verified
+ *  marks keep ✓/✗; those are the only marks Clipy itself stands behind. */
 function attestedMarkAnnotation(verdict: "pass" | "fail", observed: string): string {
-  return `[ASSERT ${verdict === "pass" ? "✓" : "✗"} driver-attested; observed=${observed}]`;
+  return `[≈ ${verdict === "pass" ? "ASSERT" : "FAILED"} driver-attested; observed=${observed}]`;
 }
 
 /** The leading [verification] note. The two provenances are SEPARATE segments and
@@ -3231,8 +3265,14 @@ function printMarkResult(res: Json, json: boolean): void {
     return;
   }
   const sec = (Number(res.tMs ?? 0) / 1000).toFixed(1);
-  const assert = res.assert as { passed?: boolean } | undefined;
-  const glyph = assert && assert.passed === false ? c.red("✗") : c.green("✓");
+  const assert = res.assert as { passed?: boolean; attested?: boolean } | undefined;
+  // Same typographic rule as the transcript: an ATTESTED mark leads with the hedge
+  // glyph, never ✓/✗ — the terminal skim must read like the transcript skim.
+  const glyph = assert?.attested
+    ? c.yellow("≈")
+    : assert && assert.passed === false
+      ? c.red("✗")
+      : c.green("✓");
   process.stdout.write(`${glyph} mark @ ${sec}s — ${String(res.text ?? "")}\n`);
 }
 
@@ -3284,7 +3324,7 @@ async function cmdMark(text: string, json: boolean, opts: MarkOpts): Promise<voi
       printJson({ ...result, text: macText, ...(attest ? { assert: { passed: attest.verdict === "pass", observed: attest.observed, attested: true } } : {}) });
       return;
     }
-    const glyph = attest && attest.verdict === "fail" ? c.red("✗") : c.green("✓");
+    const glyph = attest ? c.yellow("≈") : c.green("✓"); // attested ⇒ hedge, never ✓/✗
     process.stdout.write(
       `${glyph} mark @ ${Number(result.atSeconds ?? 0).toFixed(1)}s — ${macText}\n`,
     );
@@ -3351,7 +3391,7 @@ async function cmdMark(text: string, json: boolean, opts: MarkOpts): Promise<voi
       // ⚠ UNVERIFIED (never a silent pass) — the daemon counts {unverified:true}
       // file marks into the clipy segment's third bucket.
       if (hasAssert) {
-        const annotated = `${cleanText} [ASSERT ⚠ could not evaluate — ${reason}]`;
+        const annotated = `${cleanText} [ASSERT ⚠ clipy could not evaluate — ${reason}]`;
         appendFileSync(
           state.marksPath,
           `${JSON.stringify({ id: markId, tMs: localTMs, text: annotated, unverified: true })}\n`,
@@ -4567,7 +4607,7 @@ async function cmdAgents(
 // contract changes.
 // ---------------------------------------------------------------------------
 
-const GUIDE_SCHEMA_VERSION = 9;
+const GUIDE_SCHEMA_VERSION = 10;
 
 function cmdGuide(json: boolean): void {
   if (!json) {
@@ -4613,7 +4653,7 @@ function cmdGuide(json: boolean): void {
       cmdDoc("list", "clipy list [-n N] [--page P] [--status s,…] [--json]", "List recordings, newest first"),
       cmdDoc("search", "clipy search <query> [--json]", "Full-text search titles + descriptions"),
       cmdDoc("show", "clipy show <id|url> [--json]", "One recording's metadata + share link"),
-      cmdDoc("transcript", "clipy transcript <id> [--srt|--vtt|--json] | clipy transcript <id> --replace <file.json|-> ", "Print the transcript, or REPLACE it (ingest scope; file holds {segments:[{start,end,text}]} or {plaintext}; regenerates the summary)", ["--srt", "--vtt", "--json", "--replace <file>"]),
+      cmdDoc("transcript", "clipy transcript <id> [--marks-only] [--srt|--vtt|--json] | clipy transcript <id> --replace <file.json|-> ", "Print the transcript, or REPLACE it (ingest scope; file holds {segments:[{start,end,text}]} or {plaintext}; regenerates the summary). Default text output is ONE ENTRY PER LINE, chronological and timestamp-prefixed, from the same segments --srt/--vtt use — an agent-narration transcript is a list of discrete marks, and concatenating them into one run-on paragraph made it unreadable. --marks-only drops [auto] instrumentation lines (navigations, console errors) so only the narration a human wrote remains; it applies to the default text output (--srt/--vtt/--json are unaffected). A transcript with no segments falls back to plaintext, and --json still carries the raw plaintext for scripts that want the old shape.", ["--marks-only", "--srt", "--vtt", "--json", "--replace <file>"]),
       cmdDoc("summary", "clipy summary <id> [--json]", "AI summary: TL;DR, key points, action items"),
       cmdDoc("moments", "clipy moments <id> [--json]", "Key moments: timestamps, captions, click coords"),
       cmdDoc("context", "clipy context <id>", "Full agent-context bundle as markdown"),
@@ -4622,7 +4662,7 @@ function cmdGuide(json: boolean): void {
       cmdDoc("wait", "clipy wait <id> [--for transcript|summary|both] [--timeout sec]", "Block until artifacts are ready"),
       cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. Auth (web capture only, applied before the first navigation so a logged-in SPA's route guard sees it): --storage-state <playwright storageState JSON path>, --cookie 'name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]' (repeatable), --local-storage 'key=value' (repeatable, target origin only), --init-script <js file run before every page load>, --user-data-dir <dir> (launch from a persistent Chromium user-data ROOT with its whole logged-in identity; web only, mutually exclusive with --storage-state; refused if <dir> is a profile subdir — pass the root — or, in direct mode, a live-locked root via SingletonLock/Socket), --profile-directory <name> (with --user-data-dir: pick a NAMED profile like 'Profile 12' from chrome://version; Playwright can't select a profile in place, so Clipy COPIES it into a temp recording root and launches the copy — loudly disclosed, the real profile is never opened or written, and the copy is deleted after upload; no need to quit Chrome, though it warns if Chrome is running since in-use DBs may copy inconsistently). Auth boundary: --storage-state only seeds what the file contains; for cross-origin auth produce it with `npx playwright open --save-storage=auth.json <login-host>`, or use --user-data-dir + --profile-directory to record your real profile, or --source mac-screen --window Chrome. With --source mac-screen: records the real screen via the Clipy Mac app (--type not yet applied on mac; auth flags rejected — the screen is already logged in); --window '<title|app|id>' or --display <id> target one window/display (ids from clipy sources). --json prints {id, shareUrl, contextUrl, sizeBytes}", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--storage-state", "--cookie", "--local-storage", "--init-script", "--user-data-dir", "--profile-directory", "--width", "--height", "--wait", "--source", "--window", "--display", "--json"]),
       cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen] [--window w] [--display d] [--expose-cdp] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). --window/--display (with --source mac-screen) record one window/display. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code — the crash-safe wrapper so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). `session run` exports CLIPY_SESSION_FILE to the child so mark/chapter resolve the session from any cwd. --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--expose-cdp", "--storage-state", "--user-data-dir", "--profile-directory", "--cookie", "--local-storage", "--init-script", "--json"]),
-      cmdDoc("mark", "clipy mark \"<text>\" [--observed \"<values>\" --verdict pass|fail] [--assert-selector <css> [--assert-text <substr>]] [--assert-url <glob>] [--fail-mode warn|abort] [--at <sec>|--ago <sec>] [--json]", "Drop a live-timestamped note into the active session. A mark carries at most ONE evidence provenance, and the two are labeled + tallied separately so they can never be pooled. DRIVER-ATTESTED (--observed '<values>' --verdict pass|fail, both required together): you drove the browser and report what YOU observed — renders '<text> [ASSERT ✓ driver-attested; observed=<values>]' (or ✗) and works in EVERY session type including --source mac-screen. Honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it — put real observed values there. Combining --observed/--verdict with --assert-* is a usage error. CLIPY-VERIFIED assertion marks (Clipy-owned page only) make the note evidence Clipy itself checked: --assert-selector checks a CSS selector matches (its trimmed textContent is recorded as 'observed'); --assert-text requires that element's text to contain a substring (needs --assert-selector); --assert-url matches the page URL against a glob (** = any, * = any non-slash, no * = substring). The daemon evaluates against its live page and annotates the mark: pass ⇒ '<text> [assert ✓ verified-by-clipy; <observed>]', fail ⇒ '<text> [ASSERT ✗ verified-by-clipy; expected …; observed …]' — a false claim cannot read as fact. --fail-mode warn (default) records the ✗; --fail-mode abort DISCARDS the whole session on a failed assertion (no upload) and the CLI exits non-zero. If any assertion was attempted, a leading 0ms [verification] note is prepended, reporting the provenances as SEPARATE segments: '[verification] N clipy-verified: P passed, F failed, K unverified · M driver-attested: P passed, F failed' (a segment is omitted when empty; with only clipy-verified marks the legacy 'N assertion(s): …' rendering is byte-identical). --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now (mutually exclusive). Assertions/backdating need a web session (rejected on --source mac-screen). Up to 200 marks per recording.", ["--observed", "--verdict", "--assert-selector", "--assert-text", "--assert-url", "--fail-mode", "--at", "--ago", "--json"]),
+      cmdDoc("mark", "clipy mark \"<text>\" [--observed \"<values>\" --verdict pass|fail] [--assert-selector <css> [--assert-text <substr>]] [--assert-url <glob>] [--fail-mode warn|abort] [--at <sec>|--ago <sec>] [--json]", "Drop a live-timestamped note into the active session. A mark carries at most ONE evidence provenance, and the two are labeled + tallied separately so they can never be pooled. DRIVER-ATTESTED (--observed '<values>' --verdict pass|fail, both required together): you drove the browser and report what YOU observed — renders '<text> [≈ ASSERT driver-attested; observed=<values>]' (pass) / '<text> [≈ FAILED driver-attested; observed=<values>]' (fail) — a HEDGE glyph, never ✓/✗, so a skim distinguishes provenance by shape alone and works in EVERY session type including --source mac-screen. Honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it — put real observed values there. Combining --observed/--verdict with --assert-* is a usage error. CLIPY-VERIFIED assertion marks (Clipy-owned page only) make the note evidence Clipy itself checked: --assert-selector checks a CSS selector matches (its trimmed textContent is recorded as 'observed'); --assert-text requires that element's text to contain a substring (needs --assert-selector); --assert-url matches the page URL against a glob (** = any, * = any non-slash, no * = substring). The daemon evaluates against its live page and annotates the mark: pass ⇒ '<text> [assert ✓ verified-by-clipy; <observed>]', fail ⇒ '<text> [ASSERT ✗ verified-by-clipy; expected …; observed …]' — a false claim cannot read as fact. --fail-mode warn (default) records the ✗; --fail-mode abort DISCARDS the whole session on a failed assertion (no upload) and the CLI exits non-zero. If any assertion was attempted, a leading 0ms [verification] note is prepended, reporting the provenances as SEPARATE segments: '[verification] N clipy-verified: P passed, F failed, K unverified · M driver-attested: P passed, F failed' (a segment is omitted when empty; with only clipy-verified marks the legacy 'N assertion(s): …' rendering is byte-identical). --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now (mutually exclusive). Assertions/backdating need a web session (rejected on --source mac-screen). Up to 200 marks per recording.", ["--observed", "--verdict", "--assert-selector", "--assert-text", "--assert-url", "--fail-mode", "--at", "--ago", "--json"]),
       cmdDoc("chapter", "clipy chapter \"<label>\" [--json]", "Mark a BEFORE/AFTER section boundary in the active recording (stored as '=== CHAPTER: <label> ==='). The PR-review shape: demo the base branch, run `clipy chapter \"AFTER — fix applied\"`, swap branches + restart the dev server, demo the fix — one video carrying both states. Works on web + --source mac-screen sessions.", ["--json"]),
       cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails", ["--json"]),
       cmdDoc("playwright-path", "clipy playwright-path [--json]", "Print the node_modules directory of the Playwright this CLI resolves, so your own --expose-cdp driver scripts can load the same copy: NODE_PATH=$(clipy playwright-path) node driver.js. Exits 1 (empty stdout) if Playwright is unresolvable. --json prints {path, nodeModulesDir, source}", ["--json"]),
@@ -4638,9 +4678,9 @@ function cmdGuide(json: boolean): void {
       "Headless captures have no audio: --note flags and session marks become the transcript, labeled agent-narration.",
       "--note is absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text'); pass-scoped notes anchor to the real start of a --viewports pass, so they don't drift when load time shifts the pass boundaries. A malformed pass note (e.g. 'pass2 text' with no colon) is a usage error, not silently demoted.",
       "--type declares what a recording IS (bug_report/feature_request/product_demo/walkthrough_tutorial/feedback_review/discussion_talk/other, plus short aliases) so the AI summary doesn't misread a demo as a bug report. Applied on web today; --source mac-screen support is pending a Clipy app update.",
-      "Clipy is a RECORDER, not a driver. When you drive the browser yourself (the usual agent case), the primary path is: record the real app (--source mac-screen --window '<app>', or your own driven browser) and attach evidence with driver-attested marks — `clipy mark \"<claim>\" --observed \"<values you read>\" --verdict pass|fail` — plus `clipy chapter` for before/after. Clipy holds the ledger; it does not drive. The owned-browser auth flags (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script) are the AGENTLESS/CI fallback for when nothing is driving and Clipy needs its own logged-in context. Provenance is never pooled: driver-attested marks render '[ASSERT ✓ driver-attested; observed=…]' and clipy-evaluated ones '[assert ✓ verified-by-clipy; …]', and the [verification] note counts them in separate segments. The honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it.",
+      "Clipy is a RECORDER, not a driver. When you drive the browser yourself (the usual agent case), the primary path is: record the real app (--source mac-screen --window '<app>', or your own driven browser) and attach evidence with driver-attested marks — `clipy mark \"<claim>\" --observed \"<values you read>\" --verdict pass|fail` — plus `clipy chapter` for before/after. Clipy holds the ledger; it does not drive. The owned-browser auth flags (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script) are the AGENTLESS/CI fallback for when nothing is driving and Clipy needs its own logged-in context. Provenance is never pooled: driver-attested marks render '[≈ ASSERT driver-attested; observed=…]' / '[≈ FAILED …]' (hedge glyph) and clipy-evaluated ones '[assert ✓ verified-by-clipy; …]' / '[ASSERT ✗ verified-by-clipy; …]' (✓/✗ are reserved for what Clipy itself checked), and the [verification] note counts them in separate segments. The honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it.",
       "Assertion marks are the differentiator: assert what you claim. `clipy mark \"X\" --assert-selector '.status' --assert-text Active` records X only alongside the live-page truth — the daemon runs the check against its Playwright page and annotates the mark ✓/✗ with what it actually observed, so a false claim cannot pass as fact in the transcript. --fail-mode abort turns a failed assertion into a discarded session (nothing uploaded, non-zero exit). Assertions need a web session and the daemon's control endpoint (started by clipy 0.6+); they are rejected on --source mac-screen.",
-      "A mark is NEVER dropped, and a late verdict never rewrites it. If the daemon can't be reached to evaluate an assertion (its event loop briefly starved during a dev-server recompile), `clipy mark` records the narration anyway tagged '[ASSERT ⚠ could not evaluate — <reason>]', prints a loud ⚠, and exits 0 — an unverified claim is flagged, never promoted to a ✓. The tally's third bucket counts these: '[verification] N assertion(s): P passed, F failed, K unverified' (the ', K unverified' clause is omitted when K=0). That ⚠ is the MARK OF RECORD: if the daemon was only slow and evaluates the same claim later, that verdict judged a LATER page state, so it does NOT overwrite the ⚠ — it's recorded as a separate '[late check of \"…\" — evaluated Ns after the claim: …]' note at its own time and counts toward none of P/F/K. Plain non-asserted marks the daemon later processes are just deduped (exactly once).",
+      "A mark is NEVER dropped, and a late verdict never rewrites it. If the daemon can't be reached to evaluate an assertion (its event loop briefly starved during a dev-server recompile), `clipy mark` records the narration anyway tagged '[ASSERT ⚠ clipy could not evaluate — <reason>]', prints a loud ⚠, and exits 0 — an unverified claim is flagged, never promoted to a ✓. The tally's third bucket counts these: '[verification] N assertion(s): P passed, F failed, K unverified' (the ', K unverified' clause is omitted when K=0). That ⚠ is the MARK OF RECORD: if the daemon was only slow and evaluates the same claim later, that verdict judged a LATER page state, so it does NOT overwrite the ⚠ — it's recorded as a separate '[late check of \"…\" — evaluated Ns after the claim: …]' note at its own time and counts toward none of P/F/K. Plain non-asserted marks the daemon later processes are just deduped (exactly once).",
       "clipy chapter \"<label>\" splits one recording into BEFORE/AFTER sections for PR-review-style demos: record the base branch, `clipy chapter \"AFTER — fix applied\"`, swap branches + restart, record the fix. One video carries both states.",
       "clipy session run [start flags] -- <command…> is the crash-safe wrapper: it starts a session, runs your driver command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), and guarantees cleanup — exit 0 uploads, any non-zero exit or signal discards and propagates the code. Use it so a crashing driver never records dead air to the max ceiling.",
       "clipy mark --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now — a `clipy mark` spawn lands ~100-300ms late, so backdate to align a mark with the state it describes. Backdating an ASSERTED mark: it lands at the backdated time but the assertion judges the LIVE page, so if the verdict was observed >2s from the backdated position the text gains '(assertion observed Ns after this backdated mark — the verdict describes the page at observation time)' and --json carries a signed assert.driftSec; live-clock asserted marks and backdated plain marks are unaffected. When driving over --expose-cdp, call window.__clipyMark(text, opts?) / window.__clipyChapter(label) IN-PAGE (page.evaluate) to emit marks/chapters with zero spawn latency, evaluated daemon-side with the page in hand. __clipyMark's opts {assertSelector, assertText, assertUrl, failMode} run the SAME assertions as the CLI flags (assertText requires assertSelector or the call rejects; failMode 'abort' discards the session); it returns the annotated {tMs, text, assert}. While CDP is exposed the page's own scripts can call these too (within the existing --expose-cdp trust model).",
@@ -4734,6 +4774,7 @@ async function main(): Promise<void> {
       limit: { type: "string" },
       output: { type: "string", short: "o" },
       srt: { type: "boolean", default: false },
+      "marks-only": { type: "boolean", default: false },
       vtt: { type: "boolean", default: false },
       for: { type: "string" },
       timeout: { type: "string" },
@@ -4881,7 +4922,7 @@ async function main(): Promise<void> {
         return;
       }
       const fmt = json ? "json" : values.srt ? "srt" : values.vtt ? "vtt" : "text";
-      await cmdTranscript(ctx, rest[0], fmt);
+      await cmdTranscript(ctx, rest[0], fmt, Boolean(values["marks-only"]));
       return;
     }
     case "summary":
