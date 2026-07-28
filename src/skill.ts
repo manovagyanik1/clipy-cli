@@ -10,7 +10,7 @@
  */
 export const CLIPY_SKILL_MD = `---
 name: clipy
-description: Read and create Clipy screen recordings. Use when the user shares a clipy.online/video/<id> URL (watch, summarize, or act on a recording, bug report, or walkthrough), OR when the user asks you to record your own work — demo a feature you built, capture a UI fix across screen sizes, or show a bug reproduction — and share it as a link.
+description: Read and create Clipy screen recordings, and turn any video into agent-readable context. Use when the user shares a clipy.online/video/<id> URL (watch, summarize, or act on a recording, bug report, or walkthrough), shares a YouTube URL or local video file as context/reference for a task ("implement what this video shows", "give me the context of this video" — import it with clipy context import), OR asks you to record your own work — demo a feature you built, capture a UI fix, or show a bug reproduction — and share it as a link.
 ---
 
 # Clipy — recordings you can read AND make
