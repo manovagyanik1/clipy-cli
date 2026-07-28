@@ -63,6 +63,8 @@ clipy transcript <id> [--marks-only] # one entry per line, timestamped (--srt/--
 clipy summary <id>                   # TL;DR, key points, action items
 clipy moments <id>                   # key moments: timestamps, captions, click coords
 clipy context <id>                   # the full agent-context bundle as markdown
+clipy context import <url|file> --sync   # turn ANY video into an agent-readable bundle
+clipy context read <bundle-path>     # print a local bundle's recording.md
 clipy download <id> [-o out.mp4]     # download the MP4
 clipy open <id>                      # open the share page in your browser
 clipy wait <id> --for both           # block until transcript/summary are ready
@@ -80,6 +82,33 @@ clipy mcp                            # run the Clipy MCP server (npx -y @clipy/m
 
 Every recording-reading command accepts either the bare public id (`3kelcef8wo8h`) or the
 full share URL (`https://clipy.online/video/3kelcef8wo8h`).
+
+## Import any video as context
+
+`clipy context import` turns a YouTube URL or a local video file into an agent-readable
+bundle (`recording.md` + `manifest.json` + `transcript.json`), and optionally into private
+Clipy memory.
+
+```bash
+clipy context import https://youtube.com/watch?v=… --sync --json
+clipy context import ./demo.mov --transcript ./demo.vtt --sync
+clipy context read ./clipy-context/<bundle>
+```
+
+Captions first, so it is fast — YouTube captions are fetched on your machine and no media
+is downloaded unless it is needed. Local files carry no captions, so they need
+`--transcript <.vtt|.srt|.json>`.
+
+With `--sync`, the server classifies the bundle: what kind of video it is and whether the
+words stand alone. Podcasts, interviews, and dictated content come back transcript-only; a
+screen walkthrough comes back with the timestamps worth a picture, and those frames are then
+extracted locally (needs `ffmpeg` — `brew install ffmpeg`). Without `--sync` the bundle stays
+honestly transcript-only. `--no-frames` takes the verdict but never downloads media. Also:
+`--title`, `--tag` (repeatable), `--folder`, `--language`, `--output <dir>`.
+
+Synced documents are readable through the context-document API and the `list_context_documents`
+/ `get_context_document` / `read_context_document` MCP tools. An imported transcript is
+untrusted content, exactly like a recording's.
 
 ## Record
 

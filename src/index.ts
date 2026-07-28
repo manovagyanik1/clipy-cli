@@ -28,6 +28,8 @@ import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { CLIPY_SKILL_MD } from "./skill.js";
 import { browserLogin, shouldUseManualLogin, type BrowserLoginResult } from "./browserLogin.js";
+import { cmdContextImport } from "./context/importCmd.js";
+import { cmdContextRead } from "./context/readCmd.js";
 import {
   BridgeUnavailableError,
   bridgeRequest,
@@ -372,6 +374,22 @@ ${c.bold("RECORDINGS")}
   summary <id> [--json]             AI summary: TL;DR, key points, action items
   moments <id> [--json]             Key moments (timestamps + captions + click coords)
   context <id>                      Full agent-context bundle as markdown
+  context import <youtube-url|file> [--transcript <f>] [--output <dir>]
+                                    Compile ANY video into a local Clipy context
+                                    bundle (recording.md + manifest.json +
+                                    transcript.json). YouTube captions are fetched
+                                    on your machine — no media leaves it. Local
+                                    files need --transcript <.vtt|.srt|.json>
+    --language <code> Caption language preference (default en)
+    --title <t>       Override the bundle title
+    --tag <t>         Tag for --sync (repeatable)  ·  --folder <name>
+    --sync            Also upload the derived bundle to your private library.
+                      The server classifies it and, when the transcript is not
+                      enough, names the timestamps worth a picture; those frames
+                      are then extracted locally and added to the bundle
+    --no-frames       With --sync: take the verdict but never download media
+    --json            Print {bundlePath, profile, classification, frames, …}
+  context read <bundle-path>        Print a local bundle's recording.md
   download <id> [-o <path>]         Download the MP4
   open <id>                         Open the share page in your browser
   wait <id> [--for transcript|summary|both] [--timeout <sec>]
@@ -4858,6 +4876,13 @@ function cmdGuide(json: boolean): void {
       cmdDoc("summary", "clipy summary <id> [--json]", "AI summary: TL;DR, key points, action items"),
       cmdDoc("moments", "clipy moments <id> [--json]", "Key moments: timestamps, captions, click coords"),
       cmdDoc("context", "clipy context <id>", "Full agent-context bundle as markdown"),
+      cmdDoc(
+        "context import",
+        "clipy context import <youtube-url|local-file> [--transcript <f>] [--output <dir>] [--language <code>] [--title <t>] [--tag <t>]… [--folder <name>] [--sync] [--json]",
+        "Compile ANY video into a local Clipy context bundle — a directory holding recording.md (the agent-facing document, with the untrusted-content warning and [MM:SS] transcript sections), manifest.json (provenance, versions, sufficiency report) and transcript.json. YouTube URLs resolve on YOUR machine via a Clipy-managed yt-dlp (auto-installed into ~/.clipy/bin on first use, with a disclosure); creator captions are preferred over auto-captions and NO media is downloaded. Local files need --transcript <.vtt|.srt|Clipy transcript JSON> and are probed with ffprobe. A deterministic classifier scores how well the transcript stands alone and lists the timestamps where it is blind — v1 emits the transcript profile only, so those gaps are the honest statement of what the bundle cannot show. Reruns over the same source are idempotent. --sync additionally uploads the DERIVED bundle (never source media) to your private library.",
+        ["--transcript", "--output", "--language", "--title", "--tag", "--folder", "--sync", "--json"],
+      ),
+      cmdDoc("context read", "clipy context read <bundle-path>", "Print a local bundle's recording.md to stdout — plain, unpaged, uncoloured, for an agent to read directly."),
       cmdDoc("download", "clipy download <id> [-o path]", "Download the MP4"),
       cmdDoc("open", "clipy open <id>", "Open the share page in a browser"),
       cmdDoc("wait", "clipy wait <id> [--for transcript|summary|both] [--timeout sec]", "Block until artifacts are ready"),
@@ -4991,6 +5016,14 @@ async function main(): Promise<void> {
       viewports: { type: "string" },
       max: { type: "string" },
       replace: { type: "string" },
+      transcript: { type: "string" },
+      language: { type: "string" },
+      folder: { type: "string" },
+      tag: { type: "string", multiple: true },
+      sync: { type: "boolean", default: false },
+      // Opt out of Phase 2: sync and take the server's verdict, but never
+      // download media or write frames.
+      "no-frames": { type: "boolean", default: false },
       source: { type: "string" },
       window: { type: "string" },
       display: { type: "string" },
@@ -5148,10 +5181,44 @@ async function main(): Promise<void> {
       if (!rest[0]) die("usage: clipy moments <id|url> [--json]", 2);
       await cmdMoments(ctx, rest[0], json);
       return;
-    case "context":
-      if (!rest[0]) die("usage: clipy context <id|url>", 2);
+    case "context": {
+      // `import` and `read` are reserved literals — they shadow any recording id
+      // by that name, which is why they can never be confused for one.
+      if (rest[0] === "import") {
+        if (!rest[1]) die("usage: clipy context import <youtube-url|local-file> [--transcript <f>] [--output <dir>] [--sync]", 2);
+        try {
+          await cmdContextImport(rest[1], {
+            apiUrl: ctx.apiUrl,
+            apiKey: ctx.apiKey,
+            cliVersion: VERSION,
+            transcriptPath: values.transcript as string | undefined,
+            outputDir: values.output as string | undefined,
+            language: values.language as string | undefined,
+            title: values.title as string | undefined,
+            tags: (values.tag as string[] | undefined) ?? [],
+            folder: values.folder as string | undefined,
+            sync: Boolean(values.sync),
+            frames: !values["no-frames"],
+            json,
+          });
+        } catch (e) {
+          die((e as Error).message);
+        }
+        return;
+      }
+      if (rest[0] === "read") {
+        if (!rest[1]) die("usage: clipy context read <bundle-path>", 2);
+        try {
+          cmdContextRead(rest[1]);
+        } catch (e) {
+          die((e as Error).message);
+        }
+        return;
+      }
+      if (!rest[0]) die("usage: clipy context <id|url> | clipy context import <url|file> | clipy context read <bundle-path>", 2);
       await cmdContext(ctx, rest[0]);
       return;
+    }
     case "download":
       if (!rest[0]) die("usage: clipy download <id|url> [-o <path>]", 2);
       await cmdDownload(ctx, rest[0], values.output as string | undefined);
