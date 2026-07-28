@@ -20,6 +20,9 @@ export interface TranscriptSegment {
 export type TranscriptSource =
   | 'creator_captions'
   | 'auto_captions'
+  /** Machine-translated out of the video's original language — the lowest
+   *  fidelity source we accept, and worth flagging as such to an agent. */
+  | 'auto_captions_translated'
   | 'user_file'
   | 'local_stt';
 
@@ -107,6 +110,27 @@ export interface ManifestFrame {
   caption?: string;
 }
 
+/**
+ * Whether this bundle is everything it was meant to be.
+ *
+ * A bundle outlives the run that produced it: the warning envelope is gone by
+ * the next session, so the document itself has to say whether it is
+ * transcript-only BY DESIGN (the classifier judged the words sufficient) or
+ * transcript-only BY FAILURE (frames were planned and never arrived). Those two
+ * look identical on disk and call for opposite reactions, so they are recorded
+ * as distinct states rather than inferred from a frame count.
+ */
+export interface ArecCompleteness {
+  status: 'complete' | 'incomplete';
+  /** Frames the classifier asked for that are not in this bundle. */
+  missingFrames?: number;
+  /** The stable error code from the import that fell short. */
+  reasonCode?: string;
+  reason?: string;
+  /** Runnable verbatim — the whole point of recording this. */
+  rerunCommand?: string;
+}
+
 export interface ArecManifest {
   bundleVersion: 1;
   arecVersion: '0.2-draft';
@@ -120,6 +144,7 @@ export interface ArecManifest {
   sufficiency?: SufficiencyReport;
   serverClassification?: ServerClassification;
   frames?: ManifestFrame[];
+  completeness?: ArecCompleteness;
   createdAt: string;
 }
 

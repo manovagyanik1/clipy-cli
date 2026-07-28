@@ -25,6 +25,7 @@ import {
   parseYoutubeJson3,
   renderArecMarkdown,
   slugHash,
+  type ArecCompleteness,
   type ArecManifest,
   type ContextSource,
   type ManifestFrame,
@@ -35,7 +36,10 @@ import {
   type UploadContextPayload,
   type UploadFrame,
 } from "../context-core/index.js";
-import { fetchCaptions, fetchVideoMeta, resolveYtDlp } from "./ytdlp.js";
+import { describeCaptions, fetchCaptions, fetchVideoMeta, resolveYtDlp } from "./ytdlp.js";
+import { canonicalYoutubeUrl, isYoutubeHost, parseYoutubeId } from "./youtubeUrl.js";
+import { ImportError, type ImportWarning } from "./errors.js";
+import { looksLikeStaleBinary } from "./retry.js";
 import { probeVideo } from "./probe.js";
 import { extractFrames, type ExtractedFrame } from "./frames.js";
 import { borrowLocalVideo, borrowYoutubeVideo, type BorrowedVideo } from "./videoFetch.js";
@@ -56,40 +60,46 @@ export interface ImportOptions {
   json: boolean;
 }
 
-const YOUTUBE_HOSTS = new Set([
-  "youtube.com",
-  "www.youtube.com",
-  "m.youtube.com",
-  "music.youtube.com",
-  "youtu.be",
-  "www.youtu.be",
-]);
-
 type Input =
-  | { kind: "youtube"; url: string }
+  | { kind: "youtube"; url: string; videoId: string }
   | { kind: "local"; path: string }
   | { kind: "url"; url: string };
 
 function classifyInput(raw: string): Input {
   const trimmed = raw.trim();
+  // Shell-escaped input (`watch\?v\=…`) still has to be recognised as YouTube,
+  // so host detection runs on the de-escaped string.
+  const unescaped = trimmed.replace(/\\/g, "");
   let parsed: URL | null = null;
   try {
-    parsed = new URL(trimmed);
+    parsed = new URL(unescaped);
   } catch {
     parsed = null;
   }
 
   if (parsed && (parsed.protocol === "http:" || parsed.protocol === "https:")) {
-    const host = parsed.hostname.toLowerCase();
-    if (YOUTUBE_HOSTS.has(host)) return { kind: "youtube", url: trimmed };
-    return { kind: "url", url: trimmed };
+    if (isYoutubeHost(parsed.hostname)) {
+      const videoId = parseYoutubeId(trimmed);
+      if (!videoId) {
+        throw new ImportError(
+          "invalid_url",
+          `could not find a video id in "${raw}". Channel, playlist and search URLs are not supported.`,
+          `Pass a single-video URL, e.g. clipy context import "https://www.youtube.com/watch?v=<id>" (youtu.be/<id> and /shorts/<id> also work).`,
+        );
+      }
+      // Everything downstream uses the canonical URL — never the raw input.
+      return { kind: "youtube", url: canonicalYoutubeUrl(videoId), videoId };
+    }
+    return { kind: "url", url: unescaped };
   }
 
   const path = resolve(trimmed);
   if (existsSync(path) && statSync(path).isFile()) return { kind: "local", path };
 
-  throw new Error(
-    `could not read "${raw}" — pass a YouTube URL or the path to a local video file.`,
+  throw new ImportError(
+    "source_unreadable",
+    `could not read "${raw}" — it is neither a YouTube URL nor a readable local file.`,
+    `Check the path exists, or pass a YouTube URL: clipy context import "https://www.youtube.com/watch?v=<id>"`,
   );
 }
 
@@ -112,8 +122,10 @@ function parseTranscriptFile(path: string): TranscriptSegment[] {
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error(
-      `--transcript ${path} is neither .vtt/.srt nor valid JSON. Supported: WebVTT, SubRip, or Clipy transcript JSON ({"segments":[{"startMs","endMs","text"}]}).`,
+    throw new ImportError(
+      "transcript_unreadable",
+      `--transcript ${path} is neither .vtt/.srt nor valid JSON.`,
+      `Supply WebVTT (.vtt), SubRip (.srt), or Clipy transcript JSON ({"segments":[{"startMs","endMs","text"}]}).`,
     );
   }
 
@@ -123,7 +135,11 @@ function parseTranscriptFile(path: string): TranscriptSegment[] {
 
   const raw = (parsed as ClipyTranscriptJson).segments;
   if (!Array.isArray(raw)) {
-    throw new Error(`--transcript ${path} has no usable segments.`);
+    throw new ImportError(
+      "transcript_unreadable",
+      `--transcript ${path} has no usable segments.`,
+      `Supply WebVTT (.vtt), SubRip (.srt), or Clipy transcript JSON ({"segments":[{"startMs","endMs","text"}]}).`,
+    );
   }
   const segments: TranscriptSegment[] = [];
   for (const item of raw as Record<string, unknown>[]) {
@@ -134,8 +150,36 @@ function parseTranscriptFile(path: string): TranscriptSegment[] {
     if (!Number.isFinite(startMs) || typeof value !== "string") continue;
     segments.push({ startMs, endMs: Number.isFinite(endMs) ? endMs : startMs, text: value });
   }
-  if (segments.length === 0) throw new Error(`--transcript ${path} has no usable segments.`);
+  if (segments.length === 0) {
+    throw new ImportError(
+      "transcript_unreadable",
+      `--transcript ${path} has no usable segments.`,
+      `Supply WebVTT (.vtt), SubRip (.srt), or Clipy transcript JSON ({"segments":[{"startMs","endMs","text"}]}).`,
+    );
+  }
   return segments;
+}
+
+/** Platform-correct, runnable verbatim — an agent should be able to paste it. */
+const FFMPEG_INSTALL_COMMAND =
+  process.platform === "darwin"
+    ? "brew install ffmpeg"
+    : process.platform === "win32"
+      ? "winget install Gyan.FFmpeg"
+      : "sudo apt install ffmpeg";
+
+/** Resolves + parses `--transcript`, shared by every input kind. */
+function loadUserTranscript(transcriptPath: string): TranscriptSegment[] {
+  const resolved = resolve(transcriptPath);
+  if (!existsSync(resolved)) {
+    throw new ImportError(
+      "transcript_unreadable",
+      `--transcript ${resolved} does not exist.`,
+      `Check the path, or drop --transcript to use the provider's captions.`,
+    );
+  }
+  notify(`Reading the transcript from ${basename(resolved)}…`);
+  return parseTranscriptFile(resolved);
 }
 
 /** How Phase 2 would get at the pixels, if the server asks for them. */
@@ -182,26 +226,86 @@ function rerunCommand(target: string, opts: ImportOptions): string {
   return parts.join(" ");
 }
 
-async function compileYoutube(url: string, opts: ImportOptions): Promise<Compiled> {
+async function compileYoutube(url: string, videoId: string, opts: ImportOptions): Promise<Compiled> {
   const bin = await resolveYtDlp(notify);
   notify("Fetching video info…");
   const meta = await fetchVideoMeta(bin, url);
-  notify(`Found: "${meta.title}" (${fmtClock(meta.durationMs)})`);
-  const langPref = opts.language ?? meta.language ?? "en";
 
-  notify(`Downloading captions (${langPref})…`);
-  const captions = await fetchCaptions(bin, url, meta, langPref);
+  // A zero duration is how YouTube's placeholder/consent stubs come back. They
+  // are not real videos, and compiling one produces an empty bundle attributed
+  // to a URL the user did ask for — worse than a refusal.
+  if (!meta.durationMs) {
+    throw new ImportError(
+      "invalid_url",
+      `could not read this video: ${url} returned no duration. That usually means it is private, region-blocked, age-gated, members-only, or an unfinished live stream.`,
+      `Open the URL in a browser to check it plays, or import a local copy: clipy context import ./<file> --transcript <file.vtt>`,
+    );
+  }
+  notify(`Found: "${meta.title}" (${fmtClock(meta.durationMs)})`);
+
+  // providerId comes from the URL we parsed, not from yt-dlp's echo, so the
+  // manifest points at the video the user named even if metadata is partial.
+  const id = meta.id || videoId;
+  const source: ContextSource = {
+    kind: "youtube",
+    canonicalUrl: canonicalYoutubeUrl(id),
+    providerId: id,
+  };
+
+  // An explicit --transcript is the user overriding the provider, so YouTube's
+  // captions are never consulted — not even as a fallback.
+  if (opts.transcriptPath) {
+    const segments = loadUserTranscript(opts.transcriptPath);
+    notify(`Using your transcript file (${segments.length} segments) — skipping YouTube captions.`);
+    const transcript = buildNormalizedTranscript(segments, {
+      ...(opts.language ? { language: opts.language } : {}),
+      source: "user_file",
+      durationMs: meta.durationMs || undefined,
+    });
+    return finish({
+      title: opts.title ?? meta.title,
+      source,
+      durationMs: meta.durationMs,
+      transcript,
+      fingerprint: `youtube:${id}`,
+      media: { kind: "youtube", url, ytDlpBin: bin, durationMs: meta.durationMs },
+      opts,
+    });
+  }
+
+  let downloadFailure: string | null = null;
+  const captions = await fetchCaptions(bin, url, meta, {
+    ...(opts.language ? { language: opts.language } : {}),
+    notify,
+    onFailure: (reason) => {
+      downloadFailure = reason;
+    },
+  });
   if (!captions) {
-    const available = [...new Set([...meta.subtitleLangs, ...meta.autoCaptionLangs])];
-    if (available.length > 0) {
-      throw new Error(
-        `this video has no captions in "${langPref}". Re-run with --language <code> (e.g. --language ${available.includes("en") ? "en" : available[0]}).`,
+    // A listed track that refused to download is a different problem with a
+    // different fix, so it must not be reported as an absent track.
+    if (downloadFailure) {
+      const stale = looksLikeStaleBinary(downloadFailure);
+      throw new ImportError(
+        "no_captions",
+        `the captions are listed but could not be downloaded: ${downloadFailure}`,
+        stale
+          ? `This looks like an out-of-date yt-dlp (an extraction failure, not a block). Update it — the managed copy self-updates, or run: yt-dlp -U`
+          : `If this is HTTP 429, YouTube is rate-limiting this machine — wait a few minutes and re-run. Otherwise supply your own captions: clipy context import <url> --transcript <file.vtt>`,
       );
     }
-    throw new Error(
-      "this video has no captions (neither creator-provided nor auto-generated).\n" +
-        "  Supply your own with --transcript <file.vtt|file.srt|transcript.json>.\n" +
-        "  Local speech-to-text for caption-less videos lands in a future release.",
+    const available = [...new Set([...meta.subtitleLangs, ...meta.autoCaptionLangs])];
+    if (available.length > 0) {
+      throw new ImportError(
+        "no_captions",
+        `this video has no captions in "${opts.language ?? "any usable language"}". Available: ${available.slice(0, 20).join(", ")}${available.length > 20 ? `, … (${available.length} total)` : ""}.`,
+        `Re-run picking one of those: clipy context import <url> --language ${available[0]}`,
+      );
+    }
+    throw new ImportError(
+      "no_captions",
+      "this video has no captions at all (neither creator-provided nor auto-generated).",
+      `Supply your own: clipy context import <url> --transcript <file.vtt|file.srt|transcript.json>`,
     );
   }
 
@@ -215,23 +319,14 @@ async function compileYoutube(url: string, opts: ImportOptions): Promise<Compile
     source: captions.source,
     durationMs: meta.durationMs || undefined,
   });
-  notify(
-    `Got ${transcript.segments.length} caption segments (${
-      captions.source === "creator_captions" ? "creator-provided" : "auto-generated"
-    }, ${captions.language}).`,
-  );
-
-  const source: ContextSource = {
-    kind: "youtube",
-    ...(meta.id ? { canonicalUrl: `https://www.youtube.com/watch?v=${meta.id}`, providerId: meta.id } : {}),
-  };
+  notify(`Got ${transcript.segments.length} caption segments (${describeCaptions(captions)}).`);
 
   return finish({
     title: opts.title ?? meta.title,
     source,
     durationMs: meta.durationMs,
     transcript,
-    fingerprint: `youtube:${meta.id || url}`,
+    fingerprint: `youtube:${id}`,
     media: { kind: "youtube", url, ytDlpBin: bin, durationMs: meta.durationMs },
     opts,
   });
@@ -239,19 +334,32 @@ async function compileYoutube(url: string, opts: ImportOptions): Promise<Compile
 
 async function compileLocal(path: string, opts: ImportOptions): Promise<Compiled> {
   if (!opts.transcriptPath) {
-    throw new Error(
-      `local files need a transcript: pass --transcript <file.vtt|file.srt|transcript.json>.\n` +
-        "  Local speech-to-text lands in a future release.",
+    throw new ImportError(
+      "no_captions",
+      "local files need a transcript — Clipy cannot transcribe them yet.",
+      `Re-run with a caption file: clipy context import ${JSON.stringify(path)} --transcript <file.vtt|file.srt|transcript.json>`,
     );
   }
-  const transcriptPath = resolve(opts.transcriptPath);
-  if (!existsSync(transcriptPath)) throw new Error(`--transcript ${transcriptPath} does not exist.`);
-
   notify(`Probing ${basename(path)} with ffprobe…`);
-  const probe = await probeVideo(path);
+  let probe;
+  try {
+    probe = await probeVideo(path);
+  } catch (e) {
+    const message = (e as Error).message;
+    if (/ffprobe was not found/i.test(message)) {
+      throw new ImportError("ffmpeg_missing", message, FFMPEG_INSTALL_COMMAND);
+    }
+    if (/no video stream/i.test(message)) {
+      throw new ImportError(
+        "no_video_stream",
+        message,
+        `Supply a file with a video track, or import the audio transcript-only with --no-frames.`,
+      );
+    }
+    throw new ImportError("source_unreadable", message, `Check the file plays, then re-run.`);
+  }
   const contentHash = sha256File(path);
-  notify(`Reading the transcript from ${basename(transcriptPath)}…`);
-  const segments = parseTranscriptFile(transcriptPath);
+  const segments = loadUserTranscript(opts.transcriptPath);
   notify(`Got ${segments.length} transcript segments (${fmtClock(probe.durationMs)} of video).`);
 
   const transcript = buildNormalizedTranscript(segments, {
@@ -311,12 +419,14 @@ function withVisualEvidence(
   compiled: Compiled,
   classification: ServerClassification,
   frames: ManifestFrame[],
+  completeness?: ArecCompleteness,
 ): Compiled {
   const manifest: ArecManifest = {
     ...compiled.manifest,
     profile: frames.length > 0 ? "visual" : compiled.manifest.profile,
     serverClassification: classification,
     ...(frames.length > 0 ? { frames } : {}),
+    ...(completeness ? { completeness } : {}),
   };
   return {
     ...compiled,
@@ -426,6 +536,12 @@ async function apiPost(
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
+  } catch (e) {
+    throw new ImportError(
+      "server_unreachable",
+      `could not reach the Clipy API at ${opts.apiUrl}: ${(e as Error).message}`,
+      `Check your network, then re-run. Without --sync the local bundle is still written and readable with: clipy context read <bundle>`,
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -490,9 +606,11 @@ interface SyncResult {
 
 async function sync(compiled: Compiled, opts: ImportOptions, bundlePath: string): Promise<SyncResult> {
   if (!opts.apiKey) {
-    throw new Error(
-      `--sync needs an API key. Run \`clipy login\` (or set CLIPY_API_KEY), then re-run.\n` +
-        `  Nothing was lost: the local bundle is already written to ${bundlePath}.`,
+    throw new ImportError(
+      "auth_required",
+      `--sync needs an API key, and none is configured. The local bundle is already written to ${bundlePath}.`,
+      "clipy login",
+      { bundlePath },
     );
   }
 
@@ -517,27 +635,45 @@ async function sync(compiled: Compiled, opts: ImportOptions, bundlePath: string)
     // — so the local bundle is the user's intact fallback, and saying so is the
     // difference between "it broke" and "here is what you still have".
     const detail = typeof body.error === "string" ? body.error : `HTTP ${status}`;
-    const intact = `Your local bundle is complete and unaffected: ${bundlePath}`;
+    const partial = { bundlePath };
     if (status === 401) {
-      throw new Error(
-        `sync failed while uploading the transcript: ${detail}\n` +
-          `  Run \`clipy login\` to set a new key, then re-run.\n  ${intact}`,
+      throw new ImportError(
+        "auth_required",
+        `sync failed: ${detail}. Your local bundle is complete and unaffected: ${bundlePath}`,
+        "clipy login",
+        partial,
+      );
+    }
+    if (status === 403) {
+      throw new ImportError(
+        "wrong_scope",
+        `sync failed: ${detail}. The key is valid but lacks the ingest scope. Your local bundle is complete and unaffected: ${bundlePath}`,
+        "Mint a key with the ingest scope at https://clipy.online/settings/api-keys, then re-run with it.",
+        partial,
       );
     }
     if (status === 409) {
-      throw new Error(
-        `sync failed while uploading the transcript: ${detail}\n` +
-          `  That idempotency key already points at different content — this source changed since the last import.\n` +
-          `  Delete the old document in your library, or import from a fresh copy.\n  ${intact}`,
+      throw new ImportError(
+        "content_conflict",
+        `sync failed: ${detail}. That idempotency key already points at different content — this source changed since the last import. Your local bundle is complete and unaffected: ${bundlePath}`,
+        "Delete the old document in your library, or import from a fresh copy.",
+        partial,
       );
     }
     if (status === 429) {
-      throw new Error(
-        `sync failed while uploading the transcript: ${detail}\n` +
-          `  You have hit today's ingest quota (it resets at 00:00 UTC). Re-run then.\n  ${intact}`,
+      throw new ImportError(
+        "quota_exceeded",
+        `sync failed: ${detail}. You have hit today's ingest quota (it resets at 00:00 UTC). Your local bundle is complete and unaffected: ${bundlePath}`,
+        "Re-run after 00:00 UTC. Do not retry in a loop — it only burns the limit.",
+        partial,
       );
     }
-    throw new Error(`sync failed while uploading the transcript: ${detail}\n  ${intact}`);
+    throw new ImportError(
+      "server_unreachable",
+      `sync failed while uploading the transcript: ${detail}. Your local bundle is complete and unaffected: ${bundlePath}`,
+      `Re-run the same command. The bundle is readable meanwhile: clipy context read ${bundlePath}`,
+      partial,
+    );
   }
 
   return {
@@ -628,13 +764,15 @@ async function collectFrames(
 export async function cmdContextImport(target: string, opts: ImportOptions): Promise<void> {
   const input = classifyInput(target);
   if (input.kind === "url") {
-    throw new Error(
-      "direct media URLs are not supported yet — pass a YouTube URL or download the file first and import it locally.",
+    throw new ImportError(
+      "invalid_url",
+      "direct media URLs are not supported yet.",
+      `Download the file first, then: clipy context import ./<file> --transcript <file.vtt>`,
     );
   }
 
   let compiled =
-    input.kind === "youtube" ? await compileYoutube(input.url, opts) : await compileLocal(input.path, opts);
+    input.kind === "youtube" ? await compileYoutube(input.url, input.videoId, opts) : await compileLocal(input.path, opts);
 
   const outputDir = resolve(opts.outputDir ?? process.cwd());
   let { path: bundlePath, rewritten } = writeBundle(outputDir, compiled);
@@ -643,6 +781,34 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
   let synced: SyncResult | null = null;
   let uploadedFrames: ExtractedFrame[] = [];
   let frameUpload: { added: number; total: number } | null = null;
+  // Everything that went wrong WITHOUT costing the user the import. These ride
+  // out on a successful (exit 0) result — an agent must not read a missing
+  // frame as a failed import.
+  const warnings: ImportWarning[] = [];
+
+  /**
+   * The bundle outlives the run, and the warning envelope does not — so the
+   * verdict has to be written INTO the document. "Transcript-only because the
+   * words were enough" and "transcript-only because the frames failed" look
+   * identical on disk otherwise.
+   */
+  const completenessOf = (
+    classification: ServerClassification,
+    /** Frames that reached the DOCUMENT — not merely the local bundle. A failed
+     *  upload leaves the images on disk but the document still can't show them. */
+    attachedFrames = 0,
+  ): ArecCompleteness => {
+    const planned = classification.needsVisual ? classification.frameTimestampsMs.length : 0;
+    const missing = Math.max(0, planned - attachedFrames);
+    if (missing === 0) return { status: "complete" };
+    const cause = warnings[0];
+    return {
+      status: "incomplete",
+      missingFrames: missing,
+      ...(cause ? { reasonCode: cause.code, reason: cause.error } : {}),
+      rerunCommand: rerunCommand(target, opts),
+    };
+  };
 
   if (opts.sync) {
     // Phase 1: the transcript bundle goes up, the verdict comes back.
@@ -680,6 +846,17 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
         // Phase 2: fetch only the moments the server named.
         const { frames, workDir, failure } = await collectFrames(compiled, classification.frameTimestampsMs, opts);
         if (failure) {
+          warnings.push({
+            code: /403/.test(failure)
+              ? "ytdlp_download_403"
+              : /ffmpeg|ffprobe/i.test(failure)
+                ? "ffmpeg_missing"
+                : "frames_upload_failed",
+            error: `frames could not be extracted: ${failure.split("\n")[0]}`,
+            remediation: /ffmpeg|ffprobe/i.test(failure)
+              ? FFMPEG_INSTALL_COMMAND
+              : rerunCommand(target, opts),
+          });
           // Phase 1 already succeeded — this is a PARTIAL success, and saying
           // "failed" here would send the user hunting for a document that is
           // sitting in their library right now.
@@ -701,6 +878,11 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
                 `Frames attached ✓ — ${frameUpload.added} new (${frameUpload.total} on the document).`,
               );
             } catch (e) {
+              warnings.push({
+                code: "frames_upload_failed",
+                error: `the frames were cut but ${(e as Error).message}`,
+                remediation: rerunCommand(target, opts),
+              });
               // Same partial-success rule as a failed extraction: the document
               // exists, only the pictures are missing.
               notify(
@@ -712,6 +894,11 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
               uploadedFrames = frames;
             }
           } else if (frames.length > 0) {
+            warnings.push({
+              code: "frames_upload_failed",
+              error: "frames were extracted but the server returned no document id, so they were not uploaded.",
+              remediation: rerunCommand(target, opts),
+            });
             notify("frames were extracted but the server returned no document id, so they were not uploaded.");
           }
 
@@ -730,6 +917,8 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
                 ...(caption ? { caption } : {}),
               };
             }),
+            // frameUpload is set only when the server accepted them.
+            completenessOf(classification, frameUpload ? uploadedFrames.length : 0),
           );
           ({ path: bundlePath } = writeBundle(outputDir, compiled, uploadedFrames));
         } finally {
@@ -739,7 +928,7 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
 
       // Even with no frames, the verdict itself belongs in the bundle.
       if (uploadedFrames.length === 0) {
-        compiled = withVisualEvidence(compiled, classification, []);
+        compiled = withVisualEvidence(compiled, classification, [], completenessOf(classification));
         ({ path: bundlePath } = writeBundle(outputDir, compiled));
       }
     }
@@ -749,15 +938,22 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
     process.stdout.write(
       `${JSON.stringify(
         {
+          ok: true,
           bundlePath,
+          // The file an agent should actually open. Naming the directory alone
+          // makes every caller guess at the entry point.
+          contextPath: join(bundlePath, "recording.md"),
+          title: compiled.manifest.title,
           profile: compiled.manifest.profile,
           recommendedProfile: report?.recommendedProfile ?? null,
           overallScore: report?.overallScore ?? null,
           gapCount: report?.gaps.length ?? 0,
           ...(synced ? { synced: true, publicId: synced.publicId } : opts.sync ? { synced: false } : {}),
+          ...(synced?.folderName ? { folderName: synced.folderName } : {}),
           classification: synced?.classification ?? null,
           frames: uploadedFrames.length,
           ...(frameUpload ? { framesAdded: frameUpload.added, framesTotal: frameUpload.total } : {}),
+          warnings,
         },
         null,
         2,
@@ -765,6 +961,24 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
     );
     return;
   }
+
+  // The headline. A user who ran one command should not have to assemble "did
+  // it work, and where is it" out of four key-value lines.
+  process.stdout.write(`\nYour agent-ready context for ${JSON.stringify(compiled.manifest.title)} is ready.\n`);
+  process.stdout.write(
+    `  → local bundle: ${join(bundlePath, "recording.md")}  (point your agent here, or run: clipy context read ${bundlePath})\n`,
+  );
+  if (synced) {
+    process.stdout.write(
+      `  → in your Clipy library: filed under ${JSON.stringify(synced.folderName ?? "Knowledge Base")} — searchable, and readable by agents via MCP (read_context_document ${synced.publicId})\n`,
+    );
+  }
+  if (warnings.length > 0) {
+    process.stdout.write(
+      `  → incomplete: ${warnings.map((w) => w.error).join("; ")}\n     to finish it: ${warnings[0].remediation}\n`,
+    );
+  }
+  process.stdout.write("\n");
 
   process.stdout.write(`bundle: ${bundlePath}${rewritten ? " (rewritten — source content changed)" : ""}\n`);
   if (synced?.classification) {
@@ -797,5 +1011,4 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
       `synced: ${synced.publicId} (private — only you can read it${synced.folderName ? `, filed in ${synced.folderName}` : ""})\n`,
     );
   }
-  process.stdout.write(`next: clipy context read ${bundlePath}\n`);
 }

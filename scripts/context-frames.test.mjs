@@ -48,7 +48,8 @@ const CLASSIFICATION = {
 };
 
 /** Runs the CLI against a fresh mock server; returns what the server saw. */
-async function run(extraArgs, outDir) {
+async function run(extraArgs, outDir, opts = {}) {
+  const classification = opts.classification ?? CLASSIFICATION;
   const seen = { create: null, frames: null };
   const server = createServer((req, res) => {
     let body = "";
@@ -58,11 +59,16 @@ async function run(extraArgs, outDir) {
       if (req.url === "/api/v1/context-documents") {
         seen.create = { body: parsed, auth: req.headers.authorization };
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ id: "ctx_1", publicId: "abc123", created: true, classification: CLASSIFICATION }));
+        res.end(JSON.stringify({ id: "ctx_1", publicId: "abc123", created: true, classification }));
         return;
       }
       if (req.url === "/api/v1/context-documents/ctx_1/frames") {
         seen.frames = { body: parsed, auth: req.headers.authorization };
+        if (opts.failFrames) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "frame storage is down" }));
+          return;
+        }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ added: parsed.frames.length, total: parsed.frames.length }));
         return;
@@ -168,4 +174,66 @@ const skipManifest = JSON.parse(readFileSync(join(skipOut.bundlePath, "manifest.
 assert.equal(skipManifest.serverClassification.videoType, "tutorial");
 assert.equal(skipManifest.frames, undefined);
 
-process.stdout.write("✓ two-phase visual pipeline: moment plan, frame upload + captions, bundle regeneration, --no-frames\n");
+// A complete bundle must not cry incomplete.
+assert.ok(!md.includes("## Incomplete"), "a bundle with all its frames must not claim to be incomplete");
+
+// --- an incomplete bundle says so IN the document --------------------------
+
+// The warning envelope is gone by the next session, so recording.md itself has
+// to carry "what is missing" and "how to finish it".
+const failDir = mkdtempSync(join(tmpdir(), "clipy-frames-fail-"));
+const failed = await run([], failDir, { failFrames: true });
+assert.equal(failed.status, 0, "a frames failure is a PARTIAL success, not a failure");
+
+const failOut = JSON.parse(failed.stdout);
+const failBundle = failOut.bundlePath;
+const failMd = readFileSync(join(failBundle, "recording.md"), "utf8");
+const failManifest = JSON.parse(readFileSync(join(failBundle, "manifest.json"), "utf8"));
+
+assert.equal(failManifest.completeness.status, "incomplete");
+assert.equal(failManifest.completeness.missingFrames, 2, "both planned frames are missing");
+assert.equal(failManifest.completeness.reasonCode, "frames_upload_failed");
+assert.match(failManifest.completeness.rerunCommand, /^clipy context import /);
+
+assert.ok(failMd.includes("## Incomplete"), "recording.md must carry an Incomplete section");
+// Near the top: after the title, before the metadata a reader would act on.
+assert.ok(
+  failMd.indexOf("## Incomplete") < failMd.indexOf("## Metadata"),
+  "the Incomplete section must come before the metadata, not be buried",
+);
+assert.match(failMd, /2 frames the classifier asked for were not captured/);
+assert.match(failMd, /\(`frames_upload_failed`\)/, "the stable error code belongs in the document");
+assert.match(failMd, /the transcript, the metadata, and the server classification below/);
+assert.ok(
+  failMd.includes(failManifest.completeness.rerunCommand),
+  "the verbatim re-run command must be in the document",
+);
+assert.match(failMd, /idempotent/, "the reader must know re-running will not duplicate the document");
+
+// --- transcript-only BY DESIGN reads differently ---------------------------
+
+const gateDir = mkdtempSync(join(tmpdir(), "clipy-frames-gate-"));
+const gated = await run([], gateDir, {
+  classification: {
+    videoType: "interview",
+    videoTypeConfidence: 0.88,
+    needsVisual: false,
+    frameTimestampsMs: [],
+    model: "test-planner",
+  },
+});
+assert.equal(gated.status, 0);
+const gateBundle = JSON.parse(gated.stdout).bundlePath;
+const gateMd = readFileSync(join(gateBundle, "recording.md"), "utf8");
+const gateManifest = JSON.parse(readFileSync(join(gateBundle, "manifest.json"), "utf8"));
+
+assert.equal(gateManifest.completeness.status, "complete", "no frames were planned, so nothing is missing");
+assert.ok(!gateMd.includes("## Incomplete"), "a by-design transcript-only bundle is NOT incomplete");
+assert.match(
+  gateMd,
+  /transcript-only BY DESIGN/,
+  "the document must say the words were judged sufficient",
+);
+assert.match(gateMd, /do not re-run this import/, "an agent must be told not to 'complete' a finished bundle");
+
+process.stdout.write("✓ two-phase visual pipeline: moment plan, frame upload + captions, --no-frames, incomplete vs by-design\n");

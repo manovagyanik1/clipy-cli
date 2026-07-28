@@ -5,6 +5,7 @@
  */
 
 import type {
+  ArecCompleteness,
   ArecManifest,
   ContextProfile,
   ContextSource,
@@ -56,6 +57,16 @@ function mdInline(raw: string): string {
     .trim();
 }
 
+/**
+ * For text going INSIDE a code span, where mdInline is exactly wrong: it strips
+ * `_`, `*` and `[]`, which silently corrupts an error code or a shell command
+ * the reader is meant to copy. A code span only has to survive its own fence,
+ * so backticks and newlines are the only things that need removing.
+ */
+function mdCode(raw: string): string {
+  return raw.replace(/[\r\n]+/g, ' ').replace(/`/g, '').trim();
+}
+
 export interface BuildManifestInput {
   title: string;
   source: ContextSource;
@@ -66,6 +77,7 @@ export interface BuildManifestInput {
   sufficiency?: SufficiencyReport;
   serverClassification?: ServerClassification;
   frames?: ManifestFrame[];
+  completeness?: ArecCompleteness;
   createdAt?: string;
 }
 
@@ -88,6 +100,7 @@ export function buildManifest(input: BuildManifestInput): ArecManifest {
       ? { serverClassification: input.serverClassification }
       : {}),
     ...(input.frames && input.frames.length ? { frames: input.frames } : {}),
+    ...(input.completeness ? { completeness: input.completeness } : {}),
     createdAt: input.createdAt ?? new Date().toISOString(),
   };
 }
@@ -106,6 +119,8 @@ const GAP_REASON_TEXT: Record<VisualGapReason, string> = {
 const TRANSCRIPT_SOURCE_TEXT: Record<NormalizedTranscript['source'], string> = {
   creator_captions: 'creator-provided captions',
   auto_captions: 'provider auto-generated captions',
+  auto_captions_translated:
+    'provider auto-generated captions, machine-translated from another language',
   user_file: 'a caption file supplied by the user',
   local_stt: 'local speech-to-text on the user’s machine',
 };
@@ -129,6 +144,48 @@ export function renderArecMarkdown(
   lines.push('');
   lines.push(`# ${mdInline(manifest.title) || 'Untitled recording'}`);
   lines.push('');
+
+  // Directly under the title, before anything a reader might act on: a bundle
+  // that is missing evidence must say so where nobody can miss it, and a bundle
+  // that is transcript-only ON PURPOSE must say THAT — otherwise the two are
+  // indistinguishable on disk and an agent re-runs a finished import, or trusts
+  // an unfinished one.
+  const completeness = manifest.completeness;
+  if (completeness && completeness.status === 'incomplete') {
+    lines.push('## Incomplete');
+    lines.push('');
+    lines.push(
+      `**This bundle is missing visual evidence.** ${
+        completeness.missingFrames
+          ? `${completeness.missingFrames} frame${completeness.missingFrames === 1 ? '' : 's'} the classifier asked for ${completeness.missingFrames === 1 ? 'was' : 'were'} not captured`
+          : 'Frames the classifier asked for were not captured'
+      }${completeness.reasonCode ? ` (\`${mdCode(completeness.reasonCode)}\`)` : ''}.`
+    );
+    lines.push('');
+    if (completeness.reason) {
+      lines.push(`- Why: ${mdInline(completeness.reason)}`);
+    }
+    lines.push(
+      '- Still complete and usable: the transcript, the metadata, and the server classification below. Read them normally.'
+    );
+    if (completeness.rerunCommand) {
+      lines.push(
+        `- To complete this bundle, re-run exactly: \`${mdCode(completeness.rerunCommand)}\``
+      );
+      lines.push(
+        '  Imports are idempotent — this fills in what is missing rather than creating a second document.'
+      );
+    }
+    lines.push('');
+  } else if (
+    manifest.serverClassification &&
+    !manifest.serverClassification.needsVisual
+  ) {
+    lines.push(
+      '> This bundle is transcript-only BY DESIGN: the classifier judged the words sufficient on their own, so no frames were planned. Nothing is missing — do not re-run this import to "complete" it.'
+    );
+    lines.push('');
+  }
 
   lines.push('## Metadata');
   lines.push('');

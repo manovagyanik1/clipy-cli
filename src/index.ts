@@ -30,6 +30,8 @@ import { CLIPY_SKILL_MD } from "./skill.js";
 import { browserLogin, shouldUseManualLogin, type BrowserLoginResult } from "./browserLogin.js";
 import { cmdContextImport } from "./context/importCmd.js";
 import { cmdContextRead } from "./context/readCmd.js";
+import { errorEnvelope } from "./context/errors.js";
+import { supportsWebp } from "./context/ffmpeg.js";
 import {
   BridgeUnavailableError,
   bridgeRequest,
@@ -511,6 +513,14 @@ ${c.bold("GLOBAL FLAGS")}
 
 ${c.bold("EXIT CODES")}
   0 ok · 1 error · 2 usage · 3 artifact not ready (transcript/summary/wait)
+
+  A PARTIAL success exits 0. On ${c.bold("context import")}, a transcript that synced
+  with its frames missing is exit 0 with a "warnings" array — the document is in
+  your library and readable. Do not treat it as a failure.
+
+  With --json, ${c.bold("every")} outcome is exactly one JSON object on stdout, including
+  failures: {"ok":false,"code":"<stable_code>","error":"…","remediation":"…",
+  "partial":null}. Branch on "code" (stable), never on the message text.
 
 ${c.bold("SETUP")}
   1. ${c.bold("clipy login")}                approve this device in your browser
@@ -1194,6 +1204,181 @@ async function doctorPlaywrightCheck(): Promise<DoctorCheck> {
   };
 }
 
+// --- context prerequisites -------------------------------------------------
+// `clipy context import` needs yt-dlp (YouTube resolution) and ffmpeg/ffprobe
+// (probing + frame extraction), and both fail LATE — after the user has already
+// been told an import is running. Doctor probes them up front so an agent can
+// see the missing piece before it hits ytdlp_missing / ffmpeg_missing. These
+// probes deliberately do NOT auto-install: doctor is read-only, and a health
+// check that silently downloads a binary is a health check nobody can trust.
+
+/** Locate a context tool without installing it: Clipy's managed bin dir first
+ *  (where the auto-installer puts it), then PATH. */
+function findContextTool(names: readonly string[]): { path: string; source: "managed" | "path" } | null {
+  const managedDir = join(homedir(), ".clipy", "bin");
+  for (const name of names) {
+    const candidate = join(managedDir, name);
+    if (existsSync(candidate)) return { path: candidate, source: "managed" };
+  }
+  const sep = process.platform === "win32" ? ";" : ":";
+  for (const dir of (process.env.PATH ?? "").split(sep)) {
+    if (!dir) continue;
+    for (const name of names) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) return { path: candidate, source: "path" };
+    }
+  }
+  return null;
+}
+
+/** Run `<bin> <args>` and capture stdout, with a short timeout. Never throws. */
+function probeToolOutput(bin: string, args: string[], timeoutMs = 8000): Promise<string | null> {
+  return new Promise((resolveOut) => {
+    let out = "";
+    let settled = false;
+    const finish = (value: string | null) => {
+      if (settled) return;
+      settled = true;
+      resolveOut(value);
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    } catch {
+      finish(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(null);
+    }, timeoutMs);
+    child.stdout?.on("data", (d) => {
+      out += String(d);
+    });
+    child.stderr?.on("data", (d) => {
+      out += String(d);
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      finish(null);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      finish(code === 0 ? out : out || null);
+    });
+  });
+}
+
+async function doctorYtDlpCheck(): Promise<DoctorCheck> {
+  const names = process.platform === "win32" ? ["yt-dlp.exe"] : ["yt-dlp", "yt-dlp_macos"];
+  const found = findContextTool(names);
+  if (!found) {
+    return {
+      name: "yt-dlp",
+      status: "warn",
+      detail: "not installed — `clipy context import <youtube-url>` cannot resolve YouTube yet",
+      hint: "Clipy auto-installs it into ~/.clipy/bin on first use; to pre-install run `brew install yt-dlp` (macOS), `pipx install yt-dlp`, or `python3 -m pip install -U yt-dlp`",
+      data: { present: false, path: null, version: null },
+    };
+  }
+  const raw = await probeToolOutput(found.path, ["--version"]);
+  const version = raw?.trim().split(/\s+/)[0] ?? null;
+  return {
+    name: "yt-dlp",
+    status: version ? "pass" : "warn",
+    detail: version
+      ? `${version} at ${found.path} (${found.source === "managed" ? "Clipy-managed" : "on PATH"})`
+      : `found at ${found.path} but it did not answer --version`,
+    ...(version
+      ? {}
+      : { hint: "the binary may be corrupt or blocked — delete it and let Clipy reinstall, or reinstall it yourself" }),
+    data: { present: true, path: found.path, source: found.source, version },
+  };
+}
+
+async function doctorFfmpegChecks(): Promise<DoctorCheck[]> {
+  const out: DoctorCheck[] = [];
+  const exe = (n: string) => (process.platform === "win32" ? `${n}.exe` : n);
+  const hint =
+    process.platform === "darwin"
+      ? "brew install ffmpeg"
+      : process.platform === "win32"
+        ? "winget install Gyan.FFmpeg"
+        : "sudo apt install ffmpeg";
+
+  const ffmpeg = findContextTool([exe("ffmpeg")]);
+  const ffprobe = findContextTool([exe("ffprobe")]);
+  if (!ffmpeg || !ffprobe) {
+    const missing = [!ffmpeg ? "ffmpeg" : null, !ffprobe ? "ffprobe" : null].filter(Boolean).join(" + ");
+    out.push({
+      name: "ffmpeg",
+      status: "warn",
+      detail: `${missing} not found — context imports can produce a transcript but NOT frames`,
+      hint,
+      data: { ffmpeg: ffmpeg?.path ?? null, ffprobe: ffprobe?.path ?? null },
+    });
+    return out;
+  }
+  const raw = await probeToolOutput(ffmpeg.path, ["-version"]);
+  const version = raw?.match(/ffmpeg version (\S+)/)?.[1] ?? null;
+  out.push({
+    name: "ffmpeg",
+    status: "pass",
+    detail: `${version ?? "present"} at ${ffmpeg.path} (ffprobe at ${ffprobe.path})`,
+    data: { ffmpeg: ffmpeg.path, ffprobe: ffprobe.path, version },
+  });
+
+  // Frames prefer WebP but fall back to JPEG, so a missing libwebp is INFO, not
+  // a failure — reported anyway so nobody reads "image/jpeg" in a manifest and
+  // wonders whether something went wrong.
+  const webp = await supportsWebp(ffmpeg.path);
+  out.push({
+    name: "ffmpeg webp",
+    status: webp ? "pass" : "info",
+    detail: webp
+      ? "libwebp encoder available — frames extract as WebP"
+      : "no libwebp encoder in this build — frames extract as JPEG instead (slightly larger, same content)",
+    ...(webp ? {} : { hint: `harmless; for WebP frames install a build with libwebp (${hint})` }),
+    data: { webp, frameFormat: webp ? "webp" : "jpeg" },
+  });
+  return out;
+}
+
+/** API reachability, independent of whether a key exists — `auth` can only
+ *  report "unreachable" when there is a key to send. */
+async function doctorApiCheck(ctx: Ctx): Promise<DoctorCheck> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const started = Date.now();
+  try {
+    const res = await fetch(`${ctx.apiUrl}/api/health`, {
+      headers: { Accept: "application/json", "User-Agent": `clipy-cli/${VERSION}` },
+      signal: controller.signal,
+    });
+    const ms = Date.now() - started;
+    return {
+      name: "api",
+      status: res.ok ? "pass" : "warn",
+      detail: res.ok
+        ? `${ctx.apiUrl} reachable (${ms}ms)`
+        : `${ctx.apiUrl} answered HTTP ${res.status}`,
+      ...(res.ok ? {} : { hint: "the service may be degraded — --sync imports and all read commands will fail until it recovers" }),
+      data: { apiUrl: ctx.apiUrl, status: res.status, latencyMs: ms },
+    };
+  } catch (e) {
+    const message = (e as Error).name === "AbortError" ? "request timed out" : (e as Error).message;
+    return {
+      name: "api",
+      status: "fail",
+      detail: `${ctx.apiUrl} unreachable: ${message}`,
+      hint: "check your connection or CLIPY_API_URL — local (non --sync) context imports still work and stay readable with `clipy context read`",
+      data: { apiUrl: ctx.apiUrl, reachable: false },
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function doctorInstallCheck(): DoctorCheck {
   const { mode, argv1 } = detectInstallMode();
   const label: Record<InstallMode, string> = {
@@ -1232,9 +1417,12 @@ function doctorGlyph(status: CheckStatus): string {
 
 async function cmdDoctor(ctx: Ctx, json: boolean): Promise<void> {
   const checks: DoctorCheck[] = [
+    await doctorApiCheck(ctx),
     await doctorAuthCheck(ctx),
     ...(await doctorBridgeChecks()),
     await doctorPlaywrightCheck(),
+    await doctorYtDlpCheck(),
+    ...(await doctorFfmpegChecks()),
     doctorInstallCheck(),
   ];
   const failed = checks.filter((chk) => chk.status === "fail").length;
@@ -4826,7 +5014,33 @@ async function cmdAgents(
 // contract changes.
 // ---------------------------------------------------------------------------
 
-const GUIDE_SCHEMA_VERSION = 11;
+const GUIDE_SCHEMA_VERSION = 12;
+
+/** The stable machine-readable failure taxonomy carried in `--json` error
+ *  envelopes. Codes are the contract; messages are not. Published through the
+ *  guide so an agent discovers the full recovery table without the skill. */
+const GUIDE_ERROR_CODES: ReadonlyArray<{
+  code: string;
+  meaning: string;
+  retryable: boolean;
+  remediation: string;
+}> = [
+  { code: "invalid_url", meaning: "the URL is not a video Clipy can resolve", retryable: false, remediation: "re-read the URL with the user; retrying the same string cannot help" },
+  { code: "no_captions", meaning: "the YouTube video publishes no captions in any language", retryable: false, remediation: "there is nothing to transcribe from — import a local file with --transcript <.vtt|.srt|json>, or proceed without the video" },
+  { code: "ytdlp_missing", meaning: "yt-dlp could not be resolved or auto-installed", retryable: true, remediation: "let Clipy auto-install it into ~/.clipy/bin, or install it yourself (brew install yt-dlp / pipx install yt-dlp), then re-run; `clipy doctor --json` reports the path it tried" },
+  { code: "ytdlp_download_403", meaning: "YouTube refused the media download (frames could not be extracted)", retryable: false, remediation: "the CLI already retried internally — do NOT loop. If the transcript synced, the import is usable: report frames as pending and re-run the same command later" },
+  { code: "ffmpeg_missing", meaning: "ffmpeg/ffprobe is not installed or not on PATH", retryable: true, remediation: "brew install ffmpeg (macOS) / sudo apt install ffmpeg (Linux) / winget install Gyan.FFmpeg, then re-run the same command" },
+  { code: "no_video_stream", meaning: "the file carries no decodable video track", retryable: false, remediation: "audio-only source — import transcript-only with --no-frames, or supply the real video file" },
+  { code: "auth_required", meaning: "HTTP 401 — no API key, or the key is invalid/revoked", retryable: true, remediation: "run `clipy login` and WAIT for the user to approve the device in the browser it opens (`clipy login --no-browser` on headless hosts); retry only after login returns" },
+  { code: "wrong_scope", meaning: "HTTP 403 — the key is valid but lacks a required permission", retryable: false, remediation: "write paths need the 'ingest' scope — mint a key carrying it at /settings/api-keys; re-running with the same key cannot help" },
+  { code: "quota_exceeded", meaning: "HTTP 429 — the account hit a plan or rate limit", retryable: false, remediation: "report the quota to the user and STOP; a retry loop only burns the limit. Any local bundle already produced remains readable" },
+  { code: "frames_upload_failed", meaning: "the transcript synced but the frames did not", retryable: true, remediation: "PARTIAL SUCCESS, not a failure — the document exists and is readable. Re-run the SAME import command later to complete it; never re-import from scratch" },
+  { code: "server_unreachable", meaning: "the Clipy API could not be reached", retryable: true, remediation: "check `clipy doctor --json`'s api check; a local (non --sync) bundle is still complete and readable with `clipy context read`" },
+  { code: "transcript_unreadable", meaning: "the --transcript file could not be parsed", retryable: false, remediation: "confirm it is a real .vtt/.srt/Clipy transcript JSON and not empty or an HTML error page; ask the user for the right file rather than guessing another path" },
+  { code: "source_unreadable", meaning: "the local video file could not be opened or probed", retryable: false, remediation: "verify the path exists and is readable (unmounted volume, still downloading, wrong container) — not retryable until the file is" },
+  { code: "content_conflict", meaning: "a different video already occupies that document", retryable: false, remediation: "do NOT overwrite — show the user both and let them choose; re-running unchanged conflicts again" },
+  { code: "unknown", meaning: "an unclassified failure", retryable: true, remediation: "re-run once; if it repeats, hand the user the whole envelope as a bug report rather than improvising a workaround" },
+];
 
 function cmdGuide(json: boolean): void {
   if (!json) {
@@ -4848,9 +5062,14 @@ function cmdGuide(json: boolean): void {
       "Clipy (clipy.online) command line: read your screen recordings' transcripts/summaries/key moments, and record web apps headlessly (one-shot or live session with timestamped marks).",
     outputConvention: {
       jsonFlag: "--json",
-      stdout: "primary results (JSON when --json is set)",
-      stderr: "progress + human hints; never JSON",
-      errors: "exit non-zero with a message on stderr prefixed 'error:'",
+      stdout: "primary results (JSON when --json is set) — THE SOURCE OF TRUTH",
+      stderr: "progress, warnings, and install disclosures; narration only, never part of the contract, never JSON. Do not parse it and do not infer success or failure from it.",
+      errors:
+        "exit non-zero with a message on stderr prefixed 'error:'. Under --json, `context import` prints exactly ONE object on stdout either way: a failure is {ok:false, code, error, remediation, partial} — branch on `code` (stable, see errorCodes), never on `error` text; `remediation` is the next action, written to be run verbatim where possible; `partial` holds whatever survived (e.g. {bundlePath}) or null.",
+      success:
+        "{ok:true, …} always carries a `warnings` array — empty when nothing went wrong. A PARTIAL success (transcript synced, frames missing) is ok:true with entries in `warnings`, each {code, error, remediation}, and exits 0. Read the warnings; do not read them as failure.",
+      neverInventSuccess:
+        "If no readable result was printed, the work did not happen. Never report an import, recording, or frame capture as done because the command appeared to run.",
     },
     env: [
       { name: "CLIPY_API_KEY", description: "API key (clipy_sk_live_…) from clipy.online/settings/api-keys; write commands need the 'ingest' scope" },
@@ -4865,6 +5084,16 @@ function cmdGuide(json: boolean): void {
       { code: 2, meaning: "usage error" },
       { code: 3, meaning: "artifact not ready yet (transcript/summary/wait)" },
     ],
+    errorCodes: GUIDE_ERROR_CODES,
+    partialSuccess: {
+      rule: "A context import whose transcript synced but whose frames did not is a USABLE RESULT, not a failure. The document exists, is readable, and answers most questions.",
+      recover:
+        "Re-run the SAME `clipy context import` command on the SAME source. Imports are idempotent: the rerun resolves to the same document and fills in what is missing.",
+      never:
+        "Never re-import from scratch (new title, new --output, 'a fresh one') and never delete the partial document before retrying — that duplicates it and recovers nothing.",
+      tellTheUser:
+        "Say plainly: imported and readable, frames pending, and which timestamps are affected (the classifier already names them in the bundle's sufficiency report).",
+    },
     commands: [
       cmdDoc("login", "clipy login [--no-browser] [--key <key>] [--paste]", "Approve this device in the browser (default). --no-browser (auto-detected on SSH and display-less Linux) prints the approval URL to open on any device and prompts for the code it shows. --key/--paste store a pasted key (also the automatic path when stdout is not a TTY)", ["--no-browser", "--key <key>", "--paste"]),
       cmdDoc("logout", "clipy logout", "Delete the stored key"),
@@ -4880,9 +5109,9 @@ function cmdGuide(json: boolean): void {
         "context import",
         "clipy context import <youtube-url|local-file> [--transcript <f>] [--output <dir>] [--language <code>] [--title <t>] [--tag <t>]… [--folder <name>] [--sync] [--json]",
         "Compile ANY video into a local Clipy context bundle — a directory holding recording.md (the agent-facing document, with the untrusted-content warning and [MM:SS] transcript sections), manifest.json (provenance, versions, sufficiency report) and transcript.json. YouTube URLs resolve on YOUR machine via a Clipy-managed yt-dlp (auto-installed into ~/.clipy/bin on first use, with a disclosure); creator captions are preferred over auto-captions and NO media is downloaded. Local files need --transcript <.vtt|.srt|Clipy transcript JSON> and are probed with ffprobe. A deterministic classifier scores how well the transcript stands alone and lists the timestamps where it is blind — v1 emits the transcript profile only, so those gaps are the honest statement of what the bundle cannot show. Reruns over the same source are idempotent. --sync additionally uploads the DERIVED bundle (never source media) to your private library.",
-        ["--transcript", "--output", "--language", "--title", "--tag", "--folder", "--sync", "--json"],
+        ["--transcript", "--output", "--language", "--title", "--tag", "--folder", "--sync", "--no-frames", "--json"],
       ),
-      cmdDoc("context read", "clipy context read <bundle-path>", "Print a local bundle's recording.md to stdout — plain, unpaged, uncoloured, for an agent to read directly."),
+      cmdDoc("context read", "clipy context read <bundle-path>", "Print a local bundle's recording.md to stdout — plain, unpaged, uncoloured, for an agent to read directly. It opens with a self-describing header (source, duration, classification, sufficiency, untrusted-content warning) before the [MM:SS] transcript sections, so the first screen tells you what the document is and where it is blind. For a SYNCED document read it over MCP instead: get_context_document for metadata+classification without the transcript, then read_context_document with startMs/endMs for just the span you need."),
       cmdDoc("download", "clipy download <id> [-o path]", "Download the MP4"),
       cmdDoc("open", "clipy open <id>", "Open the share page in a browser"),
       cmdDoc("wait", "clipy wait <id> [--for transcript|summary|both] [--timeout sec]", "Block until artifacts are ready"),
@@ -4890,7 +5119,7 @@ function cmdGuide(json: boolean): void {
       cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen] [--window w] [--display d] [--expose-cdp] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). --window/--display (with --source mac-screen) record one window/display. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code — the crash-safe wrapper so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). `session run` exports CLIPY_SESSION_FILE to the child so mark/chapter resolve the session from any cwd. --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--expose-cdp", "--storage-state", "--user-data-dir", "--profile-directory", "--cookie", "--local-storage", "--init-script", "--json"]),
       cmdDoc("mark", "clipy mark \"<text>\" [--observed \"<values>\" --verdict pass|fail] [--assert-selector <css> [--assert-text <substr>]] [--assert-url <glob>] [--fail-mode warn|abort] [--at <sec>|--ago <sec>] [--json]", "Drop a live-timestamped note into the active session. A mark carries at most ONE evidence provenance, and the two are labeled + tallied separately so they can never be pooled. DRIVER-ATTESTED (--observed '<values>' --verdict pass|fail, both required together): you drove the browser and report what YOU observed — renders '<text> [≈ ASSERT driver-attested; observed=<values>]' (pass) / '<text> [≈ FAILED driver-attested; observed=<values>]' (fail) — a HEDGE glyph, never ✓/✗, so a skim distinguishes provenance by shape alone and works in EVERY session type including --source mac-screen. Honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it — put real observed values there. Combining --observed/--verdict with --assert-* is a usage error. CLIPY-VERIFIED assertion marks (Clipy-owned page only) make the note evidence Clipy itself checked: --assert-selector checks a CSS selector matches (its trimmed textContent is recorded as 'observed'); --assert-text requires that element's text to contain a substring (needs --assert-selector); --assert-url matches the page URL against a glob (** = any, * = any non-slash, no * = substring). The daemon evaluates against its live page and annotates the mark: pass ⇒ '<text> [assert ✓ verified-by-clipy; <observed>]', fail ⇒ '<text> [ASSERT ✗ verified-by-clipy; expected …; observed …]' — a false claim cannot read as fact. --fail-mode warn (default) records the ✗; --fail-mode abort DISCARDS the whole session on a failed assertion (no upload) and the CLI exits non-zero. If any assertion was attempted, a leading 0ms [verification] note is prepended, reporting the provenances as SEPARATE segments: '[verification] N clipy-verified: P passed, F failed, K unverified · M driver-attested: P passed, F failed' (a segment is omitted when empty; with only clipy-verified marks the legacy 'N assertion(s): …' rendering is byte-identical). --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now (mutually exclusive). Assertions/backdating need a web session (rejected on --source mac-screen). Up to 200 marks per recording.", ["--observed", "--verdict", "--assert-selector", "--assert-text", "--assert-url", "--fail-mode", "--at", "--ago", "--json"]),
       cmdDoc("chapter", "clipy chapter \"<label>\" [--json]", "Mark a BEFORE/AFTER section boundary in the active recording (stored as '=== CHAPTER: <label> ==='). The PR-review shape: demo the base branch, run `clipy chapter \"AFTER — fix applied\"`, swap branches + restart the dev server, demo the fix — one video carrying both states. Works on web + --source mac-screen sessions.", ["--json"]),
-      cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails", ["--json"]),
+      cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API reachability (GET /api/health, with latency), API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), the CONTEXT-IMPORT prerequisites (yt-dlp presence/path/version, ffmpeg + ffprobe presence/version, and whether that ffmpeg has the libwebp encoder frames need), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails. Read-only: it never installs anything, so a missing yt-dlp/ffmpeg reports WARN with the install command rather than silently downloading a binary. Run it first whenever a context import or a recording fails — it names the missing piece behind ytdlp_missing / ffmpeg_missing / auth_required / server_unreachable instead of leaving you to guess.", ["--json"]),
       cmdDoc("playwright-path", "clipy playwright-path [--json]", "Print the node_modules directory of the Playwright this CLI resolves, so your own --expose-cdp driver scripts can load the same copy: NODE_PATH=$(clipy playwright-path) node driver.js. Exits 1 (empty stdout) if Playwright is unresolvable. --json prints {path, nodeModulesDir, source}", ["--json"]),
       cmdDoc("sources", "clipy sources [--json]", "List displays + windows the Clipy Mac app can capture — ids feed --window/--display. --json gives each entry a `source` {kind,id,title} in the SAME shape session start/record report for the resolved capture, so a caller can compare what it picked against what the camera reports without transforming either."),
       cmdDoc("agents", "clipy agents <status|install|uninstall> <claude|codex|cursor>", "Install the bundled Clipy skill for a coding agent; install triggers a browser login first when no key is configured (interactive terminals only)"),
@@ -4919,6 +5148,9 @@ function cmdGuide(json: boolean): void {
       "clipy record gates its capture clock on the first non-blank frame (up to a 10s cap, then starts anyway) so notes aren't anchored to a still-compiling t=0.",
       "Run `clipy doctor` first when record/session or --source mac-screen fails — it names the exact missing piece (key, bridge socket/handshake/version, Playwright, install mode).",
       "Public recordings have an unauthenticated context document at https://clipy.online/video/<id>.md.",
+      "READING AN IMPORT WITHOUT DROWNING IN IT. Imported videos are often an hour or more, so read in widening passes rather than pulling the whole document. (1) Metadata + classification first — `clipy context read` opens with the self-describing header (source, duration, video type, whether the words stand alone, and the timestamps the classifier flagged as blind); over MCP `get_context_document` returns exactly that WITHOUT the transcript, the cheapest possible orientation. (2) Then the targeted span — the document is sectioned in [MM:SS] blocks and MCP `read_context_document` takes startMs/endMs, returning only overlapping sections (and reporting how many it withheld), so a two-hour video costs two minutes of context. (3) Frames LAST, and only at the timestamps the classifier said the transcript cannot carry. Whole-document reads are for short videos (~under 10 minutes) or when you genuinely need every word.",
+      "FAILURE RECOVERY. Under --json every command's error is a stable-code envelope {ok:false, error:{code,message,hint}} — see errorCodes for the full table with per-code remediation. The three an agent actually hits: auth_required (401) ⇒ run `clipy login` and WAIT for the user to approve in the browser it opens, saying out loud that you are waiting (a silently blocking agent looks hung); quota_exceeded (429) ⇒ report the limit to the user and STOP, never retry-loop; ytdlp_download_403 ⇒ the CLI already retried internally, so treat the import as done-but-incomplete, tell the user frames are pending, and move on with the transcript. When you cannot tell which state you are in, run `clipy doctor --json` — it reports yt-dlp, ffmpeg, auth, and API reachability in one call.",
+      "PARTIAL SUCCESS IS SUCCESS. A context import whose transcript synced while frames failed produces a real, readable document. Complete it by re-running the SAME import command on the SAME source (imports are idempotent and resolve to the same document); never re-import from scratch and never delete the partial first — see partialSuccess.",
     ],
   });
 }
@@ -5202,7 +5434,18 @@ async function main(): Promise<void> {
             json,
           });
         } catch (e) {
-          die((e as Error).message);
+          // With --json, a failure is still exactly one JSON object on stdout —
+          // an agent must never have to parse prose off stderr to learn what
+          // went wrong.
+          const envelope = errorEnvelope(e);
+          if (json) {
+            process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
+            process.exit(1);
+          }
+          process.stderr.write(
+            `${c.red("error:")} ${envelope.error as string}\n  to fix: ${envelope.remediation as string}\n`,
+          );
+          process.exit(1);
         }
         return;
       }

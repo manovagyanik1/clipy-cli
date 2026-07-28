@@ -8,14 +8,24 @@
  */
 
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import { MAX_ATTEMPTS, RETRY_BACKOFF_MS, classifyFailure, isRetriable, retryNotice, sleep } from "./retry.js";
 import { pipeline } from "node:stream/promises";
 import { createWriteStream } from "node:fs";
 
-const RELEASE_BASE = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
+/**
+ * NIGHTLY, not stable. yt-dlp's own README calls stable "often stale and prone
+ * to external breakage" and names nightly "the recommended channel for regular
+ * users" — and YouTube-side breakage in 2026 has repeatedly been fixed the same
+ * week it appeared. A stable pin means shipping known-broken extraction for
+ * weeks. See docs/research/2026-07-29-ytdlp-403-fallbacks.md §4.
+ */
+const RELEASE_BASE = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download";
+/** Past this, our managed copy is refreshed before it is used. */
+const MAX_BINARY_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const STDERR_CAP = 16_384;
 
 export function clipyBinDir(): string {
@@ -129,10 +139,54 @@ async function install(notify: (msg: string) => void): Promise<string> {
 
 let cached: string | null = null;
 
+/**
+ * Refreshes OUR copy if it has gone stale.
+ *
+ * Deliberately never touches a yt-dlp the user installed themselves: `-U` on a
+ * Homebrew or pipx binary either fails or fights the package manager, and
+ * either way it is not ours to modify. Failure here is always swallowed — a
+ * stale binary might still work, and an unreachable GitHub must not block an
+ * import that would otherwise succeed.
+ */
+async function refreshManagedBinary(bin: string, notify: (msg: string) => void): Promise<void> {
+  if (bin !== managedPath()) return;
+  let age: number;
+  try {
+    age = Date.now() - statSync(bin).mtimeMs;
+  } catch {
+    return;
+  }
+  if (age < MAX_BINARY_AGE_MS) return;
+
+  notify(
+    `Your yt-dlp copy is ${Math.floor(age / (24 * 60 * 60 * 1000))} days old — updating it (YouTube breaks extraction often; this is Clipy's own copy, not a system install)…`,
+  );
+  try {
+    const res = await run(bin, ["-U"], 120_000);
+    notify(
+      res.code === 0
+        ? "yt-dlp is up to date."
+        : "yt-dlp could not update itself — continuing with the copy you have.",
+    );
+  } catch {
+    notify("yt-dlp could not update itself — continuing with the copy you have.");
+  }
+  // Stamp it either way: a failed check should not be retried on every import.
+  try {
+    const now = new Date();
+    utimesSync(bin, now, now);
+  } catch {
+    // Best effort.
+  }
+}
+
 export async function resolveYtDlp(notify: (msg: string) => void): Promise<string> {
   if (cached) return cached;
   const managed = managedPath();
-  if (existsSync(managed)) return (cached = managed);
+  if (existsSync(managed)) {
+    await refreshManagedBinary(managed, notify);
+    return (cached = managed);
+  }
   const found = onPath();
   if (found) return (cached = found);
   return (cached = await install(notify));
@@ -184,8 +238,29 @@ export async function fetchVideoMeta(bin: string, url: string): Promise<YoutubeM
 export interface FetchedCaptions {
   format: "json3" | "vtt";
   text: string;
-  source: "creator_captions" | "auto_captions";
+  source: "creator_captions" | "auto_captions" | "auto_captions_translated";
+  /** The real language of the text, e.g. "hi" — never a track name like "hi-orig". */
   language: string;
+  /** Set only when the text is a machine translation. */
+  translatedFrom?: string;
+}
+
+/** yt-dlp marks a video's own caption track with an -orig suffix. */
+function baseLang(track: string): string {
+  return track.replace(/-orig$/i, "");
+}
+
+/**
+ * The language the video was actually spoken in, if we can tell. The -orig
+ * track name is the strongest signal (YouTube adds it precisely to distinguish
+ * the source track from its ~200 auto-translations); the metadata `language`
+ * field is the fallback.
+ */
+function originalLanguage(meta: YoutubeMeta): string | undefined {
+  const tagged = [...meta.subtitleLangs, ...meta.autoCaptionLangs].find((l) =>
+    /-orig$/i.test(l),
+  );
+  return tagged ?? meta.language;
 }
 
 /**
@@ -207,49 +282,151 @@ function pickLang(available: string[], want: string): string | null {
   );
 }
 
+export interface CaptionAttempt {
+  /** The track name to ask yt-dlp for — may carry the -orig suffix. */
+  track: string;
+  source: "creator_captions" | "auto_captions" | "auto_captions_translated";
+  language: string;
+  translatedFrom?: string;
+  flag: "--write-subs" | "--write-auto-subs";
+}
+
+/**
+ * Which caption track to try, in order. Exported for tests: the ranking is the
+ * whole feature, and it is worth asserting without a network round trip.
+ *
+ * An explicit --language is obeyed and nothing else is attempted — silently
+ * importing a different language than the one asked for would be worse than
+ * failing. Otherwise: creator captions beat machine ones, and within the
+ * machine ones the video's ORIGINAL language beats a translation of it,
+ * because YouTube's auto-translations are a translation OF a transcription and
+ * degrade twice over.
+ */
+export function planCaptionAttempts(meta: YoutubeMeta, explicitLanguage?: string): CaptionAttempt[] {
+  const attempts: CaptionAttempt[] = [];
+  const seen = new Set<string>();
+  const orig = originalLanguage(meta);
+
+  const add = (
+    track: string | null | undefined,
+    kind: "creator" | "auto",
+  ): void => {
+    if (!track || seen.has(`${kind}:${track}`)) return;
+    seen.add(`${kind}:${track}`);
+    const language = baseLang(track);
+    const translated =
+      kind === "auto" && !!orig && baseLang(orig).toLowerCase() !== language.toLowerCase();
+    attempts.push({
+      track,
+      language,
+      source:
+        kind === "creator"
+          ? "creator_captions"
+          : translated
+            ? "auto_captions_translated"
+            : "auto_captions",
+      ...(translated ? { translatedFrom: baseLang(orig!) } : {}),
+      flag: kind === "creator" ? "--write-subs" : "--write-auto-subs",
+    });
+  };
+
+  if (explicitLanguage) {
+    add(pickLang(meta.subtitleLangs, explicitLanguage), "creator");
+    add(pickLang(meta.autoCaptionLangs, explicitLanguage), "auto");
+    return attempts;
+  }
+
+  // 2. Any creator track, the original language for preference.
+  add(orig ? pickLang(meta.subtitleLangs, orig) : null, "creator");
+  add(meta.subtitleLangs[0], "creator");
+
+  // 3-5. Auto: original language, then English, then whatever exists.
+  add(orig ? pickLang(meta.autoCaptionLangs, orig) : null, "auto");
+  add(pickLang(meta.autoCaptionLangs, "en"), "auto");
+  add(meta.autoCaptionLangs[0], "auto");
+
+  return attempts;
+}
+
+/** One human-readable phrase for a track's provenance. */
+export function describeCaptions(c: { source: FetchedCaptions["source"]; language: string; translatedFrom?: string }): string {
+  if (c.source === "creator_captions") return `${c.language}, creator-provided`;
+  if (c.source === "auto_captions_translated") {
+    return `${c.language}, auto-translated from ${c.translatedFrom}`;
+  }
+  return `${c.language}, auto-generated — video's original language`;
+}
+
 export async function fetchCaptions(
   bin: string,
   url: string,
   meta: YoutubeMeta,
-  langPref: string,
+  opts: { language?: string; notify?: (msg: string) => void; onFailure?: (reason: string) => void } = {},
 ): Promise<FetchedCaptions | null> {
-  const attempts: { source: "creator_captions" | "auto_captions"; lang: string; flag: string }[] = [];
-  const creator = pickLang(meta.subtitleLangs, langPref);
-  if (creator) attempts.push({ source: "creator_captions", lang: creator, flag: "--write-subs" });
-  const auto = pickLang(meta.autoCaptionLangs, langPref);
-  if (auto) attempts.push({ source: "auto_captions", lang: auto, flag: "--write-auto-subs" });
+  const attempts = planCaptionAttempts(meta, opts.language);
+  // A track can be listed and still refuse to download — YouTube rate-limits
+  // (HTTP 429) under exactly the retry patterns an import produces. Reporting
+  // that as "this video has no captions" sends the user to fix the wrong thing.
+  let lastFailure: string | null = null;
 
   for (const attempt of attempts) {
-    for (const format of ["json3", "vtt"] as const) {
-      const dir = mkdtempSync(join(tmpdir(), "clipy-subs-"));
-      try {
-        const res = await run(
-          bin,
-          [
-            "--ignore-config",
-            "--no-playlist",
-            "--skip-download",
-            attempt.flag,
-            "--sub-langs",
-            attempt.lang,
-            "--sub-format",
+    opts.notify?.(`Downloading captions (${describeCaptions(attempt)})…`);
+
+    // Retrying the PREFERRED track before dropping to the next language is what
+    // keeps re-runs idempotent: a transient 403/429 on the original-language
+    // track must not silently promote a machine translation, because that would
+    // change the transcript under a bundle fingerprint that has not changed and
+    // the server would reject the re-upload as a content conflict.
+    for (let tryN = 1; tryN <= MAX_ATTEMPTS; tryN += 1) {
+      let stderr = "";
+      for (const format of ["json3", "vtt"] as const) {
+        const dir = mkdtempSync(join(tmpdir(), "clipy-subs-"));
+        try {
+          const res = await run(
+            bin,
+            [
+              "--ignore-config",
+              "--no-playlist",
+              "--skip-download",
+              attempt.flag,
+              "--sub-langs",
+              attempt.track,
+              "--sub-format",
+              format,
+              "-o",
+              join(dir, "track.%(ext)s"),
+              url,
+            ],
+            180_000,
+          );
+          if (res.code !== 0) {
+            stderr = res.stderr.trim();
+            const line = stderr.split("\n").filter(Boolean).pop();
+            if (line) lastFailure = `${attempt.track}: ${line}`;
+            continue;
+          }
+          const file = readdirSync(dir).find((f) => f.endsWith(`.${format}`));
+          if (!file) continue;
+          const text = readFileSync(join(dir, file), "utf8");
+          if (!text.trim()) continue;
+          return {
             format,
-            "-o",
-            join(dir, "track.%(ext)s"),
-            url,
-          ],
-          180_000,
-        );
-        if (res.code !== 0) continue;
-        const file = readdirSync(dir).find((f) => f.endsWith(`.${format}`));
-        if (!file) continue;
-        const text = readFileSync(join(dir, file), "utf8");
-        if (!text.trim()) continue;
-        return { format, text, source: attempt.source, language: attempt.lang };
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
+            text,
+            source: attempt.source,
+            language: attempt.language,
+            ...(attempt.translatedFrom ? { translatedFrom: attempt.translatedFrom } : {}),
+          };
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
       }
+
+      const kind = classifyFailure(stderr);
+      if (!stderr || !isRetriable(kind) || tryN === MAX_ATTEMPTS) break;
+      opts.notify?.(retryNotice(stderr, kind, tryN + 1, MAX_ATTEMPTS));
+      await sleep(RETRY_BACKOFF_MS[tryN - 1] ?? 5_000);
     }
   }
+  if (lastFailure) opts.onFailure?.(lastFailure);
   return null;
 }
