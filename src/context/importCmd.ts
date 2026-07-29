@@ -38,6 +38,12 @@ import {
 } from "../context-core/index.js";
 import { describeCaptions, fetchCaptions, fetchVideoMeta, resolveYtDlp } from "./ytdlp.js";
 import { canonicalYoutubeUrl, isYoutubeHost, parseYoutubeId } from "./youtubeUrl.js";
+
+// The web app and the API share an origin in every real deployment; strip any
+// trailing slash so the printed URL is clean.
+function webOriginFromApiUrl(apiUrl: string): string {
+  return apiUrl.replace(/\/+$/, "");
+}
 import { ImportError, type ImportWarning } from "./errors.js";
 import { looksLikeStaleBinary } from "./retry.js";
 import { probeVideo } from "./probe.js";
@@ -965,14 +971,19 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
   // The headline. A user who ran one command should not have to assemble "did
   // it work, and where is it" out of four key-value lines.
   process.stdout.write(`\nYour agent-ready context for ${JSON.stringify(compiled.manifest.title)} is ready.\n`);
-  process.stdout.write(
-    `  → local bundle: ${join(bundlePath, "recording.md")}  (point your agent here, or run: clipy context read ${bundlePath})\n`,
-  );
   if (synced) {
+    // Server copy first — once synced it is the canonical, durable one; the
+    // local bundle is the offline/working copy.
     process.stdout.write(
-      `  → in your Clipy library: filed under ${JSON.stringify(synced.folderName ?? "Knowledge Base")} — searchable, and readable by agents via MCP (read_context_document ${synced.publicId})\n`,
+      `  → view it: ${webOriginFromApiUrl(opts.apiUrl)}/knowledge/${synced.publicId}  (filed under ${JSON.stringify(synced.folderName ?? "Knowledge Base")})\n`,
+    );
+    process.stdout.write(
+      `  → for agents: MCP read_context_document ${synced.publicId}, or the local bundle below\n`,
     );
   }
+  process.stdout.write(
+    `  → local bundle: ${join(bundlePath, "recording.md")}  (run: clipy context read ${bundlePath})\n`,
+  );
   if (warnings.length > 0) {
     process.stdout.write(
       `  → incomplete: ${warnings.map((w) => w.error).join("; ")}\n     to finish it: ${warnings[0].remediation}\n`,
