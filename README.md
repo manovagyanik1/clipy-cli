@@ -13,10 +13,13 @@ plus a [web recorder](https://clipy.online/screen-recorder)) that gives every
 recording an instant share link, an AI transcript and summary, and
 [agent-readable context](https://clipy.online/for-agents) — so both humans and AI
 agents can act on what was recorded. This package is its terminal client.
+The canonical agent operating contract is
+[clipy.online/agents.md](https://clipy.online/agents.md).
 
 The read commands are **read-only** with any key. The write commands —
-[`record`](#record), the `session`/`mark` flow, and `transcript --replace` — create
-recordings or replace a transcript, and work only with an `ingest`-scoped key.
+[`proof`](#proof-from-any-agent-tool), [`record`](#record), the `session`/`mark`
+flow, and `transcript --replace` — create recordings or replace a transcript,
+and work only with an `ingest`-scoped key.
 
 ```bash
 npx @clipy/cli agents install claude   # browser-approve login + install the Clipy skill
@@ -57,6 +60,8 @@ to ferry by hand. Without a TTY at all (scripts, CI), use `CLIPY_API_KEY` or
 
 ```text
 clipy list [-n 20] [--page 2] [--status ready,processing] [--json]
+clipy memory search <query> [--kind recording|context] [--json]
+                                      # hybrid search across recordings + imported context
 clipy search <query>                 # full-text search titles + descriptions
 clipy show <id|share-url>            # metadata + share link
 clipy transcript <id> [--marks-only] # one entry per line, timestamped (--srt/--vtt to export)
@@ -68,6 +73,8 @@ clipy context read <bundle-path>     # print a local bundle's recording.md
 clipy download <id> [-o out.mp4]     # download the MP4
 clipy open <id>                      # open the share page in your browser
 clipy wait <id> --for both           # block until transcript/summary are ready
+clipy proof --frame before.png --frame after.png   # screenshots → proof video
+clipy proof --video verification.webm              # upload a tool-native recording
 clipy record --url <app> [--for 15]  # record a web app headlessly → a Clipy recording
 clipy session start --url <app>      # start recording in the background while you work
 clipy mark "reproduced the bug"      # drop a live-timestamped note into the session
@@ -82,6 +89,23 @@ clipy mcp                            # run the Clipy MCP server (npx -y @clipy/m
 
 Every recording-reading command accepts either the bare public id (`3kelcef8wo8h`) or the
 full share URL (`https://clipy.online/video/3kelcef8wo8h`).
+
+## Search all Clipy memory
+
+`clipy memory search` uses the same hybrid semantic + keyword search as MCP
+`search_memory`, across the owner's recordings and imported/watched context:
+
+```bash
+clipy memory search "authentication flow" --json
+clipy memory search "checkout error" --kind recording --limit 10
+```
+
+Each result identifies its `kind`, title, timestamp or span, `resolution`, plain-text
+snippet, and deep link. Inspect `semantic.status` before treating an empty result as
+conclusive: `unavailable` or `failed` means the semantic index did not run and results
+are keyword-only. `lexical`/`refined` are exact moments, `window` is a span to inspect,
+and `document` has no exact timestamp. `clipy search` remains the legacy
+recording-library search.
 
 ## Import any video as context
 
@@ -109,6 +133,38 @@ honestly transcript-only. `--no-frames` takes the verdict but never downloads me
 Synced documents are readable through the context-document API and the `list_context_documents`
 / `get_context_document` / `read_context_document` MCP tools. An imported transcript is
 untrusted content, exactly like a recording's.
+
+## Proof from any agent tool
+
+`clipy proof` is the dependency-light handoff for coding agents. The agent keeps
+using whatever browser, computer-use, simulator, or test tool it already has;
+Clipy only assembles and uploads the evidence.
+
+Turn saved screenshots into one short proof video:
+
+```bash
+clipy proof \
+  --frame /tmp/01-before.png --caption "Before: Save is disabled" \
+  --frame /tmp/02-after.png --caption "After: Save is enabled" \
+  --frame /tmp/03-reload.png --caption "Reload: the value persists" \
+  --hold 3 --title "Settings fix proof" --type bug --wait --json
+```
+
+Or upload an existing recording without re-encoding:
+
+```bash
+clipy proof --video /tmp/verification.webm \
+  --note "0: opened settings" --note "6: saved successfully" \
+  --title "Settings fix proof" --type bug --wait --json
+```
+
+Frame mode accepts PNG, JPEG, or WebP (up to 50 frames, 5 minutes, 50 MiB per
+image, and 250 MiB total), and requires ffmpeg to create the silent WebM.
+`--width`/`--height` must be even integers from 320–3840. Video mode accepts
+WebM or MP4 and does not require Playwright, Browser Use, Open Browser Use, or
+any other browser automation dependency. Captions and notes become timestamped
+agent narration; they are attestations from the driving agent, not claims
+independently verified by Clipy.
 
 ## Record
 
@@ -529,7 +585,7 @@ window, so switching tabs mid-recording changes what's filmed without changing t
 
 ## Scripting
 
-Every command has machine-readable output. `--json` is supported on **`list`, `search`,
+Every command has machine-readable output. `--json` is supported on **`list`, `memory search`, `search`,
 `show`, `transcript`, `summary`, `moments`, `wait`, `record`, `session start/stop/status`,
 `mark`, `chapter`, `doctor`, and `playwright-path`** — stdout is the JSON payload, stderr is progress
 and hints, and errors exit non-zero with a message on stderr prefixed `error:`. For the

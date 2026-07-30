@@ -21,13 +21,16 @@ const vtt = join(dir, "clip.vtt");
 writeFileSync(vtt, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello from the test fixture.\n\n00:00:01.000 --> 00:00:02.000\nSecond line of narration.\n");
 
 let received = null;
+// What the server answers next. The second run stands in for a re-import the
+// server matched to a document the user already had.
+let reply = { id: "ctx_1", publicId: "abc123", created: true };
 const server = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
     received = { method: req.method, url: req.url, auth: req.headers.authorization, body: JSON.parse(body) };
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ id: "ctx_1", publicId: "abc123", created: true }));
+    res.end(JSON.stringify(reply));
   });
 });
 
@@ -36,19 +39,21 @@ const port = server.address().port;
 
 // spawn, not spawnSync: the mock server shares this event loop, so a blocking
 // child could never be answered.
-const run = await new Promise((resolveRun) => {
-  const child = spawn(
-    process.execPath,
-    [cli, "context", "import", video, "--transcript", vtt, "--output", dir, "--sync", "--tag", "docs", "--tag", "api", "--folder", "Imports", "--json"],
-    { env: { ...process.env, CLIPY_API_KEY: "test-key", CLIPY_API_URL: `http://127.0.0.1:${port}` } },
-  );
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (d) => (stdout += d));
-  child.stderr.on("data", (d) => (stderr += d));
-  child.on("close", (status) => resolveRun({ status, stdout, stderr }));
-});
-server.close();
+const runCli = () =>
+  new Promise((resolveRun) => {
+    const child = spawn(
+      process.execPath,
+      [cli, "context", "import", video, "--transcript", vtt, "--output", dir, "--sync", "--tag", "docs", "--tag", "api", "--folder", "Imports", "--json"],
+      { env: { ...process.env, CLIPY_API_KEY: "test-key", CLIPY_API_URL: `http://127.0.0.1:${port}` } },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("close", (status) => resolveRun({ status, stdout, stderr }));
+  });
+
+const run = await runCli();
 
 assert.equal(run.status, 0, `CLI failed: ${run.stderr}`);
 assert.ok(received, "server received no request");
@@ -78,5 +83,19 @@ assert.ok(!JSON.stringify(b).includes(dir), "payload leaked a local filesystem p
 const out = JSON.parse(run.stdout);
 assert.equal(out.synced, true);
 assert.equal(out.publicId, "abc123");
+assert.equal(out.refreshed, false);
+
+// Second import of the same source: the server dedupes on source identity and
+// refreshes the document it already has. Same public id, no second entry.
+reply = { id: "ctx_1", publicId: "abc123", created: false, refreshed: true };
+const again = await runCli();
+server.close();
+
+assert.equal(again.status, 0, `re-import failed: ${again.stderr}`);
+assert.match(again.stderr, /Already in your Knowledge Base — refreshed ✓/);
+const outAgain = JSON.parse(again.stdout);
+assert.equal(outAgain.refreshed, true);
+assert.equal(outAgain.publicId, "abc123", "a refreshed import must keep the same public id");
 
 process.stdout.write("✓ context sync payload matches the UploadContextPayload contract\n");
+process.stdout.write("✓ a re-imported source is reported as refreshed, not created\n");

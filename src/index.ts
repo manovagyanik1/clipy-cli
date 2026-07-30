@@ -32,6 +32,7 @@ import { cmdContextImport } from "./context/importCmd.js";
 import { cmdContextRead } from "./context/readCmd.js";
 import { errorEnvelope } from "./context/errors.js";
 import { supportsWebp } from "./context/ffmpeg.js";
+import { renderProofFrames } from "./proofFrames.js";
 import {
   BridgeUnavailableError,
   bridgeRequest,
@@ -366,6 +367,10 @@ ${c.bold("AUTH")}
 ${c.bold("RECORDINGS")}
   list [-n <N>] [--page <P>] [--status <s,…>] [--json]
                                     List your recordings (newest first)
+  memory search <query> [--kind recording|context] [--limit N] [--json]
+                                    Hybrid semantic + keyword search across your
+                                    recordings AND imported/watched context;
+                                    returns exact moments and deep links
   search <query> [--json]           Full-text search titles + descriptions
   show <id|url> [--json]            One recording's metadata + share link
   transcript <id> [--marks-only] [--srt|--vtt|--json]
@@ -396,6 +401,19 @@ ${c.bold("RECORDINGS")}
   open <id>                         Open the share page in your browser
   wait <id> [--for transcript|summary|both] [--timeout <sec>]
                                     Block until processing artifacts are ready
+
+${c.bold("PROOF")} ${c.dim("(tool-neutral evidence; needs an ingest-scoped API key)")}
+  proof --frame <png|jpg|webp> [--frame <image> ...]
+                                    Turn screenshots from ANY agent/browser tool
+                                    into one short proof video and upload it
+    --caption <text>  Caption each frame in order (repeat once per --frame);
+                      captions become timestamped agent narration
+    --hold <sec>      Seconds to show each frame (default 3; 0.25–30)
+    --width/--height  Even output dimensions, 320–3840 (default 1280×720)
+  proof --video <webm|mp4>          Upload a video the agent/tool already recorded
+    --title/--description/--type/--note/--wait/--json
+                      Same metadata, narration, processing wait, and JSON result
+                      contract as record; no browser automation dependency
 
 ${c.bold("RECORD")} ${c.dim("(needs an API key with the \"ingest\" permission)")}
   record --url <http(s) url> [--for <sec>] [--title <t>] [--wait]
@@ -507,7 +525,7 @@ ${c.bold("GLOBAL FLAGS")}
   --key <key>       API key for this invocation (else CLIPY_API_KEY, else stored login)
   --api-url <url>   API base (else CLIPY_API_URL, default https://clipy.online)
   --json            Machine-readable output. Supported on: list, search, show,
-                    transcript, summary, moments, wait, record, session
+                    transcript, summary, moments, wait, proof, record, session
                     start/stop/status, mark, chapter, doctor, playwright-path
   -v, --version     Print version
 
@@ -526,7 +544,7 @@ ${c.bold("SETUP")}
   1. ${c.bold("clipy login")}                approve this device in your browser
   2. ${c.bold("clipy list")}                 (or: ${c.bold("clipy agents install claude")} to wire up a coding agent)
 
-Write commands — ${c.bold("record")}, ${c.bold("session")}/${c.bold("mark")}, and ${c.bold("transcript --replace")} — need a key
+Write commands — ${c.bold("proof")}, ${c.bold("record")}, ${c.bold("session")}/${c.bold("mark")}, and ${c.bold("transcript --replace")} — need a key
 with the "ingest" permission. Everything else is read-only.
 `;
 
@@ -697,6 +715,67 @@ async function cmdList(ctx: Ctx, opts: { q?: string; n: number; page: number; st
     process.stdout.write(
       c.dim(`page ${pg.page ?? opts.page}/${pg.totalPages ?? "?"} of ${pg.total} recordings — use --page/${"-n"} for more\n`),
     );
+  }
+}
+
+async function cmdMemorySearch(
+  ctx: Ctx,
+  opts: { query: string; kinds: string[]; limit: number; json: boolean },
+): Promise<void> {
+  const validKinds = new Set(["recording", "context"]);
+  const kinds = opts.kinds.flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
+  const invalidKinds = kinds.filter((kind) => !validKinds.has(kind));
+  if (invalidKinds.length > 0) {
+    die(`--kind must be recording or context (unknown: ${invalidKinds.join(", ")})`, 2);
+  }
+
+  const params = new URLSearchParams({ q: opts.query, limit: String(opts.limit) });
+  if (kinds.length > 0) params.set("kinds", [...new Set(kinds)].join(","));
+  const body = await apiJson(ctx, `/api/v1/search?${params.toString()}`);
+  if (opts.json) {
+    printJson(body);
+    return;
+  }
+
+  const semantic = body.semantic as { status?: string; reason?: string } | undefined;
+  const degraded = Boolean(body.degraded);
+  const results = (body.results ?? []) as Array<{
+    kind?: string;
+    title?: string;
+    startMs?: number | null;
+    endMs?: number | null;
+    resolution?: string;
+    snippet?: string;
+    url?: string;
+  }>;
+  const semanticStatus = semantic?.status ?? (degraded ? "unavailable" : "unknown");
+  process.stdout.write(
+    `${c.dim(`semantic: ${semanticStatus}${degraded ? " (keyword-only fallback)" : ""} · ${results.length} result${results.length === 1 ? "" : "s"}`)}\n`,
+  );
+  if (results.length === 0) {
+    if (degraded) {
+      process.stdout.write(
+        `${c.yellow("No keyword matches. Semantic search did not run; retry with more literal phrasing before concluding the memory is absent.")}\n`,
+      );
+    }
+    return;
+  }
+
+  for (const result of results) {
+    const startMs = typeof result.startMs === "number" ? result.startMs : null;
+    const endMs = typeof result.endMs === "number" ? result.endMs : null;
+    const resolution = result.resolution ?? "unknown";
+    const time =
+      startMs == null
+        ? ""
+        : resolution === "window" && endMs != null
+          ? ` · ${fmtDuration(Math.floor(startMs / 1000))}–${fmtDuration(Math.floor(endMs / 1000))}`
+          : ` · ${fmtDuration(Math.floor(startMs / 1000))}`;
+    process.stdout.write(
+      `\n${c.cyan(`[${result.kind ?? "result"}]`)} ${c.bold(result.title ?? "Untitled")}${c.dim(`${time} · ${resolution}`)}\n`,
+    );
+    if (result.snippet) process.stdout.write(`${result.snippet}\n`);
+    if (result.url) process.stdout.write(`${c.dim(result.url)}\n`);
   }
 }
 
@@ -1462,10 +1541,8 @@ async function cmdDoctor(ctx: Ctx, json: boolean): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// record — the ONE write command. Drives a headless browser (Playwright),
-// captures the page to WebM, and streams it through Clipy's raw-upload
-// pipeline exactly like the web recorder does. Needs an API key with the
-// `ingest` scope. Everything else in this CLI stays read-only.
+// Ingest write plumbing. `record`, session mode, and `proof` all stream media
+// through the same raw-upload contract. Needs an API key with `ingest` scope.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1539,6 +1616,7 @@ async function ingestPostChunk(
   uploadToken: string,
   partNumber: number,
   bytes: Uint8Array,
+  container: SupportedVideoContainer = "webm",
 ): Promise<void> {
   const key = requireKey(ctx);
   for (let attempt = 1; attempt <= 4; attempt++) {
@@ -1550,7 +1628,8 @@ async function ingestPostChunk(
     form.append("recordingId", recordingId);
     form.append("uploadToken", uploadToken);
     form.append("partNumber", String(partNumber));
-    form.append("file", new Blob([part], { type: "video/webm" }), `part-${partNumber}.webm`);
+    const mime = container === "mp4" ? "video/mp4" : "video/webm";
+    form.append("file", new Blob([part], { type: mime }), `part-${partNumber}.${container}`);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 120_000);
     let res: Response;
@@ -1925,22 +2004,38 @@ function resolveNarrationNotes(parsed: ParsedNote[], passStartsMs: number[]): Na
   });
 }
 
-/** WebM/Matroska files start with the EBML magic. Refuse to upload anything
- *  else — a crashed Chromium can leave a zero-byte or garbage file behind. */
-function validateWebmFile(videoPath: string): number {
-  const size = statSync(videoPath).size;
+type SupportedVideoContainer = "webm" | "mp4";
+
+/** WebM/Matroska starts with EBML; MP4 carries an ftyp box at offset 4.
+ *  Refuse unknown/empty files before creating a server-side upload session. */
+function validateVideoFile(videoPath: string): {
+  sizeBytes: number;
+  container: SupportedVideoContainer;
+} {
+  const stat = statSync(videoPath);
+  if (!stat.isFile()) throw new Error(`recording media is not a file: ${videoPath}`);
+  const size = stat.size;
   if (size === 0) throw new Error("recording produced an empty file");
   const fd = openSync(videoPath, "r");
   try {
-    const head = Buffer.alloc(4);
-    readSync(fd, head, 0, 4, 0);
-    if (!(head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3)) {
-      throw new Error("recording file is not valid WebM (corrupt capture?)");
+    const head = Buffer.alloc(8);
+    const bytesRead = readSync(fd, head, 0, 8, 0);
+    if (
+      bytesRead >= 4 &&
+      head[0] === 0x1a &&
+      head[1] === 0x45 &&
+      head[2] === 0xdf &&
+      head[3] === 0xa3
+    ) {
+      return { sizeBytes: size, container: "webm" };
     }
+    if (bytesRead >= 8 && head.subarray(4, 8).toString("ascii") === "ftyp") {
+      return { sizeBytes: size, container: "mp4" };
+    }
+    throw new Error("recording file is not valid WebM or MP4 (corrupt capture?)");
   } finally {
     closeSync(fd);
   }
-  return size;
 }
 
 // --- Recording kind (--type) -----------------------------------------------
@@ -2000,14 +2095,16 @@ interface UploadedRecording {
   shareUrl: string;
   contextUrl: string;
   sizeBytes: number;
+  container: SupportedVideoContainer;
 }
 
 /**
- * Streams a captured WebM through Clipy's raw-upload pipeline
- * (initiate → chunks → finalize → complete). Shared by `clipy record` and
- * session mode. Aborts the server-side upload session on failure.
+ * Streams validated WebM/MP4 media through Clipy's raw-upload pipeline
+ * (initiate → chunks → finalize → complete). Shared by `clipy proof`,
+ * `clipy record`, and session mode. Aborts the server-side upload session on
+ * failure.
  */
-async function uploadWebmToClipy(
+async function uploadVideoToClipy(
   ctx: Ctx,
   opts: {
     videoPath: string;
@@ -2015,30 +2112,34 @@ async function uploadWebmToClipy(
     description?: string;
     narration?: Narration;
     recordingKind?: string;
+    sourceVersion?: string;
     log: (m: string) => void;
   },
 ): Promise<UploadedRecording> {
-  const sizeBytes = validateWebmFile(opts.videoPath);
+  const { sizeBytes, container } = validateVideoFile(opts.videoPath);
   opts.log(`${c.dim(`captured ${fmtBytes(sizeBytes)} — uploading…`)}`);
+  const sourceVersion = opts.sourceVersion ?? `cli/${VERSION}`;
 
   const recordingId = randomUUID();
   let uploadToken = "";
   let publicId = "";
   try {
     // 1) initiate → uploadToken + the video row (createVideoRow so the share
-    //    link exists immediately). sourcePlatform 'web' is honest: this IS a
-    //    web-content capture.
+    //    link exists immediately). The existing CLI/raw-upload contract uses
+    //    sourcePlatform "web"; sourceVersion carries `cli-proof/*` provenance
+    //    until the backend grows provider-specific source metadata.
     const init = await ingestPostJson(ctx, "/api/videos/raw-upload/initiate", {
       recordingId,
       createVideoRow: true,
       sourcePlatform: "web",
-      sourceVersion: `cli/${VERSION}`,
+      sourceVersion,
     });
     uploadToken = String(init.uploadToken ?? "");
     publicId = String(init.publicId ?? "");
     if (!uploadToken) throw new Error("initiate did not return an uploadToken");
+    if (!publicId) throw new Error("initiate did not return a publicId");
 
-    // 2) stream the WebM in sequential 4 MiB parts read straight off disk (a
+    // 2) stream the media in sequential 4 MiB parts read straight off disk (a
     //    long capture never has to sit fully in memory). Sequential keeps
     //    nextPartNumber advancing so we never trip the out-of-order guard.
     const PART_SIZE = 4 * 1024 * 1024;
@@ -2053,7 +2154,14 @@ async function uploadWebmToClipy(
         if (bytesRead <= 0) break;
         // new Blob([...]) snapshots the bytes synchronously, so reusing `window`
         // on the next iteration is safe (the chunk is fully sent before then).
-        await ingestPostChunk(ctx, recordingId, uploadToken, partNumber, window.subarray(0, bytesRead));
+        await ingestPostChunk(
+          ctx,
+          recordingId,
+          uploadToken,
+          partNumber,
+          window.subarray(0, bytesRead),
+          container,
+        );
         if (process.stderr.isTTY) {
           process.stderr.write(`\r${c.dim(`uploading… part ${partNumber}/${totalParts}`)}`);
         }
@@ -2075,7 +2183,7 @@ async function uploadWebmToClipy(
       name: opts.name,
       description: opts.description,
       sourcePlatform: "web",
-      sourceVersion: `cli/${VERSION}`,
+      sourceVersion,
       ...(opts.recordingKind ? { recordingKind: opts.recordingKind } : {}),
       ...(opts.narration && (opts.narration.text || opts.narration.notes?.length)
         ? { narration: opts.narration }
@@ -2099,7 +2207,134 @@ async function uploadWebmToClipy(
     // page to browsers. Same document as /api/agent-context/<id>.
     contextUrl: `${ctx.apiUrl}/video/${publicId}.md`,
     sizeBytes,
+    container,
   };
+}
+
+interface ProofOpts {
+  framePaths: string[];
+  captions: string[];
+  videoPath?: string;
+  holdSeconds: number;
+  width: number;
+  height: number;
+  name?: string;
+  description?: string;
+  recordingKind?: string;
+  notes: ParsedNote[];
+  wait: boolean;
+  json: boolean;
+}
+
+/**
+ * Creates a shareable proof recording from screenshots supplied by any agent
+ * tool, or uploads a WebM/MP4 that tool already recorded. This path deliberately
+ * knows nothing about Playwright, OBU, Computer Use, or browser ownership.
+ */
+async function cmdProof(ctx: Ctx, opts: ProofOpts): Promise<void> {
+  const hasFrames = opts.framePaths.length > 0;
+  const hasVideo = Boolean(opts.videoPath);
+  if (hasFrames === hasVideo) {
+    die("usage: clipy proof (--frame <image> ... | --video <webm|mp4>) [--caption <text> ...]", 2);
+  }
+  if (!hasFrames && opts.captions.length > 0) {
+    die("--caption is only valid with --frame", 2);
+  }
+  if (opts.captions.length > 0 && opts.captions.length !== opts.framePaths.length) {
+    die(
+      `--caption count (${opts.captions.length}) must match --frame count (${opts.framePaths.length})`,
+      2,
+    );
+  }
+  if (maxPassRef(opts.notes) > 0) {
+    die('proof notes use absolute timestamps such as --note "3: saved state"; passN notes need record --viewports', 2);
+  }
+  requireKey(ctx);
+
+  const tmpDir = join(tmpdir(), `clipy-proof-${randomUUID()}`);
+  let generatedVideo = false;
+  let videoPath = opts.videoPath ? resolve(opts.videoPath) : "";
+  let durationSeconds: number | null = null;
+  let failure: Error | null = null;
+  const log = (message: string) => {
+    if (!opts.json) process.stderr.write(`${message}\n`);
+  };
+
+  try {
+    const narrationNotes: NarrationNote[] = resolveNarrationNotes(opts.notes, [0]);
+    if (hasFrames) {
+      mkdirSync(tmpDir, { recursive: true });
+      videoPath = join(tmpDir, "proof.webm");
+      log(c.dim(`assembling ${opts.framePaths.length} proof frame${opts.framePaths.length === 1 ? "" : "s"}…`));
+      const rendered = await renderProofFrames({
+        framePaths: opts.framePaths,
+        outputPath: videoPath,
+        holdSeconds: opts.holdSeconds,
+        width: opts.width,
+        height: opts.height,
+        notify: log,
+      });
+      generatedVideo = true;
+      durationSeconds = rendered.durationSeconds;
+      opts.captions.forEach((caption, index) => {
+        const text = caption.trim();
+        if (!text) return;
+        narrationNotes.push({
+          startMs: Math.round(index * opts.holdSeconds * 1000),
+          endMs: Math.round((index + 1) * opts.holdSeconds * 1000),
+          text: `[proof frame ${index + 1}/${opts.framePaths.length}] ${text}`,
+        });
+      });
+    } else if (!existsSync(videoPath)) {
+      throw new Error(`proof video does not exist: ${videoPath}`);
+    }
+
+    narrationNotes.sort((a, b) => a.startMs - b.startMs);
+    if (narrationNotes.length > 200) {
+      throw new Error("proof supports at most 200 captions/notes");
+    }
+
+    const uploaded = await uploadVideoToClipy(ctx, {
+      videoPath,
+      name: opts.name ?? "Agent verification proof",
+      description: opts.description,
+      narration: narrationNotes.length > 0 ? { notes: narrationNotes } : undefined,
+      recordingKind: opts.recordingKind,
+      sourceVersion: `cli-proof/${VERSION}`,
+      log,
+    });
+    if (opts.wait) {
+      await waitForArtifacts(ctx, uploaded.publicId);
+    }
+
+    const source = hasFrames
+      ? {
+          kind: "proof-frames",
+          frameCount: opts.framePaths.length,
+          holdSeconds: opts.holdSeconds,
+          durationSeconds,
+        }
+      : { kind: "proof-video", container: uploaded.container };
+    if (opts.json) {
+      printJson({
+        id: uploaded.publicId,
+        shareUrl: uploaded.shareUrl,
+        contextUrl: uploaded.contextUrl,
+        sizeBytes: uploaded.sizeBytes,
+        source,
+      });
+    } else {
+      process.stdout.write(`${c.green("✓")} proof uploaded — ${c.bold(uploaded.shareUrl)}\n`);
+      process.stdout.write(`${c.dim("agent context:")} ${uploaded.contextUrl}\n`);
+    }
+  } catch (error) {
+    failure = error as Error;
+  } finally {
+    if (generatedVideo || existsSync(tmpDir)) {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+  if (failure) die(failure.message);
 }
 
 /**
@@ -2728,7 +2963,7 @@ async function cmdRecord(ctx: Ctx, opts: RecordOpts): Promise<void> {
     const notes = [...autoNotes, ...resolveNarrationNotes(opts.notes, passStartsMs)].sort(
       (a, b) => a.startMs - b.startMs,
     );
-    uploaded = await uploadWebmToClipy(ctx, {
+    uploaded = await uploadVideoToClipy(ctx, {
       videoPath,
       name: opts.name,
       description: opts.description,
@@ -4863,7 +5098,7 @@ async function runSessionDaemon(file: string): Promise<void> {
     }
 
     save({ state: "uploading" });
-    const uploaded = await uploadWebmToClipy(ctx, {
+    const uploaded = await uploadVideoToClipy(ctx, {
       videoPath,
       name: state.name,
       description: state.description,
@@ -4987,7 +5222,7 @@ async function cmdAgents(
     }
     process.stdout.write(`${c.green("✓")} Clipy skill installed for ${c.bold(target)} at ${c.dim(path)}\n`);
     process.stdout.write(
-      `${c.dim("It teaches the agent to read clipy.online links and to record with clipy record / session.")}\n`,
+      `${c.dim("It teaches the agent to read Clipy links and create proof with clipy proof / record / session.")}\n`,
     );
     return;
   }
@@ -5014,7 +5249,7 @@ async function cmdAgents(
 // contract changes.
 // ---------------------------------------------------------------------------
 
-const GUIDE_SCHEMA_VERSION = 12;
+const GUIDE_SCHEMA_VERSION = 14;
 
 /** The stable machine-readable failure taxonomy carried in `--json` error
  *  envelopes. Codes are the contract; messages are not. Published through the
@@ -5059,7 +5294,7 @@ function cmdGuide(json: boolean): void {
     binary: "clipy",
     version: VERSION,
     description:
-      "Clipy (clipy.online) command line: read your screen recordings' transcripts/summaries/key moments, and record web apps headlessly (one-shot or live session with timestamped marks).",
+      "Clipy (clipy.online) command line: read recordings, turn screenshots or tool-native video into proof, and record web apps or the Mac screen.",
     outputConvention: {
       jsonFlag: "--json",
       stdout: "primary results (JSON when --json is set) — THE SOURCE OF TRUTH",
@@ -5099,6 +5334,12 @@ function cmdGuide(json: boolean): void {
       cmdDoc("logout", "clipy logout", "Delete the stored key"),
       cmdDoc("whoami", "clipy whoami", "Check the active key"),
       cmdDoc("list", "clipy list [-n N] [--page P] [--status s,…] [--json]", "List recordings, newest first"),
+      cmdDoc(
+        "memory search",
+        "clipy memory search <query> [--kind recording|context]… [--limit N] [--json]",
+        "Hybrid semantic + keyword search across the user's own screen recordings and imported/watched context. Results include kind, publicId, title, timestamp/span, resolution, plain-text snippet, scores, and a deep link. Read semantic.status before trusting an empty result: unavailable/failed means keyword-only fallback. lexical/refined resolutions are exact moments; window is a span; document has no exact timestamp.",
+        ["--kind recording|context", "--limit N", "--json"],
+      ),
       cmdDoc("search", "clipy search <query> [--json]", "Full-text search titles + descriptions"),
       cmdDoc("show", "clipy show <id|url> [--json]", "One recording's metadata + share link"),
       cmdDoc("transcript", "clipy transcript <id> [--marks-only] [--srt|--vtt|--json] | clipy transcript <id> --replace <file.json|-> ", "Print the transcript, or REPLACE it (ingest scope; file holds {segments:[{start,end,text}]} or {plaintext}; regenerates the summary). Default text output is ONE ENTRY PER LINE, chronological and timestamp-prefixed, from the same segments --srt/--vtt use — an agent-narration transcript is a list of discrete marks, and concatenating them into one run-on paragraph made it unreadable. --marks-only drops [auto] instrumentation lines (navigations, console errors) so only the narration a human wrote remains; it applies to the default text output (--srt/--vtt/--json are unaffected). A transcript with no segments falls back to plaintext, and --json still carries the raw plaintext for scripts that want the old shape.", ["--marks-only", "--srt", "--vtt", "--json", "--replace <file>"]),
@@ -5115,11 +5356,17 @@ function cmdGuide(json: boolean): void {
       cmdDoc("download", "clipy download <id> [-o path]", "Download the MP4"),
       cmdDoc("open", "clipy open <id>", "Open the share page in a browser"),
       cmdDoc("wait", "clipy wait <id> [--for transcript|summary|both] [--timeout sec]", "Block until artifacts are ready"),
+      cmdDoc(
+        "proof",
+        "clipy proof (--frame <png|jpg|webp>… | --video <webm|mp4>) [--caption <text>…] [--hold sec] [--title t] [--type kind] [--note '3: text']… [--wait] [--json]",
+        "Tool-neutral proof upload. --frame may be repeated to turn screenshots produced by any browser, computer-use, simulator, or test tool into one silent WebM; --caption must be omitted or repeated exactly once per frame and becomes timestamped agent narration. --hold controls each frame's duration (default 3s, 0.25–30; total cap 300s); --width/--height must be even integers from 320–3840 and default to 1280x720. Frame inputs are bounded to 50 MiB each and 250 MiB total. Screenshot stitching needs ffmpeg but does not need Playwright or a browser integration. --video uploads an already-recorded WebM or MP4 without re-encoding and needs no recording dependency. Exactly one source mode is required. --json prints {id, shareUrl, contextUrl, sizeBytes, source}; proof-video source reports only the detected container and never discloses the local path. Captions and notes are driver-attested narration, not Clipy-verified assertions.",
+        ["--frame", "--caption", "--video", "--hold", "--width", "--height", "--title", "--description", "--type", "--note", "--wait", "--json"],
+      ),
       cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. Auth (web capture only, applied before the first navigation so a logged-in SPA's route guard sees it): --storage-state <playwright storageState JSON path>, --cookie 'name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]' (repeatable), --local-storage 'key=value' (repeatable, target origin only), --init-script <js file run before every page load>, --user-data-dir <dir> (launch from a persistent Chromium user-data ROOT with its whole logged-in identity; web only, mutually exclusive with --storage-state; refused if <dir> is a profile subdir — pass the root — or, in direct mode, a live-locked root via SingletonLock/Socket), --profile-directory <name> (with --user-data-dir: pick a NAMED profile like 'Profile 12' from chrome://version; Playwright can't select a profile in place, so Clipy COPIES it into a temp recording root and launches the copy — loudly disclosed, the real profile is never opened or written, and the copy is deleted after upload; no need to quit Chrome, though it warns if Chrome is running since in-use DBs may copy inconsistently). Auth boundary: --storage-state only seeds what the file contains; for cross-origin auth produce it with `npx playwright open --save-storage=auth.json <login-host>`, or use --user-data-dir + --profile-directory to record your real profile, or --source mac-screen --window Chrome. With --source mac-screen: records the real screen via the Clipy Mac app (--type not yet applied on mac; auth flags rejected — the screen is already logged in); --window '<title|app|id>' or --display <id> target one window/display (ids from clipy sources). --json prints {id, shareUrl, contextUrl, sizeBytes}", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--storage-state", "--cookie", "--local-storage", "--init-script", "--user-data-dir", "--profile-directory", "--width", "--height", "--wait", "--source", "--window", "--display", "--json"]),
       cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen] [--window w] [--display d] [--expose-cdp] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). --window/--display (with --source mac-screen) record one window/display. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code — the crash-safe wrapper so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). `session run` exports CLIPY_SESSION_FILE to the child so mark/chapter resolve the session from any cwd. --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--expose-cdp", "--storage-state", "--user-data-dir", "--profile-directory", "--cookie", "--local-storage", "--init-script", "--json"]),
       cmdDoc("mark", "clipy mark \"<text>\" [--observed \"<values>\" --verdict pass|fail] [--assert-selector <css> [--assert-text <substr>]] [--assert-url <glob>] [--fail-mode warn|abort] [--at <sec>|--ago <sec>] [--json]", "Drop a live-timestamped note into the active session. A mark carries at most ONE evidence provenance, and the two are labeled + tallied separately so they can never be pooled. DRIVER-ATTESTED (--observed '<values>' --verdict pass|fail, both required together): you drove the browser and report what YOU observed — renders '<text> [≈ ASSERT driver-attested; observed=<values>]' (pass) / '<text> [≈ FAILED driver-attested; observed=<values>]' (fail) — a HEDGE glyph, never ✓/✗, so a skim distinguishes provenance by shape alone and works in EVERY session type including --source mac-screen. Honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it — put real observed values there. Combining --observed/--verdict with --assert-* is a usage error. CLIPY-VERIFIED assertion marks (Clipy-owned page only) make the note evidence Clipy itself checked: --assert-selector checks a CSS selector matches (its trimmed textContent is recorded as 'observed'); --assert-text requires that element's text to contain a substring (needs --assert-selector); --assert-url matches the page URL against a glob (** = any, * = any non-slash, no * = substring). The daemon evaluates against its live page and annotates the mark: pass ⇒ '<text> [assert ✓ verified-by-clipy; <observed>]', fail ⇒ '<text> [ASSERT ✗ verified-by-clipy; expected …; observed …]' — a false claim cannot read as fact. --fail-mode warn (default) records the ✗; --fail-mode abort DISCARDS the whole session on a failed assertion (no upload) and the CLI exits non-zero. If any assertion was attempted, a leading 0ms [verification] note is prepended, reporting the provenances as SEPARATE segments: '[verification] N clipy-verified: P passed, F failed, K unverified · M driver-attested: P passed, F failed' (a segment is omitted when empty; with only clipy-verified marks the legacy 'N assertion(s): …' rendering is byte-identical). --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now (mutually exclusive). Assertions/backdating need a web session (rejected on --source mac-screen). Up to 200 marks per recording.", ["--observed", "--verdict", "--assert-selector", "--assert-text", "--assert-url", "--fail-mode", "--at", "--ago", "--json"]),
       cmdDoc("chapter", "clipy chapter \"<label>\" [--json]", "Mark a BEFORE/AFTER section boundary in the active recording (stored as '=== CHAPTER: <label> ==='). The PR-review shape: demo the base branch, run `clipy chapter \"AFTER — fix applied\"`, swap branches + restart the dev server, demo the fix — one video carrying both states. Works on web + --source mac-screen sessions.", ["--json"]),
-      cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API reachability (GET /api/health, with latency), API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), the CONTEXT-IMPORT prerequisites (yt-dlp presence/path/version, ffmpeg + ffprobe presence/version, and whether that ffmpeg has the libwebp encoder frames need), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails. Read-only: it never installs anything, so a missing yt-dlp/ffmpeg reports WARN with the install command rather than silently downloading a binary. Run it first whenever a context import or a recording fails — it names the missing piece behind ytdlp_missing / ffmpeg_missing / auth_required / server_unreachable instead of leaving you to guess.", ["--json"]),
+      cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API reachability (GET /api/health, with latency), API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), context/proof prerequisites (yt-dlp presence/path/version, ffmpeg + ffprobe presence/version, and whether that ffmpeg has libwebp), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails. Read-only: it never installs anything, so a missing yt-dlp/ffmpeg reports WARN with the install command rather than silently downloading a binary. Run it first whenever an import, proof, or recording fails.", ["--json"]),
       cmdDoc("playwright-path", "clipy playwright-path [--json]", "Print the node_modules directory of the Playwright this CLI resolves, so your own --expose-cdp driver scripts can load the same copy: NODE_PATH=$(clipy playwright-path) node driver.js. Exits 1 (empty stdout) if Playwright is unresolvable. --json prints {path, nodeModulesDir, source}", ["--json"]),
       cmdDoc("sources", "clipy sources [--json]", "List displays + windows the Clipy Mac app can capture — ids feed --window/--display. --json gives each entry a `source` {kind,id,title} in the SAME shape session start/record report for the resolved capture, so a caller can compare what it picked against what the camera reports without transforming either."),
       cmdDoc("agents", "clipy agents <status|install|uninstall> <claude|codex|cursor>", "Install the bundled Clipy skill for a coding agent; install triggers a browser login first when no key is configured (interactive terminals only)"),
@@ -5129,7 +5376,8 @@ function cmdGuide(json: boolean): void {
     notes: [
       "Read commands accept a bare public id or the full https://clipy.online/video/<id> URL.",
       "login opens a browser to approve this device (loopback redirect to 127.0.0.1); use --key/--paste or a piped key on headless boxes.",
-      "record/session/mark/transcript --replace are the only write commands; they need a key with the 'ingest' permission.",
+      "proof/record/session/mark/transcript --replace are write commands; they need a key with the 'ingest' permission.",
+      "Tool-neutral proof: use `clipy proof --frame ...` when the agent's existing tool can save screenshots, or `clipy proof --video ...` when it can export WebM/MP4. This never requires installing Playwright, OBU, Browser Use, or another browser driver. Frame mode needs ffmpeg only to encode the supplied images; video mode uploads without re-encoding. Captions/notes are driver-attested narration and must describe literal observed values rather than claim Clipy independently verified them.",
       "Headless captures have no audio: --note flags and session marks become the transcript, labeled agent-narration.",
       "--note is absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text'); pass-scoped notes anchor to the real start of a --viewports pass, so they don't drift when load time shifts the pass boundaries. A malformed pass note (e.g. 'pass2 text' with no colon) is a usage error, not silently demoted.",
       "--type declares what a recording IS (bug_report/feature_request/product_demo/walkthrough_tutorial/feedback_review/discussion_talk/other, plus short aliases) so the AI summary doesn't misread a demo as a bug report. Applied on web today; --source mac-screen support is pending a Clipy app update.",
@@ -5245,6 +5493,10 @@ async function main(): Promise<void> {
       title: { type: "string" },
       description: { type: "string" },
       note: { type: "string", multiple: true },
+      frame: { type: "string", multiple: true },
+      caption: { type: "string", multiple: true },
+      video: { type: "string" },
+      hold: { type: "string" },
       viewports: { type: "string" },
       max: { type: "string" },
       replace: { type: "string" },
@@ -5252,6 +5504,7 @@ async function main(): Promise<void> {
       language: { type: "string" },
       folder: { type: "string" },
       tag: { type: "string", multiple: true },
+      kind: { type: "string", multiple: true },
       sync: { type: "boolean", default: false },
       // Opt out of Phase 2: sync and take the server's verdict, but never
       // download media or write frames.
@@ -5390,6 +5643,18 @@ async function main(): Promise<void> {
       await cmdList(ctx, { q, n: num(values.n ?? values.limit, 20), page: num(values.page, 1), status: values.status as string | undefined, json });
       return;
     }
+    case "memory": {
+      if (rest[0] !== "search") die("usage: clipy memory search <query> [--kind recording|context] [--limit N] [--json]", 2);
+      const query = rest.slice(1).join(" ").trim();
+      if (!query) die("usage: clipy memory search <query> [--kind recording|context] [--limit N] [--json]", 2);
+      await cmdMemorySearch(ctx, {
+        query,
+        kinds: (values.kind as string[] | undefined) ?? [],
+        limit: num(values.limit ?? values.n, 20),
+        json,
+      });
+      return;
+    }
     case "show":
       if (!rest[0]) die("usage: clipy show <id|url>", 2);
       await cmdShow(ctx, rest[0], json);
@@ -5523,6 +5788,31 @@ async function main(): Promise<void> {
       } catch (e) {
         die((e as Error).message);
       }
+      return;
+    }
+    case "proof": {
+      const framePaths = ((values.frame as string[] | undefined) ?? []).map((path) => path.trim());
+      const captions = ((values.caption as string[] | undefined) ?? []).map((caption) => caption.trim());
+      const videoPath =
+        (values.video as string | undefined)?.trim() ||
+        (framePaths.length === 0 ? rest[0]?.trim() : undefined);
+      const holdRaw = Number(values.hold ?? 3);
+      await cmdProof(ctx, {
+        framePaths,
+        captions,
+        videoPath: videoPath || undefined,
+        holdSeconds: holdRaw,
+        width: num(values.width, 1280),
+        height: num(values.height, 720),
+        name:
+          ((values.title as string | undefined) ?? (values.name as string | undefined))?.trim() ||
+          undefined,
+        description: (values.description as string | undefined)?.trim() || undefined,
+        recordingKind: values.type ? requireRecordingKind(String(values.type)) : undefined,
+        notes: ((values.note as string[] | undefined) ?? []).map(parseNoteFlag),
+        wait: Boolean(values.wait),
+        json,
+      });
       return;
     }
     case "record": {

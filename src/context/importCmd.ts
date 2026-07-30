@@ -606,6 +606,8 @@ interface SyncResult {
   documentId: string;
   publicId: string;
   created: boolean;
+  /** The server matched this source to a document you already had and updated it. */
+  refreshed: boolean;
   folderName: string | null;
   classification: ServerClassification | null;
 }
@@ -686,6 +688,7 @@ async function sync(compiled: Compiled, opts: ImportOptions, bundlePath: string)
     documentId: typeof body.id === "string" ? body.id : "",
     publicId: typeof body.publicId === "string" ? body.publicId : "",
     created: body.created !== false,
+    refreshed: body.refreshed === true,
     folderName: typeof body.folderName === "string" ? body.folderName : null,
     classification: parseClassification(body.classification, compiled.manifest.durationMs),
   };
@@ -821,7 +824,9 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
     synced = await sync(compiled, opts, bundlePath);
     const classification = synced.classification;
     notify(
-      `Synced ✓ — ${synced.publicId} (private${synced.folderName ? `, filed in ${synced.folderName}` : ""}).`,
+      synced.refreshed
+        ? `Already in your Knowledge Base — refreshed ✓ — ${synced.publicId} (private${synced.folderName ? `, still filed in ${synced.folderName}` : ""}).`
+        : `Synced ✓ — ${synced.publicId} (private${synced.folderName ? `, filed in ${synced.folderName}` : ""}).`,
     );
 
     if (classification) {
@@ -954,7 +959,11 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
           recommendedProfile: report?.recommendedProfile ?? null,
           overallScore: report?.overallScore ?? null,
           gapCount: report?.gaps.length ?? 0,
-          ...(synced ? { synced: true, publicId: synced.publicId } : opts.sync ? { synced: false } : {}),
+          ...(synced
+            ? { synced: true, publicId: synced.publicId, refreshed: synced.refreshed }
+            : opts.sync
+              ? { synced: false }
+              : {}),
           ...(synced?.folderName ? { folderName: synced.folderName } : {}),
           classification: synced?.classification ?? null,
           frames: uploadedFrames.length,
