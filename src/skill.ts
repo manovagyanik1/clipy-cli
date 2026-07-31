@@ -15,7 +15,7 @@ description: Read and create Clipy screen recordings, turn screenshots or tool-n
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.11.0 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.12.0 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
