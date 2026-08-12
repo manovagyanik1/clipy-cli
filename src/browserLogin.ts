@@ -23,7 +23,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
-import { spawn } from "node:child_process";
+import { openUrl } from "./openUrl.js";
 
 export interface BrowserLoginResult {
   apiKey: string;
@@ -78,25 +78,7 @@ function openBrowser(url: string, log: (m: string) => void): void {
   log("If the browser didn't open, visit:");
   log(`  ${url}`);
   if (process.env.CLIPY_LOGIN_NO_BROWSER) return;
-  let cmd: string;
-  let args: string[];
-  if (process.platform === "darwin") {
-    cmd = "open";
-    args = [url];
-  } else if (process.platform === "win32") {
-    cmd = "cmd";
-    args = ["/c", "start", "", url];
-  } else {
-    cmd = "xdg-open";
-    args = [url];
-  }
-  try {
-    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
-    child.on("error", () => {}); // opener missing — the printed URL is the fallback
-    child.unref();
-  } catch {
-    // ignore — the URL is already printed
-  }
+  openUrl(url);
 }
 
 export async function browserLogin(opts: BrowserLoginOptions): Promise<BrowserLoginResult> {

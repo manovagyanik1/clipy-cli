@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -11,12 +11,17 @@ const binDir = join(work, "bin");
 mkdirSync(binDir);
 
 const fakeFfmpeg = join(binDir, "ffmpeg");
+const ffmpegArgsPath = join(work, "ffmpeg-args.json");
 writeFileSync(
   fakeFfmpeg,
   `#!/usr/bin/env node
 const fs = require("node:fs");
 const out = process.argv[process.argv.length - 1];
-fs.writeFileSync(out, Buffer.concat([Buffer.from([0x1a,0x45,0xdf,0xa3]), Buffer.alloc(4096)]));
+fs.writeFileSync(${JSON.stringify(ffmpegArgsPath)}, JSON.stringify(process.argv.slice(2)));
+const mp4 = Buffer.alloc(4096);
+mp4.writeUInt32BE(24, 0);
+mp4.write("ftyp", 4, "ascii");
+fs.writeFileSync(out, mp4);
 `,
 );
 chmodSync(fakeFfmpeg, 0o755);
@@ -139,7 +144,15 @@ try {
   assert.equal(frameResult.source.kind, "proof-frames");
   assert.equal(frameResult.source.frameCount, 2);
   assert.equal(frameResult.source.durationSeconds, 3);
-  assert.equal(chunkMediaTypes[0], "video/webm");
+  assert.equal(chunkMediaTypes[0], "video/mp4");
+  const ffmpegArgs = JSON.parse(readFileSync(ffmpegArgsPath, "utf8"));
+  assert.deepEqual(ffmpegArgs.slice(ffmpegArgs.indexOf("-c:v"), ffmpegArgs.indexOf("-c:v") + 2), [
+    "-c:v",
+    "libx264",
+  ]);
+  assert.match(ffmpegArgs[ffmpegArgs.indexOf("-filter_complex") + 1], /flags=lanczos/);
+  assert.equal(ffmpegArgs[ffmpegArgs.indexOf("-crf") + 1], "14");
+  assert.equal(ffmpegArgs[ffmpegArgs.indexOf("-tune") + 1], "stillimage");
 
   assert.equal(completes[0].name, "Settings fix proof");
   assert.equal(completes[0].recordingKind, "bug_report");

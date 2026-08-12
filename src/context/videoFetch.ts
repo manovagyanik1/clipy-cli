@@ -181,37 +181,60 @@ function attemptDownload(
   });
 }
 
+interface Escalation {
+  plan: AttemptPlan;
+  notice: string;
+  success: string;
+}
+
 /**
- * Three attempts on yt-dlp's own defaults, then two escalations.
+ * YouTube's ladder. Every rung is YouTube-specific — `player_client` is that
+ * extractor's argument and format 18 is one of its itags — so no other provider
+ * may borrow it: on a non-YouTube URL these turn a retriable failure into
+ * "Requested format is not available", which classifies as fatal.
+ *
+ * The reasoning behind each rung is in docs/research/2026-07-29-ytdlp-403-fallbacks.md §3.
+ */
+const YOUTUBE_ESCALATIONS: Escalation[] = [
+  {
+    plan: { format: DEFAULT_FORMAT, extraArgs: TOKEN_FREE_CLIENT_ARGS },
+    notice: "Still blocked — trying YouTube's token-free player clients (tv, android_vr, web_embedded)…",
+    success: "A different player client worked — continuing with frame extraction.",
+  },
+  {
+    plan: PROGRESSIVE_FALLBACK,
+    notice: "Still blocked — falling back to a pre-muxed progressive format (lower resolution, but it downloads in one piece)…",
+    success: "The progressive format worked — continuing with frame extraction.",
+  },
+];
+
+/**
+ * Loom serves a small ladder of HLS renditions and no itags, so there is
+ * nothing to escalate to — yt-dlp's own retries plus our three attempts are the
+ * whole strategy. The format spec ends in an unconstrained pair because a Loom
+ * recorded straight to 1080p may publish no rendition at or under 720p, and "no
+ * frames because the only copy was too tall" is a worse answer than one larger
+ * download that the byte and duration ceilings still bound.
+ */
+const LOOM_FORMAT = "bv*[height<=720]/b[height<=720]/bv*/b";
+
+/**
+ * Three attempts on yt-dlp's own defaults, then whatever escalations the
+ * provider has.
  *
  * The 403 this exists for is not a verdict about the video — the identical
  * command succeeds a minute later, because the media URL YouTube signed has
  * expired and only a fresh extraction mints a new one. Re-running the binary IS
  * the re-extraction, which is why the outer loop earns its keep even though
  * BASELINE_DOWNLOAD_ARGS already makes yt-dlp retry internally.
- *
- * The escalation ladder and the reasoning behind each rung are documented in
- * docs/research/2026-07-29-ytdlp-403-fallbacks.md §3.
  */
 async function downloadWithRetries(
   dir: string,
   input: { ytDlpBin: string; url: string; notify: (msg: string) => void },
+  base: AttemptPlan,
+  escalations: Escalation[],
 ): Promise<void> {
-  const base: AttemptPlan = { format: DEFAULT_FORMAT, extraArgs: [] };
   let last = "";
-
-  const escalations: { plan: AttemptPlan; notice: string; success: string }[] = [
-    {
-      plan: { format: DEFAULT_FORMAT, extraArgs: TOKEN_FREE_CLIENT_ARGS },
-      notice: "Still blocked — trying YouTube's token-free player clients (tv, android_vr, web_embedded)…",
-      success: "A different player client worked — continuing with frame extraction.",
-    },
-    {
-      plan: PROGRESSIVE_FALLBACK,
-      notice: "Still blocked — falling back to a pre-muxed progressive format (lower resolution, but it downloads in one piece)…",
-      success: "The progressive format worked — continuing with frame extraction.",
-    },
-  ];
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     if (attempt > 1) clearDir(dir);
@@ -258,12 +281,30 @@ function lastLine(stderr: string): string {
  * Throws VideoUnavailableError when the source is out of bounds — callers treat
  * that as "stay transcript-only", not as a failed import.
  */
-export async function borrowYoutubeVideo(input: {
+export function borrowYoutubeVideo(input: {
   ytDlpBin: string;
   url: string;
   durationMs: number;
   notify: (msg: string) => void;
 }): Promise<BorrowedVideo> {
+  return borrowRemoteVideo(input, { format: DEFAULT_FORMAT, extraArgs: [] }, YOUTUBE_ESCALATIONS);
+}
+
+/** The same borrow, against Loom's renditions and without YouTube's ladder. */
+export function borrowLoomVideo(input: {
+  ytDlpBin: string;
+  url: string;
+  durationMs: number;
+  notify: (msg: string) => void;
+}): Promise<BorrowedVideo> {
+  return borrowRemoteVideo(input, { format: LOOM_FORMAT, extraArgs: [] }, []);
+}
+
+async function borrowRemoteVideo(
+  input: { ytDlpBin: string; url: string; durationMs: number; notify: (msg: string) => void },
+  base: AttemptPlan,
+  escalations: Escalation[],
+): Promise<BorrowedVideo> {
   if (input.durationMs > MAX_DURATION_MS) {
     throw new VideoUnavailableError(
       `the video is ${Math.round(input.durationMs / 3_600_000)}h long — over the ${MAX_DURATION_MS / 3_600_000}h ceiling for frame extraction, so no video was downloaded.`,
@@ -281,7 +322,7 @@ export async function borrowYoutubeVideo(input: {
 
   try {
     input.notify("Downloading a low-resolution (≤720p) copy of the video for frame extraction — it is deleted the moment the frames are cut…");
-    await downloadWithRetries(dir, input);
+    await downloadWithRetries(dir, input, base, escalations);
 
     const file = readdirSync(dir).find((f) => f.startsWith("source."));
     if (!file || !existsSync(join(dir, file)) || statSync(join(dir, file)).size === 0) {

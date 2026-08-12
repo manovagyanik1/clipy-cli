@@ -10,12 +10,12 @@
  */
 export const CLIPY_SKILL_MD = `---
 name: clipy
-description: Read and create Clipy screen recordings, turn screenshots or tool-native video into proof, and turn any video into agent-readable context. Use when the user shares a clipy.online/video/<id> URL (watch, summarize, or act on a recording, bug report, or walkthrough), shares a YouTube URL or local video file as context/reference for a task ("implement what this video shows", "give me the context of this video" — import it with clipy context import), OR asks you to verify your own work and share proof through Clipy.
+description: Read and create Clipy screen recordings, turn screenshots or tool-native video into proof, and turn any video into agent-readable context. Use when the user shares a clipy.online/video/<id> URL (watch, summarize, or act on a recording, bug report, or walkthrough), shares a YouTube URL, a Loom share link, or a local video file as context/reference for a task ("implement what this video shows", "give me the context of this video" — import it with clipy context import), OR asks you to verify your own work and share proof through Clipy.
 ---
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.12.0 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.13.0 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
@@ -35,6 +35,12 @@ honest fallbacks. For the exact installed version, trust \`clipy guide --json\`;
 for an MCP connection, trust its \`tools/list\` response.
 
 ## Reading a recording (no auth needed for public links)
+
+RULE: every Clipy watch link has a machine-readable markdown twin at the same
+URL with \`.md\` appended. Whenever a Clipy video link appears ANYWHERE in your
+task — the user's message, a PR description, an issue, a pasted chat — do not
+try to watch the video or scrape the watch page: fetch the twin
+(\`https://clipy.online/video/<id>.md\`) and work from that.
 
 1. Given \`https://clipy.online/video/<id>\`, read the context document — either
    \`clipy context <id>\` or fetch \`https://clipy.online/video/<id>.md\`. Same
@@ -77,15 +83,20 @@ context hit with MCP \`read_context_document\`.
 
 ## Turning someone else's video into context (clipy context import)
 
-When the user hands you a YouTube URL or a local video file AS REFERENCE — "follow
-this tutorial", "here's the walkthrough", "this talk explains our approach" — you
-do not have to guess from the title. Convert it into a readable bundle:
+When the user hands you a YouTube URL, a Loom share link, or a local video file
+AS REFERENCE — "follow this tutorial", "here's the walkthrough", "this talk
+explains our approach" — you do not have to guess from the title. Convert it into
+a readable bundle:
 
     clipy context import https://youtube.com/watch?v=… --sync --json
+    clipy context import https://www.loom.com/share/<32-hex-id> --sync --json
     clipy context import ./demo.mov --transcript ./demo.vtt --sync --json
 
-Captions first, so it's fast: YouTube captions are fetched on your machine and no
-media is downloaded unless it turns out to be needed. Local files carry no
+Captions first, so it's fast: YouTube captions and Loom transcripts are fetched on
+your machine and no media is downloaded unless it turns out to be needed. Loom
+needs no yt-dlp for this at all, so a yt-dlp warning in \`clipy doctor\` does not
+block a Loom import. Roughly one Loom in six has no transcript recorded, and that
+comes back as \`no_captions\` rather than an empty bundle. Local files carry no
 captions, so they need \`--transcript <.vtt|.srt|.json>\`.
 
 With \`--sync\`, the SERVER classifies the bundle — what kind of video it is, and
@@ -167,7 +178,9 @@ envelope says, including partial states.
 | code | what happened | what to do |
 |---|---|---|
 | \`invalid_url\` | the URL isn't a video Clipy can resolve | Re-read the URL with the user. Don't retry the same string. |
-| \`no_captions\` | the YouTube video has no captions in any language | Nothing to transcribe from. Tell the user; offer to import a local file with \`--transcript\`, or to proceed without the video. Not retryable. |
+| \`no_captions\` | the source publishes no transcript: a YouTube video captioned in no language, or one of the ~16% of Looms with none recorded | Nothing to transcribe from. Tell the user; offer to re-run with \`--transcript\`, or to proceed without the video. Not retryable. |
+| \`loom_unreachable\` | loom.com or its transcript CDN did not answer usefully | Usually transient. Re-run the SAME command once after a pause. If it repeats it is a network/proxy problem, not a bad link. |
+| \`source_private\` | the video exists but is private or password-protected | Ask the user for a public share link, or for an exported copy to import with \`--transcript\`. Re-running the same URL cannot help. |
 | \`ytdlp_missing\` | yt-dlp couldn't be installed or resolved | \`clipy doctor --json\` names the path it tried. Fix: let it auto-install (it lands in \`~/.clipy/bin\`), or install manually — \`brew install yt-dlp\` / \`pipx install yt-dlp\`. Then re-run. |
 | \`ytdlp_download_403\` | YouTube refused the media download | **The CLI already retried internally.** If you still see this, the transcript half may have succeeded — read the envelope for what synced. Tell the user frames are pending and the document is usable without them. Do NOT loop. |
 | \`ffmpeg_missing\` | ffmpeg/ffprobe not found | \`brew install ffmpeg\` (macOS) · \`sudo apt install ffmpeg\` (Linux) · \`winget install Gyan.FFmpeg\`. Then re-run the SAME import command. |
@@ -229,8 +242,11 @@ Headless web capture also needs Playwright (kept out of the base install):
 
     npm i -g playwright && npx playwright install chromium
 
-Wiring up a coding agent? \`clipy agents install <claude|codex|cursor>\` does the
-browser login (if no key yet) and installs this skill.
+Wiring up a coding agent? \`clipy setup <claude|codex|cursor|windsurf|opencode>\`
+does the browser login (if no key yet), installs this skill, and registers the
+Clipy MCP server in that agent's own config. \`clipy agents install <target>\` is
+the skill-only form. Published instructions an agent can fetch and execute:
+https://clipy.online/agent-setup/prompt.md
 
 ## Choose the proof path before recording
 

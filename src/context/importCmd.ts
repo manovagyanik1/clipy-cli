@@ -1,6 +1,6 @@
 /**
- * `clipy context import <youtube-url|local-file>` — compiles a local Clipy
- * context bundle (AREC v0.2-draft) and optionally syncs it to the library.
+ * `clipy context import <youtube-url|loom-url|local-file>` — compiles a local
+ * Clipy context bundle (AREC v0.2-draft) and optionally syncs it to the library.
  *
  * Syncing is a TWO-PHASE protocol, and the split is deliberate: the server is
  * the classification brain. Phase 1 uploads the transcript bundle and the
@@ -38,6 +38,15 @@ import {
 } from "../context-core/index.js";
 import { describeCaptions, fetchCaptions, fetchVideoMeta, resolveYtDlp } from "./ytdlp.js";
 import { canonicalYoutubeUrl, isYoutubeHost, parseYoutubeId } from "./youtubeUrl.js";
+import {
+  LoomError,
+  canonicalLoomUrl,
+  fetchLoomMeta,
+  fetchLoomTranscript,
+  isLoomHost,
+  parseLoomId,
+  parseLoomPhrases,
+} from "./loom.js";
 
 // The web app and the API share an origin in every real deployment; strip any
 // trailing slash so the printed URL is clean.
@@ -48,7 +57,7 @@ import { ImportError, type ImportWarning } from "./errors.js";
 import { looksLikeStaleBinary } from "./retry.js";
 import { probeVideo } from "./probe.js";
 import { extractFrames, type ExtractedFrame } from "./frames.js";
-import { borrowLocalVideo, borrowYoutubeVideo, type BorrowedVideo } from "./videoFetch.js";
+import { borrowLocalVideo, borrowLoomVideo, borrowYoutubeVideo, type BorrowedVideo } from "./videoFetch.js";
 
 export interface ImportOptions {
   apiUrl: string;
@@ -68,6 +77,7 @@ export interface ImportOptions {
 
 type Input =
   | { kind: "youtube"; url: string; videoId: string }
+  | { kind: "loom"; url: string; videoId: string }
   | { kind: "local"; path: string }
   | { kind: "url"; url: string };
 
@@ -95,6 +105,17 @@ function classifyInput(raw: string): Input {
       }
       // Everything downstream uses the canonical URL — never the raw input.
       return { kind: "youtube", url: canonicalYoutubeUrl(videoId), videoId };
+    }
+    if (isLoomHost(parsed.hostname)) {
+      const videoId = parseLoomId(trimmed);
+      if (!videoId) {
+        throw new ImportError(
+          "invalid_url",
+          `could not find a Loom video id in "${raw}". Folder and workspace URLs are not supported.`,
+          `Pass a single-video share link, e.g. clipy context import "https://www.loom.com/share/<32-hex-id>" (/embed/<id> also works).`,
+        );
+      }
+      return { kind: "loom", url: canonicalLoomUrl(videoId), videoId };
     }
     return { kind: "url", url: unescaped };
   }
@@ -191,7 +212,14 @@ function loadUserTranscript(transcriptPath: string): TranscriptSegment[] {
 /** How Phase 2 would get at the pixels, if the server asks for them. */
 type MediaRef =
   | { kind: "local"; path: string }
-  | { kind: "youtube"; url: string; ytDlpBin: string; durationMs: number };
+  | { kind: "youtube"; url: string; ytDlpBin: string; durationMs: number }
+  /**
+   * No binary here on purpose. A Loom transcript is compiled over plain HTTPS,
+   * so yt-dlp is resolved (and, on a first run, installed) only if the server
+   * actually asks for frames — and a Loom import must never fail for the want
+   * of a tool its transcript never needed.
+   */
+  | { kind: "loom"; url: string; durationMs: number };
 
 interface Compiled {
   manifest: ArecManifest;
@@ -336,6 +364,134 @@ async function compileYoutube(url: string, videoId: string, opts: ImportOptions)
     media: { kind: "youtube", url, ytDlpBin: bin, durationMs: meta.durationMs },
     opts,
   });
+}
+
+/** Loom's own failure vocabulary, in the CLI's stable codes. */
+function loomImportError(e: LoomError, url: string): ImportError {
+  if (e.kind === "private") {
+    return new ImportError(
+      "source_private",
+      `${e.message} (${url})`,
+      `Ask the owner for a public share link, or export the video and import the copy: clipy context import ./<file> --transcript <file.vtt>`,
+    );
+  }
+  if (e.kind === "not_found") {
+    return new ImportError(
+      "invalid_url",
+      `${e.message} (${url})`,
+      `Open the link in a browser to check it plays, then re-run with the URL it lands on.`,
+    );
+  }
+  return new ImportError(
+    "loom_unreachable",
+    e.message,
+    `This is usually transient. Re-run the same command in a minute. If it persists, check your network or proxy: Clipy reaches loom.com and cdn.loom.com directly.`,
+  );
+}
+
+/**
+ * A Loom share link, over plain HTTPS.
+ *
+ * Loom publishes the transcript for a public link itself, so unlike the YouTube
+ * path nothing here shells out: no yt-dlp, no ffmpeg, no auto-install, and one
+ * fewer class of failure. The bundle that comes out is the same shape as every
+ * other one.
+ */
+async function compileLoom(url: string, videoId: string, opts: ImportOptions): Promise<Compiled> {
+  notify("Fetching video info from Loom…");
+  let meta;
+  try {
+    meta = await fetchLoomMeta(videoId);
+  } catch (e) {
+    if (e instanceof LoomError) throw loomImportError(e, url);
+    throw e;
+  }
+  notify(`Found: "${meta.title}"${meta.durationMs ? ` (${fmtClock(meta.durationMs)})` : ""}`);
+
+  const id = meta.id || videoId;
+  const source: ContextSource = {
+    kind: "loom",
+    canonicalUrl: canonicalLoomUrl(id),
+    providerId: id,
+  };
+  const common = {
+    title: opts.title ?? meta.title,
+    source,
+    durationMs: meta.durationMs,
+    fingerprint: `loom:${id}`,
+    media: { kind: "loom" as const, url, durationMs: meta.durationMs },
+    opts,
+  };
+
+  // An explicit --transcript is the user overriding the provider, so Loom's own
+  // transcript is never consulted — not even as a fallback.
+  if (opts.transcriptPath) {
+    const segments = loadUserTranscript(opts.transcriptPath);
+    notify(`Using your transcript file (${segments.length} segments), so Loom's own transcript is not consulted.`);
+    return finish({
+      ...common,
+      transcript: buildNormalizedTranscript(segments, {
+        ...(opts.language ? { language: opts.language } : {}),
+        source: "user_file",
+        durationMs: meta.durationMs || undefined,
+      }),
+    });
+  }
+
+  // --language picks a caption TRACK on YouTube. Loom publishes exactly one
+  // transcript, so there is nothing here for it to pick — say so rather than
+  // letting the user believe they asked for a language and got it.
+  if (opts.language) {
+    notify(
+      `Note: --language does not select a transcript on Loom, which publishes only one. Importing the transcript Loom has.`,
+    );
+  }
+
+  let fetched;
+  try {
+    fetched = await fetchLoomTranscript(id);
+  } catch (e) {
+    if (e instanceof LoomError) throw loomImportError(e, url);
+    throw e;
+  }
+
+  // Roughly one Loom in six has no transcript recorded at all. There is nothing
+  // to compile from and nothing for the classifier to score, so this refuses
+  // rather than writing a bundle whose only honest content is its own emptiness
+  // — the same answer the YouTube path gives a video with no captions.
+  if (!fetched) {
+    throw new ImportError(
+      "no_captions",
+      `this Loom video has no transcript. Loom records one for most videos but not all, and it cannot be requested after the fact.`,
+      `Supply your own: clipy context import ${JSON.stringify(url)} --transcript <file.vtt|file.srt|transcript.json>`,
+    );
+  }
+
+  const raw =
+    fetched.format === "vtt"
+      ? parseVtt(fetched.text)
+      : parseLoomPhrases(JSON.parse(fetched.text), meta.durationMs);
+
+  if (raw.length === 0) {
+    throw new ImportError(
+      "no_captions",
+      `Loom returned a transcript for this video but it contained no readable speech.`,
+      `Supply your own: clipy context import ${JSON.stringify(url)} --transcript <file.vtt|file.srt|transcript.json>`,
+    );
+  }
+
+  const transcript = buildNormalizedTranscript(raw, {
+    // Loom's transcript is machine-generated ASR. Labelling it creator-provided
+    // would overstate its fidelity to every agent that reads the manifest.
+    source: "auto_captions",
+    ...(fetched.language || opts.language ? { language: fetched.language ?? opts.language } : {}),
+    durationMs: meta.durationMs || undefined,
+  });
+  notify(
+    `Got ${transcript.segments.length} transcript segments from Loom (${fetched.format === "vtt" ? "captions" : "phrase timings"}, auto-generated).`,
+  );
+
+  return finish({ ...common, transcript });
 }
 
 async function compileLocal(path: string, opts: ImportOptions): Promise<Compiled> {
@@ -744,15 +900,26 @@ async function collectFrames(
   const workDir = mkdtempSync(join(tmpdir(), "clipy-frames-out-"));
 
   try {
-    borrowed =
-      compiled.media.kind === "local"
-        ? borrowLocalVideo(compiled.media.path)
-        : await borrowYoutubeVideo({
-            ytDlpBin: compiled.media.ytDlpBin,
-            url: compiled.media.url,
-            durationMs: compiled.media.durationMs,
-            notify,
-          });
+    if (compiled.media.kind === "local") {
+      borrowed = borrowLocalVideo(compiled.media.path);
+    } else if (compiled.media.kind === "youtube") {
+      borrowed = await borrowYoutubeVideo({
+        ytDlpBin: compiled.media.ytDlpBin,
+        url: compiled.media.url,
+        durationMs: compiled.media.durationMs,
+        notify,
+      });
+    } else {
+      // First point in a Loom import that needs a binary at all. Resolving it
+      // here — inside the block whose every failure is a warning — is what keeps
+      // a missing yt-dlp costing the user the pictures rather than the import.
+      borrowed = await borrowLoomVideo({
+        ytDlpBin: await resolveYtDlp(notify),
+        url: compiled.media.url,
+        durationMs: compiled.media.durationMs,
+        notify,
+      });
+    }
 
     const frames = await extractFrames({
       videoPath: borrowed.path,
@@ -781,7 +948,11 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
   }
 
   let compiled =
-    input.kind === "youtube" ? await compileYoutube(input.url, input.videoId, opts) : await compileLocal(input.path, opts);
+    input.kind === "youtube"
+      ? await compileYoutube(input.url, input.videoId, opts)
+      : input.kind === "loom"
+        ? await compileLoom(input.url, input.videoId, opts)
+        : await compileLocal(input.path, opts);
 
   const outputDir = resolve(opts.outputDir ?? process.cwd());
   let { path: bundlePath, rewritten } = writeBundle(outputDir, compiled);
@@ -857,16 +1028,21 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
         // Phase 2: fetch only the moments the server named.
         const { frames, workDir, failure } = await collectFrames(compiled, classification.frameTimestampsMs, opts);
         if (failure) {
+          // A Loom import reaches yt-dlp for the first time HERE, so "could not
+          // install yt-dlp" is a failure mode this branch can now see — and it
+          // has a different fix from a blocked download or a missing ffmpeg.
+          const missingYtDlp = /could not install yt-dlp/i.test(failure);
+          const missingFfmpeg = !missingYtDlp && /ffmpeg|ffprobe/i.test(failure);
           warnings.push({
-            code: /403/.test(failure)
-              ? "ytdlp_download_403"
-              : /ffmpeg|ffprobe/i.test(failure)
-                ? "ffmpeg_missing"
-                : "frames_upload_failed",
+            code: missingYtDlp
+              ? "ytdlp_missing"
+              : /403/.test(failure)
+                ? "ytdlp_download_403"
+                : missingFfmpeg
+                  ? "ffmpeg_missing"
+                  : "frames_upload_failed",
             error: `frames could not be extracted: ${failure.split("\n")[0]}`,
-            remediation: /ffmpeg|ffprobe/i.test(failure)
-              ? FFMPEG_INSTALL_COMMAND
-              : rerunCommand(target, opts),
+            remediation: missingFfmpeg ? FFMPEG_INSTALL_COMMAND : rerunCommand(target, opts),
           });
           // Phase 1 already succeeded — this is a PARTIAL success, and saying
           // "failed" here would send the user hunting for a document that is

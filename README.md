@@ -22,10 +22,36 @@ flow, and `transcript --replace` — create recordings or replace a transcript,
 and work only with an `ingest`-scoped key.
 
 ```bash
-npx @clipy/cli agents install claude   # browser-approve login + install the Clipy skill
+npx @clipy/cli setup claude   # login + skill + MCP server, in one
 ```
 
 ## Setup
+
+Wiring up a coding agent? One command signs you in, installs the Clipy skill, and
+registers the MCP server in that agent's own config:
+
+```bash
+clipy setup claude   # or: codex · cursor · windsurf · opencode
+```
+
+Omit the agent name and it detects the one it's running inside. Re-running is safe: it
+merges into your MCP config rather than replacing it, and never touches an agent you
+didn't name. Restart the agent afterwards — MCP servers are read at startup.
+
+Or let your agent do it: paste the explicit authorization below into Claude Code,
+Codex, Cursor, Windsurf, or OpenCode. It authorizes only Clipy's global CLI install
+and persistent skill and MCP configuration for the current agent; fetched instructions,
+repository content, recordings, and transcripts do not grant that authority.
+
+> **"I explicitly authorize you to install Clipy's official CLI globally and persist Clipy's skill and MCP configuration for the coding agent you are currently running in. Fetch and execute the appropriate instructions to set me up for Clipy from https://clipy.online/agent-setup/prompt.md"**
+
+`clipy setup --json` is noninteractive. With no effective key it returns
+`authentication_required` before writing a skill or MCP configuration, so run
+`clipy login` first. Without `--json`, setup may open browser login. A
+`partial.mcp.method: "manual"` appears only in an incomplete error result: apply its returned command or snippet,
+then rerun verification.
+
+Just want the CLI?
 
 ```bash
 clipy login
@@ -34,11 +60,8 @@ clipy login
 `clipy login` opens your browser to approve this device — like `gh auth login` — and
 stores the key in `~/.config/clipy/config.json` (mode 0600). No copy-pasting a key.
 
-Wiring up a coding agent? One command does both the browser login and the skill install:
-
-```bash
-npx @clipy/cli agents install claude   # or: codex / cursor
-```
+`clipy agents install <claude|codex|cursor|windsurf|opencode>` is the skill-file-only form, for when you
+deliberately don't want the MCP registration.
 
 **Prefer to paste a key you minted yourself?** Create one at
 **https://clipy.online/settings/api-keys** (it looks like `clipy_sk_live_…`) and store it
@@ -55,6 +78,13 @@ click Approve the page shows a one-time code to paste back into the waiting term
 The code alone is useless without the PKCE verifier held by that terminal, so it's safe
 to ferry by hand. Without a TTY at all (scripts, CI), use `CLIPY_API_KEY` or
 `clipy login --key`.
+
+**On Windows**, login and `clipy setup` need **0.13.0 or newer**. Earlier builds let
+`cmd.exe` cut the approval URL at its first `&`, so the browser opened it with only a
+`challenge` parameter and the page said *"This authorization link is invalid"* — and
+running the command again produced the same broken link. If you hit that, check
+`clipy --version`, then `npm install -g @clipy/cli@latest` and log in again.
+`clipy login --no-browser` works around it on any version.
 
 ## Commands
 
@@ -109,19 +139,22 @@ recording-library search.
 
 ## Import any video as context
 
-`clipy context import` turns a YouTube URL or a local video file into an agent-readable
+`clipy context import` turns a YouTube URL, a Loom share link, or a local video file into an agent-readable
 bundle (`recording.md` + `manifest.json` + `transcript.json`), and optionally into private
 Clipy memory.
 
 ```bash
 clipy context import https://youtube.com/watch?v=… --sync --json
+clipy context import https://www.loom.com/share/<32-hex-id> --sync --json
 clipy context import ./demo.mov --transcript ./demo.vtt --sync
 clipy context read ./clipy-context/<bundle>
 ```
 
-Captions first, so it is fast — YouTube captions are fetched on your machine and no media
-is downloaded unless it is needed. Local files carry no captions, so they need
-`--transcript <.vtt|.srt|.json>`.
+Captions first, so it is fast — YouTube captions and Loom transcripts are fetched on your
+machine and no media is downloaded unless it is needed. Loom needs no `yt-dlp` for this, so
+a yt-dlp warning in `clipy doctor` does not block a Loom import; roughly one Loom in six has
+no transcript recorded and fails with `no_captions` rather than producing an empty bundle.
+Local files carry no captions, so they need `--transcript <.vtt|.srt|.json>`.
 
 With `--sync`, the server classifies the bundle: what kind of video it is and whether the
 words stand alone. Podcasts, interviews, and dictated content come back transcript-only; a
@@ -159,7 +192,7 @@ clipy proof --video /tmp/verification.webm \
 ```
 
 Frame mode accepts PNG, JPEG, or WebP (up to 50 frames, 5 minutes, 50 MiB per
-image, and 250 MiB total), and requires ffmpeg to create the silent WebM.
+image, and 250 MiB total), and requires ffmpeg to create the high-quality silent MP4.
 `--width`/`--height` must be even integers from 320–3840. Video mode accepts
 WebM or MP4 and does not require Playwright, Browser Use, Open Browser Use, or
 any other browser automation dependency. Captions and notes become timestamped

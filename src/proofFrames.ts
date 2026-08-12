@@ -28,7 +28,7 @@ function evenDimension(value: number, label: string): number {
     throw new Error(`${label} must be an integer between 320 and 3840`);
   }
   if (value % 2 !== 0) {
-    throw new Error(`${label} must be even for WebM encoding`);
+    throw new Error(`${label} must be even for video encoding`);
   }
   return value;
 }
@@ -61,7 +61,7 @@ function validateFrames(paths: string[]): string[] {
 }
 
 /**
- * Turns a bounded sequence of screenshots into a silent WebM. Each screenshot
+ * Turns a bounded sequence of screenshots into a silent MP4. Each screenshot
  * is held for the same duration; narration/captions remain separate so the
  * server can expose them as timestamped agent evidence.
  *
@@ -90,7 +90,7 @@ export async function renderProofFrames(
 
   const filters: string[] = framePaths.map(
     (_frame, index) =>
-      `[${index}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+      `[${index}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=lanczos,` +
       `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,` +
       `setsar=1,fps=30,format=yuv420p[v${index}]`,
   );
@@ -105,15 +105,17 @@ export async function renderProofFrames(
     "-map",
     "[outv]",
     "-c:v",
-    "libvpx",
-    "-deadline",
-    "good",
-    "-cpu-used",
-    "4",
+    "libx264",
+    "-preset",
+    "medium",
+    "-tune",
+    "stillimage",
     "-crf",
-    "28",
-    "-b:v",
-    "0",
+    "14",
+    "-profile:v",
+    "main",
+    "-movflags",
+    "+faststart",
     "-an",
     "-y",
     opts.outputPath,

@@ -66,7 +66,7 @@ export interface SufficiencyReport {
 }
 
 export interface ContextSource {
-  kind: 'youtube' | 'local' | 'url';
+  kind: 'youtube' | 'loom' | 'local' | 'url';
   canonicalUrl?: string;
   providerId?: string;
   contentHash?: string;

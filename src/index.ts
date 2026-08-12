@@ -27,7 +27,20 @@ import { pathToFileURL } from "node:url";
 import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { CLIPY_SKILL_MD } from "./skill.js";
+import {
+  SETUP_TARGETS,
+  detectSetupTarget,
+  isSetupTarget,
+  type McpRegistration,
+  registerMcpServer,
+  renderSetupBox,
+  shortPath,
+  skillPathFor as setupSkillPathFor,
+  type SetupEnv,
+  type SetupTarget,
+} from "./setup.js";
 import { browserLogin, shouldUseManualLogin, type BrowserLoginResult } from "./browserLogin.js";
+import { openUrl } from "./openUrl.js";
 import { cmdContextImport } from "./context/importCmd.js";
 import { cmdContextRead } from "./context/readCmd.js";
 import { errorEnvelope } from "./context/errors.js";
@@ -381,12 +394,14 @@ ${c.bold("RECORDINGS")}
   summary <id> [--json]             AI summary: TL;DR, key points, action items
   moments <id> [--json]             Key moments (timestamps + captions + click coords)
   context <id>                      Full agent-context bundle as markdown
-  context import <youtube-url|file> [--transcript <f>] [--output <dir>]
+  context import <youtube-url|loom-url|file> [--transcript <f>] [--output <dir>]
                                     Compile ANY video into a local Clipy context
                                     bundle (recording.md + manifest.json +
-                                    transcript.json). YouTube captions are fetched
-                                    on your machine — no media leaves it. Local
-                                    files need --transcript <.vtt|.srt|.json>
+                                    transcript.json). YouTube captions and Loom
+                                    transcripts are fetched on your machine — no
+                                    media leaves it, and Loom needs no yt-dlp at
+                                    all. Local files need --transcript
+                                    <.vtt|.srt|.json>
     --language <code> Caption language preference (default en)
     --title <t>       Override the bundle title
     --tag <t>         Tag for --sync (repeatable)  ·  --folder <name>
@@ -505,9 +520,16 @@ ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session
   session status                    Show the active session's state
 
 ${c.bold("AGENTS")}
-  agents install <claude|codex|cursor>
-                                    Install the bundled Clipy skill for a coding
-                                    agent (teaches it to read + make recordings)
+  setup [claude|codex|cursor|windsurf|opencode]
+                                    Wire Clipy into a coding agent in ONE command:
+                                    sign in, install the skill, and register the MCP
+                                    server in that agent's own config. Detects the
+                                    agent it is running inside when you omit the name.
+                                    ${c.dim("Published instructions: clipy.online/agent-setup/prompt.md")}
+  agents install <claude|codex|cursor|windsurf|opencode>
+                                    Skill only — no MCP, no login prompt beyond the
+                                    first-run one. Use ${c.bold("setup")} unless you deliberately
+                                    want just the skill file
   agents status | uninstall <t>     Show / remove installed skills
   doctor [--json]                   Health check: API key, Mac agent bridge,
                                     Playwright, and install mode — with fix hints
@@ -526,7 +548,8 @@ ${c.bold("GLOBAL FLAGS")}
   --api-url <url>   API base (else CLIPY_API_URL, default https://clipy.online)
   --json            Machine-readable output. Supported on: list, search, show,
                     transcript, summary, moments, wait, proof, record, session
-                    start/stop/status, mark, chapter, doctor, playwright-path
+                    start/stop/status, mark, chapter, setup, agents, doctor,
+                    playwright-path
   -v, --version     Print version
 
 ${c.bold("EXIT CODES")}
@@ -541,8 +564,10 @@ ${c.bold("EXIT CODES")}
   "partial":null}. Branch on "code" (stable), never on the message text.
 
 ${c.bold("SETUP")}
-  1. ${c.bold("clipy login")}                approve this device in your browser
-  2. ${c.bold("clipy list")}                 (or: ${c.bold("clipy agents install claude")} to wire up a coding agent)
+  ${c.bold("clipy setup claude")}   one command: sign in, install the skill, register MCP
+                       ${c.dim("(also: codex · cursor · windsurf · opencode — or omit to auto-detect)")}
+
+  Reading recordings by hand instead? ${c.bold("clipy login")}, then ${c.bold("clipy list")}.
 
 Write commands — ${c.bold("proof")}, ${c.bold("record")}, ${c.bold("session")}/${c.bold("mark")}, and ${c.bold("transcript --replace")} — need a key
 with the "ingest" permission. Everything else is read-only.
@@ -619,6 +644,7 @@ async function storeAndVerifyKey(
     cfg.apiKey = key;
     if (ctx.apiUrl !== "https://clipy.online") cfg.apiUrl = ctx.apiUrl;
     writeConfig(cfg);
+    ctx.apiKey = key;
   };
   if (opts.storeFirst) {
     store();
@@ -978,16 +1004,8 @@ function fmtBytes(n: number): string {
 async function cmdOpen(ctx: Ctx, id: string): Promise<void> {
   const pid = normalizeId(id, ctx);
   const url = `${ctx.apiUrl}/video/${pid}`;
-  const platform = process.platform;
-  const opener = platform === "darwin" ? "open" : platform === "win32" ? "cmd" : "xdg-open";
-  const args = platform === "win32" ? ["/c", "start", "", url] : [url];
-  try {
-    const child = spawn(opener, args, { detached: true, stdio: "ignore" });
-    child.unref();
-    process.stdout.write(`${c.green("✓")} opening ${c.cyan(url)}\n`);
-  } catch {
-    process.stdout.write(`${url}\n`);
-  }
+  openUrl(url);
+  process.stdout.write(`${c.green("✓")} opening ${c.cyan(url)}\n`);
 }
 
 async function cmdWait(
@@ -1355,7 +1373,10 @@ async function doctorYtDlpCheck(): Promise<DoctorCheck> {
     return {
       name: "yt-dlp",
       status: "warn",
-      detail: "not installed — `clipy context import <youtube-url>` cannot resolve YouTube yet",
+      // Deliberately narrow: a Loom import compiles its transcript over plain
+      // HTTPS and needs this binary only if the server later asks for frames,
+      // so this must not read as "context import is unavailable".
+      detail: "not installed, so `clipy context import <youtube-url>` cannot resolve YouTube yet (a Loom import still works; yt-dlp is only needed there for frames)",
       hint: "Clipy auto-installs it into ~/.clipy/bin on first use; to pre-install run `brew install yt-dlp` (macOS), `pipx install yt-dlp`, or `python3 -m pip install -U yt-dlp`",
       data: { present: false, path: null, version: null },
     };
@@ -2264,7 +2285,7 @@ async function cmdProof(ctx: Ctx, opts: ProofOpts): Promise<void> {
     const narrationNotes: NarrationNote[] = resolveNarrationNotes(opts.notes, [0]);
     if (hasFrames) {
       mkdirSync(tmpDir, { recursive: true });
-      videoPath = join(tmpDir, "proof.webm");
+      videoPath = join(tmpDir, "proof.mp4");
       log(c.dim(`assembling ${opts.framePaths.length} proof frame${opts.framePaths.length === 1 ? "" : "s"}…`));
       const rendered = await renderProofFrames({
         framePaths: opts.framePaths,
@@ -5151,21 +5172,177 @@ async function runSessionDaemon(file: string): Promise<void> {
 // teaches Claude Code / Codex / Cursor how to read AND make recordings.
 // ---------------------------------------------------------------------------
 
-const AGENT_TARGETS = ["claude", "codex", "cursor"] as const;
-type AgentTarget = (typeof AGENT_TARGETS)[number];
+const AGENT_TARGETS = SETUP_TARGETS;
+type AgentTarget = SetupTarget;
+
+/** Real filesystem + subprocess access for the setup helpers. */
+function realSetupEnv(): SetupEnv {
+  return {
+    home: homedir(),
+    env: process.env,
+    run: (command, args) =>
+      new Promise((resolveRun) => {
+        // Every agent CLI we shell out to (claude, codex, …) installs on Windows
+        // as a `.cmd` shim, and Node refuses to spawn those without a shell —
+        // it fails ENOENT, which we then report as "not on PATH" even though the
+        // command is right there. Safe here because both the command and the
+        // args are fixed constants (MCP_COMMAND/MCP_ARGS), never user input.
+        const child = spawn(command, [...args], {
+          stdio: ["ignore", "pipe", "pipe"],
+          shell: process.platform === "win32",
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
+        child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
+        child.on("error", (e: Error) => resolveRun({ code: -1, stdout, stderr, spawnError: e.message }));
+        child.on("close", (code) => resolveRun({ code: code ?? 0, stdout, stderr }));
+      }),
+  };
+}
 
 function skillPathFor(target: AgentTarget): string {
-  const home = homedir();
-  switch (target) {
-    case "claude":
-      return join(home, ".claude", "skills", "clipy", "SKILL.md");
-    case "codex": {
-      const codexHome = process.env.CODEX_HOME?.trim() || join(home, ".codex");
-      return join(codexHome, "skills", "clipy", "SKILL.md");
+  return setupSkillPathFor(target, realSetupEnv());
+}
+
+function writeSkillFile(path: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, CLIPY_SKILL_MD);
+}
+
+// ---------------------------------------------------------------------------
+// setup — skill + MCP + login in one command, for an agent following the
+// published setup instructions at clipy.online/agent-setup/prompt.md.
+// ---------------------------------------------------------------------------
+
+async function cmdSetup(ctx: Ctx, targetRaw: string | undefined, json: boolean): Promise<void> {
+  const env = realSetupEnv();
+  let target: SetupTarget | undefined;
+  if (targetRaw) {
+    if (!isSetupTarget(targetRaw)) {
+      failSetup(
+        json,
+        "invalid_target",
+        `unknown agent "${targetRaw}"`,
+        `Choose one of: ${SETUP_TARGETS.join(", ")}.`,
+        null,
+        2,
+      );
     }
-    case "cursor":
-      return join(home, ".cursor", "skills", "clipy", "SKILL.md");
+    target = targetRaw;
+  } else {
+    target = detectSetupTarget(env.env);
   }
+  if (!target) {
+    failSetup(
+      json,
+      "target_detection_failed",
+      "could not determine the current agent",
+      `Run clipy setup <${SETUP_TARGETS.join("|")}>.`,
+      null,
+      2,
+    );
+  }
+
+  if (!ctx.apiKey && json) {
+    failSetup(
+      true,
+      "authentication_required",
+      "setup cannot complete without a Clipy credential",
+      "Run clipy setup without --json to approve browser sign-in, or set CLIPY_API_KEY before retrying.",
+    );
+  }
+  if (!ctx.apiKey) {
+    process.stdout.write(`${c.dim("No Clipy API key found — signing you in first…")}\n`);
+    await loginWithBrowser(ctx, shouldUseManualLogin());
+  }
+  if (!ctx.apiKey) {
+    failSetup(
+      json,
+      "authentication_failed",
+      "setup did not obtain a Clipy credential",
+      "Run clipy login, then retry setup.",
+    );
+  }
+
+  const skillPath = setupSkillPathFor(target, env);
+  let mcp: McpRegistration;
+  try {
+    mcp = await registerMcpServer(target, env);
+  } catch (error) {
+    failSetup(
+      json,
+      "mcp_registration_failed",
+      `could not register the Clipy MCP server: ${(error as Error).message}`,
+      "Fix the reported config or permission error, then retry setup.",
+    );
+  }
+  if (mcp.method === "manual") {
+    const instruction = mcp.command
+      ? `Run: ${mcp.command}`
+      : `Merge this into ${mcp.path ?? "the agent MCP config"}:\n${mcp.snippet ?? ""}`;
+    failSetup(
+      json,
+      "mcp_registration_incomplete",
+      mcp.reason ?? "the Clipy MCP server needs a manual registration step",
+      instruction,
+      {
+        target,
+        skill: { installed: false, path: skillPath },
+        mcp,
+        authenticated: true,
+      },
+    );
+  }
+  try {
+    writeSkillFile(skillPath);
+  } catch (error) {
+    failSetup(
+      json,
+      "skill_install_failed",
+      `the MCP server was registered, but the skill could not be installed: ${(error as Error).message}`,
+      `Fix permissions for ${skillPath}, then retry setup.`,
+      { target, skill: { installed: false, path: skillPath }, mcp, authenticated: true },
+    );
+  }
+
+  if (json) {
+    printJson({
+      ok: true,
+      target,
+      skill: { installed: true, path: skillPath },
+      mcp,
+      authenticated: true,
+      restartRequired: true,
+      docs: "https://clipy.online/agent-setup/prompt.md",
+    });
+    return;
+  }
+
+  const short = (p: string) => shortPath(p, env.home);
+  const rows = [
+    `✓ Skill   ${short(skillPath)}`,
+    `✓ MCP     ${mcp.path ? short(mcp.path) : (mcp.command ?? target)}${mcp.alreadyPresent && !mcp.changed ? " (already registered)" : ""}`,
+    `✓ Signed in`,
+    "",
+    "→ Restart your agent to load the MCP server",
+  ];
+  process.stdout.write(`${renderSetupBox("Clipy setup complete", rows)}\n`);
+}
+
+function failSetup(
+  json: boolean,
+  code: string,
+  error: string,
+  remediation: string,
+  partial: unknown = null,
+  exitCode = 1,
+): never {
+  if (json) {
+    printJson({ ok: false, code, error, remediation, partial });
+    process.exit(exitCode);
+  }
+  die(`${error}\n${remediation}`, exitCode);
 }
 
 async function cmdAgents(
@@ -5194,7 +5371,7 @@ async function cmdAgents(
         `${s.installed ? c.green("✓ installed") : c.dim("— not installed")}  ${s.target.padEnd(7)} ${c.dim(s.path)}\n`,
       );
     }
-    process.stdout.write(`${c.dim("install with:")} clipy agents install <claude|codex|cursor>\n`);
+    process.stdout.write(`${c.dim("install with:")} clipy agents install <${AGENT_TARGETS.join("|")}>\n`);
     return;
   }
 
@@ -5214,8 +5391,7 @@ async function cmdAgents(
       process.stdout.write(`${c.dim("No Clipy API key found — signing you in first…")}\n`);
       await loginWithBrowser(ctx, shouldUseManualLogin());
     }
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, CLIPY_SKILL_MD);
+    writeSkillFile(path);
     if (json) {
       printJson({ installed: true, target, path });
       return;
@@ -5249,7 +5425,7 @@ async function cmdAgents(
 // contract changes.
 // ---------------------------------------------------------------------------
 
-const GUIDE_SCHEMA_VERSION = 14;
+const GUIDE_SCHEMA_VERSION = 16;
 
 /** The stable machine-readable failure taxonomy carried in `--json` error
  *  envelopes. Codes are the contract; messages are not. Published through the
@@ -5261,7 +5437,9 @@ const GUIDE_ERROR_CODES: ReadonlyArray<{
   remediation: string;
 }> = [
   { code: "invalid_url", meaning: "the URL is not a video Clipy can resolve", retryable: false, remediation: "re-read the URL with the user; retrying the same string cannot help" },
-  { code: "no_captions", meaning: "the YouTube video publishes no captions in any language", retryable: false, remediation: "there is nothing to transcribe from — import a local file with --transcript <.vtt|.srt|json>, or proceed without the video" },
+  { code: "no_captions", meaning: "the source publishes no transcript: a YouTube video with captions in no language, or one of the ~16% of Loom videos with no transcript recorded", retryable: false, remediation: "there is nothing to transcribe from, so re-run with --transcript <.vtt|.srt|json>, or proceed without the video" },
+  { code: "loom_unreachable", meaning: "loom.com or its transcript CDN could not be reached, or answered with something unusable", retryable: true, remediation: "usually transient, so re-run the SAME command once after a short pause; if it repeats, it is a network/proxy problem, not a bad link" },
+  { code: "source_private", meaning: "the video exists but is private or password-protected, so its transcript cannot be read", retryable: false, remediation: "ask the owner for a public share link, or import an exported copy with --transcript; re-running the same URL cannot help" },
   { code: "ytdlp_missing", meaning: "yt-dlp could not be resolved or auto-installed", retryable: true, remediation: "let Clipy auto-install it into ~/.clipy/bin, or install it yourself (brew install yt-dlp / pipx install yt-dlp), then re-run; `clipy doctor --json` reports the path it tried" },
   { code: "ytdlp_download_403", meaning: "YouTube refused the media download (frames could not be extracted)", retryable: false, remediation: "the CLI already retried internally — do NOT loop. If the transcript synced, the import is usable: report frames as pending and re-run the same command later" },
   { code: "ffmpeg_missing", meaning: "ffmpeg/ffprobe is not installed or not on PATH", retryable: true, remediation: "brew install ffmpeg (macOS) / sudo apt install ffmpeg (Linux) / winget install Gyan.FFmpeg, then re-run the same command" },
@@ -5348,8 +5526,8 @@ function cmdGuide(json: boolean): void {
       cmdDoc("context", "clipy context <id>", "Full agent-context bundle as markdown"),
       cmdDoc(
         "context import",
-        "clipy context import <youtube-url|local-file> [--transcript <f>] [--output <dir>] [--language <code>] [--title <t>] [--tag <t>]… [--folder <name>] [--sync] [--json]",
-        "Compile ANY video into a local Clipy context bundle — a directory holding recording.md (the agent-facing document, with the untrusted-content warning and [MM:SS] transcript sections), manifest.json (provenance, versions, sufficiency report) and transcript.json. YouTube URLs resolve on YOUR machine via a Clipy-managed yt-dlp (auto-installed into ~/.clipy/bin on first use, with a disclosure); creator captions are preferred over auto-captions and NO media is downloaded. Local files need --transcript <.vtt|.srt|Clipy transcript JSON> and are probed with ffprobe. A deterministic classifier scores how well the transcript stands alone and lists the timestamps where it is blind — v1 emits the transcript profile only, so those gaps are the honest statement of what the bundle cannot show. Reruns over the same source are idempotent. --sync additionally uploads the DERIVED bundle (never source media) to your private library.",
+        "clipy context import <youtube-url|loom-url|local-file> [--transcript <f>] [--output <dir>] [--language <code>] [--title <t>] [--tag <t>]… [--folder <name>] [--sync] [--json]",
+        "Compile ANY video into a local Clipy context bundle — a directory holding recording.md (the agent-facing document, with the untrusted-content warning and [MM:SS] transcript sections), manifest.json (provenance, versions, sufficiency report) and transcript.json. YouTube URLs resolve on YOUR machine via a Clipy-managed yt-dlp (auto-installed into ~/.clipy/bin on first use, with a disclosure); creator captions are preferred over auto-captions and NO media is downloaded. Loom share links (loom.com/share/<32-hex-id>) use Loom's own published transcript over plain HTTPS — no yt-dlp is needed and none is installed, so `clipy doctor`'s yt-dlp check does not gate a Loom import; roughly one Loom in six has no transcript recorded and fails with `no_captions` rather than emitting an empty bundle, and Loom's transcript is machine-generated so it is recorded as auto_captions. Local files need --transcript <.vtt|.srt|Clipy transcript JSON> and are probed with ffprobe. A deterministic classifier scores how well the transcript stands alone and lists the timestamps where it is blind — v1 emits the transcript profile only, so those gaps are the honest statement of what the bundle cannot show. Reruns over the same source are idempotent. --sync additionally uploads the DERIVED bundle (never source media) to your private library.",
         ["--transcript", "--output", "--language", "--title", "--tag", "--folder", "--sync", "--no-frames", "--json"],
       ),
       cmdDoc("context read", "clipy context read <bundle-path>", "Print a local bundle's recording.md to stdout — plain, unpaged, uncoloured, for an agent to read directly. It opens with a self-describing header (source, duration, classification, sufficiency, untrusted-content warning) before the [MM:SS] transcript sections, so the first screen tells you what the document is and where it is blind. For a SYNCED document read it over MCP instead: get_context_document for metadata+classification without the transcript, then read_context_document with startMs/endMs for just the span you need."),
@@ -5359,7 +5537,7 @@ function cmdGuide(json: boolean): void {
       cmdDoc(
         "proof",
         "clipy proof (--frame <png|jpg|webp>… | --video <webm|mp4>) [--caption <text>…] [--hold sec] [--title t] [--type kind] [--note '3: text']… [--wait] [--json]",
-        "Tool-neutral proof upload. --frame may be repeated to turn screenshots produced by any browser, computer-use, simulator, or test tool into one silent WebM; --caption must be omitted or repeated exactly once per frame and becomes timestamped agent narration. --hold controls each frame's duration (default 3s, 0.25–30; total cap 300s); --width/--height must be even integers from 320–3840 and default to 1280x720. Frame inputs are bounded to 50 MiB each and 250 MiB total. Screenshot stitching needs ffmpeg but does not need Playwright or a browser integration. --video uploads an already-recorded WebM or MP4 without re-encoding and needs no recording dependency. Exactly one source mode is required. --json prints {id, shareUrl, contextUrl, sizeBytes, source}; proof-video source reports only the detected container and never discloses the local path. Captions and notes are driver-attested narration, not Clipy-verified assertions.",
+        "Tool-neutral proof upload. --frame may be repeated to turn screenshots produced by any browser, computer-use, simulator, or test tool into one high-quality silent MP4; --caption must be omitted or repeated exactly once per frame and becomes timestamped agent narration. --hold controls each frame's duration (default 3s, 0.25–30; total cap 300s); --width/--height must be even integers from 320–3840 and default to 1280x720. Frame inputs are bounded to 50 MiB each and 250 MiB total. Screenshot stitching needs ffmpeg but does not need Playwright or a browser integration. --video uploads an already-recorded WebM or MP4 without re-encoding and needs no recording dependency. Exactly one source mode is required. --json prints {id, shareUrl, contextUrl, sizeBytes, source}; proof-video source reports only the detected container and never discloses the local path. Captions and notes are driver-attested narration, not Clipy-verified assertions.",
         ["--frame", "--caption", "--video", "--hold", "--width", "--height", "--title", "--description", "--type", "--note", "--wait", "--json"],
       ),
       cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. Auth (web capture only, applied before the first navigation so a logged-in SPA's route guard sees it): --storage-state <playwright storageState JSON path>, --cookie 'name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]' (repeatable), --local-storage 'key=value' (repeatable, target origin only), --init-script <js file run before every page load>, --user-data-dir <dir> (launch from a persistent Chromium user-data ROOT with its whole logged-in identity; web only, mutually exclusive with --storage-state; refused if <dir> is a profile subdir — pass the root — or, in direct mode, a live-locked root via SingletonLock/Socket), --profile-directory <name> (with --user-data-dir: pick a NAMED profile like 'Profile 12' from chrome://version; Playwright can't select a profile in place, so Clipy COPIES it into a temp recording root and launches the copy — loudly disclosed, the real profile is never opened or written, and the copy is deleted after upload; no need to quit Chrome, though it warns if Chrome is running since in-use DBs may copy inconsistently). Auth boundary: --storage-state only seeds what the file contains; for cross-origin auth produce it with `npx playwright open --save-storage=auth.json <login-host>`, or use --user-data-dir + --profile-directory to record your real profile, or --source mac-screen --window Chrome. With --source mac-screen: records the real screen via the Clipy Mac app (--type not yet applied on mac; auth flags rejected — the screen is already logged in); --window '<title|app|id>' or --display <id> target one window/display (ids from clipy sources). --json prints {id, shareUrl, contextUrl, sizeBytes}", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--storage-state", "--cookie", "--local-storage", "--init-script", "--user-data-dir", "--profile-directory", "--width", "--height", "--wait", "--source", "--window", "--display", "--json"]),
@@ -5369,7 +5547,13 @@ function cmdGuide(json: boolean): void {
       cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API reachability (GET /api/health, with latency), API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), context/proof prerequisites (yt-dlp presence/path/version, ffmpeg + ffprobe presence/version, and whether that ffmpeg has libwebp), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails. Read-only: it never installs anything, so a missing yt-dlp/ffmpeg reports WARN with the install command rather than silently downloading a binary. Run it first whenever an import, proof, or recording fails.", ["--json"]),
       cmdDoc("playwright-path", "clipy playwright-path [--json]", "Print the node_modules directory of the Playwright this CLI resolves, so your own --expose-cdp driver scripts can load the same copy: NODE_PATH=$(clipy playwright-path) node driver.js. Exits 1 (empty stdout) if Playwright is unresolvable. --json prints {path, nodeModulesDir, source}", ["--json"]),
       cmdDoc("sources", "clipy sources [--json]", "List displays + windows the Clipy Mac app can capture — ids feed --window/--display. --json gives each entry a `source` {kind,id,title} in the SAME shape session start/record report for the resolved capture, so a caller can compare what it picked against what the camera reports without transforming either."),
-      cmdDoc("agents", "clipy agents <status|install|uninstall> <claude|codex|cursor>", "Install the bundled Clipy skill for a coding agent; install triggers a browser login first when no key is configured (interactive terminals only)"),
+      cmdDoc(
+        "setup",
+        "clipy setup [claude|codex|cursor|windsurf|opencode] [--json]",
+        "Wire Clipy into one coding agent in a single command: sign in if needed, install the bundled skill, and register the MCP server in that agent's own config (`claude`/`codex` through their own `mcp add`; `cursor`/`windsurf`/`opencode` by merging their JSON config, never replacing other servers). Omit the agent to auto-detect from the environment — ambiguous or unknown exits 2 rather than guessing. Re-running is safe. Successful --json output is {ok:true, target, skill:{installed,path}, mcp:{method,path,changed,alreadyPresent}, authenticated:true, restartRequired:true}. Failures use {ok:false,code,error,remediation,partial}; partial.mcp.method 'manual' means the caller must run partial.mcp.command or paste partial.mcp.snippet before setup is complete. The MCP server is read at agent startup, so the calling session will not see the tools until it restarts.",
+        ["--json"],
+      ),
+      cmdDoc("agents", "clipy agents <status|install|uninstall> <claude|codex|cursor|windsurf|opencode>", "Skill file only — does NOT register MCP. `clipy setup` is the one-command form; install triggers a browser login first when no key is configured (interactive terminals only)"),
       cmdDoc("guide", "clipy guide --json", "This manifest"),
       cmdDoc("mcp", "clipy mcp", "Run the Clipy MCP server (wraps npx -y @clipy/mcp)"),
     ],
@@ -5682,7 +5866,7 @@ async function main(): Promise<void> {
       // `import` and `read` are reserved literals — they shadow any recording id
       // by that name, which is why they can never be confused for one.
       if (rest[0] === "import") {
-        if (!rest[1]) die("usage: clipy context import <youtube-url|local-file> [--transcript <f>] [--output <dir>] [--sync]", 2);
+        if (!rest[1]) die("usage: clipy context import <youtube-url|loom-url|local-file> [--transcript <f>] [--output <dir>] [--sync]", 2);
         try {
           await cmdContextImport(rest[1], {
             apiUrl: ctx.apiUrl,
@@ -5752,6 +5936,9 @@ async function main(): Promise<void> {
       return;
     case "playwright-path":
       await cmdPlaywrightPath(json);
+      return;
+    case "setup":
+      await cmdSetup(ctx, rest[0], json);
       return;
     case "agents":
       await cmdAgents(ctx, rest[0], rest[1], json);

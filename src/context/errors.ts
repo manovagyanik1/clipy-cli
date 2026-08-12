@@ -13,6 +13,10 @@
 export type ImportErrorCode =
   | "invalid_url"
   | "no_captions"
+  /** Loom itself could not be reached, or answered with something unusable. */
+  | "loom_unreachable"
+  /** The video exists but is private or password-protected, so it cannot be read. */
+  | "source_private"
   | "no_video_stream"
   | "ytdlp_missing"
   | "ytdlp_download_403"
