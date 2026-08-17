@@ -1,6 +1,6 @@
 /**
  * `clipy context import <youtube-url|loom-url|local-file>` — compiles a local
- * Clipy context bundle (AREC v0.2-draft) and optionally syncs it to the library.
+ * Clipy context bundle (AREC v0.3-draft) and optionally syncs it to the library.
  *
  * Syncing is a TWO-PHASE protocol, and the split is deliberate: the server is
  * the classification brain. Phase 1 uploads the transcript bundle and the
@@ -18,6 +18,8 @@ import { basename, join, resolve } from "node:path";
 
 import {
   buildManifest,
+  AREC_CANONICAL_FILENAME,
+  AREC_LEGACY_FILENAME,
   buildNormalizedTranscript,
   classifyTranscript,
   parseSrt,
@@ -574,7 +576,7 @@ function finish(input: {
 
 /**
  * Rebuilds a compiled bundle around the server's verdict and the frames we
- * fetched for it. recording.md is a pure function of the manifest plus the
+ * fetched for it. recording.arec is a pure function of the manifest plus the
  * transcript, so re-rendering is the whole update.
  */
 function withVisualEvidence(
@@ -625,7 +627,8 @@ function writeBundle(
   const bundlePath = join(dir, `clipy-context-${slugHash(compiled.fingerprint)}`);
 
   const contents: Record<string, string> = {
-    "recording.md": compiled.markdown,
+    [AREC_CANONICAL_FILENAME]: compiled.markdown,
+    [AREC_LEGACY_FILENAME]: compiled.markdown,
     // createdAt changes every run; compare on everything else so a rerun over an
     // unchanged source is genuinely idempotent.
     "manifest.json": `${JSON.stringify(compiled.manifest, null, 2)}\n`,
@@ -661,7 +664,7 @@ function writeBundle(
 
 function sameBundle(bundlePath: string, contents: Record<string, string>): boolean {
   try {
-    // recording.md is a pure function of the manifest and the transcript, and it
+    // recording.arec is a pure function of the manifest and the transcript, and it
     // embeds the compile timestamp — comparing it byte-wise would make every
     // rerun look like a content change.
     const a = JSON.parse(readFileSync(join(bundlePath, "manifest.json"), "utf8")) as Record<string, unknown>;
@@ -670,7 +673,12 @@ function sameBundle(bundlePath: string, contents: Record<string, string>): boole
     delete b.createdAt;
     if (JSON.stringify(a) !== JSON.stringify(b)) return false;
     if (readFileSync(join(bundlePath, "transcript.json"), "utf8") !== contents["transcript.json"]) return false;
-    if (!existsSync(join(bundlePath, "recording.md"))) return false;
+    if (!existsSync(join(bundlePath, AREC_CANONICAL_FILENAME))) return false;
+    if (!existsSync(join(bundlePath, AREC_LEGACY_FILENAME))) return false;
+    if (
+      readFileSync(join(bundlePath, AREC_CANONICAL_FILENAME), "utf8") !==
+      readFileSync(join(bundlePath, AREC_LEGACY_FILENAME), "utf8")
+    ) return false;
     return true;
   } catch {
     return false;
@@ -1129,7 +1137,7 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
           bundlePath,
           // The file an agent should actually open. Naming the directory alone
           // makes every caller guess at the entry point.
-          contextPath: join(bundlePath, "recording.md"),
+          contextPath: join(bundlePath, AREC_CANONICAL_FILENAME),
           title: compiled.manifest.title,
           profile: compiled.manifest.profile,
           recommendedProfile: report?.recommendedProfile ?? null,
@@ -1167,7 +1175,7 @@ export async function cmdContextImport(target: string, opts: ImportOptions): Pro
     );
   }
   process.stdout.write(
-    `  → local bundle: ${join(bundlePath, "recording.md")}  (run: clipy context read ${bundlePath})\n`,
+    `  → local bundle: ${join(bundlePath, AREC_CANONICAL_FILENAME)}  (run: clipy context read ${bundlePath})\n`,
   );
   if (warnings.length > 0) {
     process.stdout.write(

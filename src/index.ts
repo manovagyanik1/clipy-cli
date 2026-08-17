@@ -396,7 +396,7 @@ ${c.bold("RECORDINGS")}
   context <id>                      Full agent-context bundle as markdown
   context import <youtube-url|loom-url|file> [--transcript <f>] [--output <dir>]
                                     Compile ANY video into a local Clipy context
-                                    bundle (recording.md + manifest.json +
+                                    bundle (recording.arec + manifest.json +
                                     transcript.json). YouTube captions and Loom
                                     transcripts are fetched on your machine — no
                                     media leaves it, and Loom needs no yt-dlp at
@@ -411,7 +411,7 @@ ${c.bold("RECORDINGS")}
                       are then extracted locally and added to the bundle
     --no-frames       With --sync: take the verdict but never download media
     --json            Print {bundlePath, profile, classification, frames, …}
-  context read <bundle-path>        Print a local bundle's recording.md
+  context read <bundle-path>        Print a local bundle's recording.arec
   download <id> [-o <path>]         Download the MP4
   open <id>                         Open the share page in your browser
   wait <id> [--for transcript|summary|both] [--timeout <sec>]
@@ -426,6 +426,7 @@ ${c.bold("PROOF")} ${c.dim("(tool-neutral evidence; needs an ingest-scoped API k
     --hold <sec>      Seconds to show each frame (default 3; 0.25–30)
     --width/--height  Even output dimensions, 320–3840 (default 1280×720)
   proof --video <webm|mp4>          Upload a video the agent/tool already recorded
+    --for <id|url>    Link the proof back to the recording it verifies
     --title/--description/--type/--note/--wait/--json
                       Same metadata, narration, processing wait, and JSON result
                       contract as record; no browser automation dependency
@@ -474,7 +475,7 @@ ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session
                                     --json gives each entry a "source" {kind,id,title}
                                     matching what session start/record report, so you
                                     can compare pick-vs-camera directly
-    --window "<title|app|id>"       Record just that window (e.g. --window Chrome)
+    --window "<title|app|id>"       Record that window's current screen area (e.g. --window Chrome)
     --display <id>                  Record a specific display
     --mic                           Opt IN to microphone capture (default: mic OFF —
                                     an agent recording for you is not the same consent
@@ -538,7 +539,8 @@ ${c.bold("AGENTS")}
   playwright-path [--json]          Print the node_modules dir of the Playwright
                                     this CLI resolves, for your own driver scripts:
                                     ${c.dim("NODE_PATH=$(clipy playwright-path) node driver.js")}
-  transcript <id> --replace <file>  Replace a transcript with agent-authored
+  transcript <id> --replace <file> --revision <sha256>
+                                    Replace a transcript with agent-authored
                                     JSON ({segments} or {plaintext}); regenerates
                                     the summary ${c.dim("(needs the \"ingest\" permission)")}
   mcp                               Run the Clipy MCP server (wraps: npx -y @clipy/mcp)
@@ -937,7 +939,8 @@ async function cmdMoments(ctx: Ctx, id: string, json: boolean): Promise<void> {
 }
 
 async function cmdContext(ctx: Ctx, id: string): Promise<void> {
-  const pid = encodeURIComponent(normalizeId(id, ctx));
+  const publicId = normalizeId(id, ctx);
+  const pid = encodeURIComponent(publicId);
   const res = await api(ctx, `/api/agent-context/${pid}`, "text/markdown, text/plain, application/json");
   const text = await res.text();
   if (!res.ok) {
@@ -951,6 +954,19 @@ async function cmdContext(ctx: Ctx, id: string): Promise<void> {
     die(msg);
   }
   process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
+  try {
+    await ingestPostJson(ctx, `/api/v1/recordings/${pid}/agent-activity`, {
+      kind: "read",
+      source: "cli",
+    });
+  } catch (error) {
+    // The context endpoint serves public recordings owned by anyone; the read
+    // receipt is owner-only, so a 404 just means "not this key's recording" —
+    // a normal shared-link read, not a failure worth warning about.
+    if ((error as { status?: number }).status !== 404) {
+      process.stderr.write(`${c.yellow("!")} agent read receipt failed: ${(error as Error).message}\n`);
+    }
+  }
 }
 
 async function cmdDownload(ctx: Ctx, id: string, outputPath: string | undefined): Promise<void> {
@@ -1615,19 +1631,26 @@ async function ingestPostJson(ctx: Ctx, path: string, payload: unknown): Promise
     if (!res.ok) {
       const msg = (typeof body.error === "string" && body.error) || `Clipy API error ${res.status}`;
       if (res.status === 401) {
-        throw new Error(`${msg}. Run \`clipy login\` with an ingest-scoped key.`);
+        throw ingestError(`${msg}. Run \`clipy login\` with an ingest-scoped key.`, res.status);
       }
       if (res.status === 403) {
-        throw new Error(
+        throw ingestError(
           `${msg}\nYour API key needs the "ingest" permission. Mint one at ` +
             `${ctx.apiUrl}/settings/api-keys (check "Record & upload").`,
+          res.status,
         );
       }
-      throw new Error(msg);
+      throw ingestError(msg, res.status);
     }
     return body;
   }
   throw new Error(`request failed after retries (${path})`);
+}
+
+// Error with the HTTP status attached so callers can branch on it (e.g. the
+// best-effort read receipt treats owner-scope 404 as "not mine", not a failure).
+function ingestError(message: string, status: number): Error & { status: number } {
+  return Object.assign(new Error(message), { status });
 }
 
 /** Upload one chunk as multipart/form-data, retrying transient 429/5xx. */
@@ -2226,7 +2249,7 @@ async function uploadVideoToClipy(
     shareUrl: `${ctx.apiUrl}/video/${publicId}`,
     // The friendly content-negotiated form: markdown to agents, a rendered
     // page to browsers. Same document as /api/agent-context/<id>.
-    contextUrl: `${ctx.apiUrl}/video/${publicId}.md`,
+    contextUrl: `${ctx.apiUrl}/video/${publicId}.arec`,
     sizeBytes,
     container,
   };
@@ -2245,6 +2268,7 @@ interface ProofOpts {
   notes: ParsedNote[];
   wait: boolean;
   json: boolean;
+  verificationFor?: string;
 }
 
 /**
@@ -2271,6 +2295,12 @@ async function cmdProof(ctx: Ctx, opts: ProofOpts): Promise<void> {
     die('proof notes use absolute timestamps such as --note "3: saved state"; passN notes need record --viewports', 2);
   }
   requireKey(ctx);
+  const verificationFor = opts.verificationFor
+    ? normalizeId(opts.verificationFor, ctx)
+    : null;
+  if (verificationFor) {
+    await apiJson(ctx, `/api/v1/recordings/${encodeURIComponent(verificationFor)}`);
+  }
 
   const tmpDir = join(tmpdir(), `clipy-proof-${randomUUID()}`);
   let generatedVideo = false;
@@ -2324,6 +2354,23 @@ async function cmdProof(ctx: Ctx, opts: ProofOpts): Promise<void> {
       sourceVersion: `cli-proof/${VERSION}`,
       log,
     });
+    if (verificationFor) {
+      try {
+        await ingestPostJson(
+          ctx,
+          `/api/v1/recordings/${encodeURIComponent(verificationFor)}/agent-activity`,
+          {
+            kind: "verification",
+            source: "cli",
+            verificationPublicId: uploaded.publicId,
+          },
+        );
+      } catch (error) {
+        throw new Error(
+          `Proof uploaded at ${uploaded.shareUrl}, but linking it to ${verificationFor} failed: ${(error as Error).message}`,
+        );
+      }
+    }
     if (opts.wait) {
       await waitForArtifacts(ctx, uploaded.publicId);
     }
@@ -2343,6 +2390,7 @@ async function cmdProof(ctx: Ctx, opts: ProofOpts): Promise<void> {
         contextUrl: uploaded.contextUrl,
         sizeBytes: uploaded.sizeBytes,
         source,
+        ...(verificationFor ? { verifies: verificationFor } : {}),
       });
     } else {
       process.stdout.write(`${c.green("✓")} proof uploaded — ${c.bold(uploaded.shareUrl)}\n`);
@@ -4203,7 +4251,7 @@ async function cmdSessionStop(json: boolean): Promise<void> {
         publicId,
         shareUrl: String(result.shareUrl ?? ""),
         contextUrl: `https://clipy.online/api/agent-context/${publicId}`,
-        sizeBytes: 0,
+        sizeBytes: Number(result.sizeBytes ?? 0),
       },
       json,
     );
@@ -5520,28 +5568,28 @@ function cmdGuide(json: boolean): void {
       ),
       cmdDoc("search", "clipy search <query> [--json]", "Full-text search titles + descriptions"),
       cmdDoc("show", "clipy show <id|url> [--json]", "One recording's metadata + share link"),
-      cmdDoc("transcript", "clipy transcript <id> [--marks-only] [--srt|--vtt|--json] | clipy transcript <id> --replace <file.json|-> ", "Print the transcript, or REPLACE it (ingest scope; file holds {segments:[{start,end,text}]} or {plaintext}; regenerates the summary). Default text output is ONE ENTRY PER LINE, chronological and timestamp-prefixed, from the same segments --srt/--vtt use — an agent-narration transcript is a list of discrete marks, and concatenating them into one run-on paragraph made it unreadable. --marks-only drops [auto] instrumentation lines (navigations, console errors) so only the narration a human wrote remains; it applies to the default text output (--srt/--vtt/--json are unaffected). A transcript with no segments falls back to plaintext, and --json still carries the raw plaintext for scripts that want the old shape.", ["--marks-only", "--srt", "--vtt", "--json", "--replace <file>"]),
+      cmdDoc("transcript", "clipy transcript <id> [--marks-only] [--srt|--vtt|--json] | clipy transcript <id> --replace <file.json|-> --revision <sha256>", "Print the transcript, or REPLACE it (ingest scope; first read --json and pass its revision; file holds {segments:[{start,end,text}]} or {plaintext}; regenerates the summary). Default text output is ONE ENTRY PER LINE, chronological and timestamp-prefixed, from the same segments --srt/--vtt use — an agent-narration transcript is a list of discrete marks, and concatenating them into one run-on paragraph made it unreadable. --marks-only drops [auto] instrumentation lines (navigations, console errors) so only the narration a human wrote remains; it applies to the default text output (--srt/--vtt/--json are unaffected). A transcript with no segments falls back to plaintext, and --json still carries the raw plaintext for scripts that want the old shape.", ["--marks-only", "--srt", "--vtt", "--json", "--replace <file>", "--revision <sha256>"]),
       cmdDoc("summary", "clipy summary <id> [--json]", "AI summary: TL;DR, key points, action items"),
       cmdDoc("moments", "clipy moments <id> [--json]", "Key moments: timestamps, captions, click coords"),
       cmdDoc("context", "clipy context <id>", "Full agent-context bundle as markdown"),
       cmdDoc(
         "context import",
         "clipy context import <youtube-url|loom-url|local-file> [--transcript <f>] [--output <dir>] [--language <code>] [--title <t>] [--tag <t>]… [--folder <name>] [--sync] [--json]",
-        "Compile ANY video into a local Clipy context bundle — a directory holding recording.md (the agent-facing document, with the untrusted-content warning and [MM:SS] transcript sections), manifest.json (provenance, versions, sufficiency report) and transcript.json. YouTube URLs resolve on YOUR machine via a Clipy-managed yt-dlp (auto-installed into ~/.clipy/bin on first use, with a disclosure); creator captions are preferred over auto-captions and NO media is downloaded. Loom share links (loom.com/share/<32-hex-id>) use Loom's own published transcript over plain HTTPS — no yt-dlp is needed and none is installed, so `clipy doctor`'s yt-dlp check does not gate a Loom import; roughly one Loom in six has no transcript recorded and fails with `no_captions` rather than emitting an empty bundle, and Loom's transcript is machine-generated so it is recorded as auto_captions. Local files need --transcript <.vtt|.srt|Clipy transcript JSON> and are probed with ffprobe. A deterministic classifier scores how well the transcript stands alone and lists the timestamps where it is blind — v1 emits the transcript profile only, so those gaps are the honest statement of what the bundle cannot show. Reruns over the same source are idempotent. --sync additionally uploads the DERIVED bundle (never source media) to your private library.",
+        "Compile ANY video into a local Clipy context bundle — a directory holding recording.arec (the canonical agent-facing Markdown document), a byte-identical recording.md compatibility copy, manifest.json (provenance, versions, sufficiency report) and transcript.json. YouTube URLs resolve on YOUR machine via a Clipy-managed yt-dlp (auto-installed into ~/.clipy/bin on first use, with a disclosure); creator captions are preferred over auto-captions and NO media is downloaded. Loom share links (loom.com/share/<32-hex-id>) use Loom's own published transcript over plain HTTPS — no yt-dlp is needed and none is installed, so `clipy doctor`'s yt-dlp check does not gate a Loom import; roughly one Loom in six has no transcript recorded and fails with `no_captions` rather than emitting an empty bundle, and Loom's transcript is machine-generated so it is recorded as auto_captions. Local files need --transcript <.vtt|.srt|Clipy transcript JSON> and are probed with ffprobe. A deterministic classifier scores how well the transcript stands alone and lists the timestamps where it is blind — v1 emits the transcript profile only, so those gaps are the honest statement of what the bundle cannot show. Reruns over the same source are idempotent. --sync additionally uploads the DERIVED bundle (never source media) to your private library.",
         ["--transcript", "--output", "--language", "--title", "--tag", "--folder", "--sync", "--no-frames", "--json"],
       ),
-      cmdDoc("context read", "clipy context read <bundle-path>", "Print a local bundle's recording.md to stdout — plain, unpaged, uncoloured, for an agent to read directly. It opens with a self-describing header (source, duration, classification, sufficiency, untrusted-content warning) before the [MM:SS] transcript sections, so the first screen tells you what the document is and where it is blind. For a SYNCED document read it over MCP instead: get_context_document for metadata+classification without the transcript, then read_context_document with startMs/endMs for just the span you need."),
+      cmdDoc("context read", "clipy context read <bundle-path>", "Print a local bundle's recording.arec to stdout — plain, unpaged, uncoloured, for an agent to read directly. It opens with a self-describing header (source, duration, classification, sufficiency, untrusted-content warning) before the [MM:SS] transcript sections, so the first screen tells you what the document is and where it is blind. For a SYNCED document read it over MCP instead: get_context_document for metadata+classification without the transcript, then read_context_document with startMs/endMs for just the span you need."),
       cmdDoc("download", "clipy download <id> [-o path]", "Download the MP4"),
       cmdDoc("open", "clipy open <id>", "Open the share page in a browser"),
       cmdDoc("wait", "clipy wait <id> [--for transcript|summary|both] [--timeout sec]", "Block until artifacts are ready"),
       cmdDoc(
         "proof",
-        "clipy proof (--frame <png|jpg|webp>… | --video <webm|mp4>) [--caption <text>…] [--hold sec] [--title t] [--type kind] [--note '3: text']… [--wait] [--json]",
-        "Tool-neutral proof upload. --frame may be repeated to turn screenshots produced by any browser, computer-use, simulator, or test tool into one high-quality silent MP4; --caption must be omitted or repeated exactly once per frame and becomes timestamped agent narration. --hold controls each frame's duration (default 3s, 0.25–30; total cap 300s); --width/--height must be even integers from 320–3840 and default to 1280x720. Frame inputs are bounded to 50 MiB each and 250 MiB total. Screenshot stitching needs ffmpeg but does not need Playwright or a browser integration. --video uploads an already-recorded WebM or MP4 without re-encoding and needs no recording dependency. Exactly one source mode is required. --json prints {id, shareUrl, contextUrl, sizeBytes, source}; proof-video source reports only the detected container and never discloses the local path. Captions and notes are driver-attested narration, not Clipy-verified assertions.",
-        ["--frame", "--caption", "--video", "--hold", "--width", "--height", "--title", "--description", "--type", "--note", "--wait", "--json"],
+        "clipy proof (--frame <png|jpg|webp>… | --video <webm|mp4>) [--for <recording>] [--caption <text>…] [--hold sec] [--title t] [--type kind] [--note '3: text']… [--wait] [--json]",
+        "Tool-neutral proof upload. --frame may be repeated to turn screenshots produced by any browser, computer-use, simulator, or test tool into one high-quality silent MP4; --caption must be omitted or repeated exactly once per frame and becomes timestamped agent narration. --hold controls each frame's duration (default 3s, 0.25–30; total cap 300s); --width/--height must be even integers from 320–3840 and default to 1280x720. Frame inputs are bounded to 50 MiB each and 250 MiB total. Screenshot stitching needs ffmpeg but does not need Playwright or a browser integration. --video uploads an already-recorded WebM or MP4 without re-encoding and needs no recording dependency. Exactly one source mode is required. --for <recording id|url> links the uploaded proof back to the recording it verifies (validated before upload; the link appears in the owner-only receipt on that recording's watch page and needs a key with both ingest and recordings:read). --json prints {id, shareUrl, contextUrl, sizeBytes, source, verifies?}; proof-video source reports only the detected container and never discloses the local path. Captions and notes are driver-attested narration, not Clipy-verified assertions.",
+        ["--frame", "--caption", "--video", "--for", "--hold", "--width", "--height", "--title", "--description", "--type", "--note", "--wait", "--json"],
       ),
-      cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. Auth (web capture only, applied before the first navigation so a logged-in SPA's route guard sees it): --storage-state <playwright storageState JSON path>, --cookie 'name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]' (repeatable), --local-storage 'key=value' (repeatable, target origin only), --init-script <js file run before every page load>, --user-data-dir <dir> (launch from a persistent Chromium user-data ROOT with its whole logged-in identity; web only, mutually exclusive with --storage-state; refused if <dir> is a profile subdir — pass the root — or, in direct mode, a live-locked root via SingletonLock/Socket), --profile-directory <name> (with --user-data-dir: pick a NAMED profile like 'Profile 12' from chrome://version; Playwright can't select a profile in place, so Clipy COPIES it into a temp recording root and launches the copy — loudly disclosed, the real profile is never opened or written, and the copy is deleted after upload; no need to quit Chrome, though it warns if Chrome is running since in-use DBs may copy inconsistently). Auth boundary: --storage-state only seeds what the file contains; for cross-origin auth produce it with `npx playwright open --save-storage=auth.json <login-host>`, or use --user-data-dir + --profile-directory to record your real profile, or --source mac-screen --window Chrome. With --source mac-screen: records the real screen via the Clipy Mac app (--type not yet applied on mac; auth flags rejected — the screen is already logged in); --window '<title|app|id>' or --display <id> target one window/display (ids from clipy sources). --json prints {id, shareUrl, contextUrl, sizeBytes}", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--storage-state", "--cookie", "--local-storage", "--init-script", "--user-data-dir", "--profile-directory", "--width", "--height", "--wait", "--source", "--window", "--display", "--json"]),
-      cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen] [--window w] [--display d] [--expose-cdp] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). --window/--display (with --source mac-screen) record one window/display. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code — the crash-safe wrapper so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). `session run` exports CLIPY_SESSION_FILE to the child so mark/chapter resolve the session from any cwd. --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--expose-cdp", "--storage-state", "--user-data-dir", "--profile-directory", "--cookie", "--local-storage", "--init-script", "--json"]),
+      cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. Auth (web capture only, applied before the first navigation so a logged-in SPA's route guard sees it): --storage-state <playwright storageState JSON path>, --cookie 'name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]' (repeatable), --local-storage 'key=value' (repeatable, target origin only), --init-script <js file run before every page load>, --user-data-dir <dir> (launch from a persistent Chromium user-data ROOT with its whole logged-in identity; web only, mutually exclusive with --storage-state; refused if <dir> is a profile subdir — pass the root — or, in direct mode, a live-locked root via SingletonLock/Socket), --profile-directory <name> (with --user-data-dir: pick a NAMED profile like 'Profile 12' from chrome://version; Playwright can't select a profile in place, so Clipy COPIES it into a temp recording root and launches the copy — loudly disclosed, the real profile is never opened or written, and the copy is deleted after upload; no need to quit Chrome, though it warns if Chrome is running since in-use DBs may copy inconsistently). Auth boundary: --storage-state only seeds what the file contains; for cross-origin auth produce it with `npx playwright open --save-storage=auth.json <login-host>`, or use --user-data-dir + --profile-directory to record your real profile, or --source mac-screen --window Chrome. With --source mac-screen: records the real screen via the Clipy Mac app (--type not yet applied on mac; auth flags rejected — the screen is already logged in); --window '<title|app|id>' records that window's initial screen area and --display <id> records one display (ids from clipy sources). --json prints {id, shareUrl, contextUrl, sizeBytes}", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--storage-state", "--cookie", "--local-storage", "--init-script", "--user-data-dir", "--profile-directory", "--width", "--height", "--wait", "--source", "--window", "--display", "--json"]),
+      cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen] [--window w] [--display d] [--expose-cdp] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). With --source mac-screen, --window records that window's initial screen area and --display records one display. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code — the crash-safe wrapper so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). `session run` exports CLIPY_SESSION_FILE to the child so mark/chapter resolve the session from any cwd. --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--expose-cdp", "--storage-state", "--user-data-dir", "--profile-directory", "--cookie", "--local-storage", "--init-script", "--json"]),
       cmdDoc("mark", "clipy mark \"<text>\" [--observed \"<values>\" --verdict pass|fail] [--assert-selector <css> [--assert-text <substr>]] [--assert-url <glob>] [--fail-mode warn|abort] [--at <sec>|--ago <sec>] [--json]", "Drop a live-timestamped note into the active session. A mark carries at most ONE evidence provenance, and the two are labeled + tallied separately so they can never be pooled. DRIVER-ATTESTED (--observed '<values>' --verdict pass|fail, both required together): you drove the browser and report what YOU observed — renders '<text> [≈ ASSERT driver-attested; observed=<values>]' (pass) / '<text> [≈ FAILED driver-attested; observed=<values>]' (fail) — a HEDGE glyph, never ✓/✗, so a skim distinguishes provenance by shape alone and works in EVERY session type including --source mac-screen. Honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it — put real observed values there. Combining --observed/--verdict with --assert-* is a usage error. CLIPY-VERIFIED assertion marks (Clipy-owned page only) make the note evidence Clipy itself checked: --assert-selector checks a CSS selector matches (its trimmed textContent is recorded as 'observed'); --assert-text requires that element's text to contain a substring (needs --assert-selector); --assert-url matches the page URL against a glob (** = any, * = any non-slash, no * = substring). The daemon evaluates against its live page and annotates the mark: pass ⇒ '<text> [assert ✓ verified-by-clipy; <observed>]', fail ⇒ '<text> [ASSERT ✗ verified-by-clipy; expected …; observed …]' — a false claim cannot read as fact. --fail-mode warn (default) records the ✗; --fail-mode abort DISCARDS the whole session on a failed assertion (no upload) and the CLI exits non-zero. If any assertion was attempted, a leading 0ms [verification] note is prepended, reporting the provenances as SEPARATE segments: '[verification] N clipy-verified: P passed, F failed, K unverified · M driver-attested: P passed, F failed' (a segment is omitted when empty; with only clipy-verified marks the legacy 'N assertion(s): …' rendering is byte-identical). --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now (mutually exclusive). Assertions/backdating need a web session (rejected on --source mac-screen). Up to 200 marks per recording.", ["--observed", "--verdict", "--assert-selector", "--assert-text", "--assert-url", "--fail-mode", "--at", "--ago", "--json"]),
       cmdDoc("chapter", "clipy chapter \"<label>\" [--json]", "Mark a BEFORE/AFTER section boundary in the active recording (stored as '=== CHAPTER: <label> ==='). The PR-review shape: demo the base branch, run `clipy chapter \"AFTER — fix applied\"`, swap branches + restart the dev server, demo the fix — one video carrying both states. Works on web + --source mac-screen sessions.", ["--json"]),
       cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API reachability (GET /api/health, with latency), API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), context/proof prerequisites (yt-dlp presence/path/version, ffmpeg + ffprobe presence/version, and whether that ffmpeg has libwebp), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails. Read-only: it never installs anything, so a missing yt-dlp/ffmpeg reports WARN with the install command rather than silently downloading a binary. Run it first whenever an import, proof, or recording fails.", ["--json"]),
@@ -5566,7 +5614,7 @@ function cmdGuide(json: boolean): void {
       "--note is absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text'); pass-scoped notes anchor to the real start of a --viewports pass, so they don't drift when load time shifts the pass boundaries. A malformed pass note (e.g. 'pass2 text' with no colon) is a usage error, not silently demoted.",
       "--type declares what a recording IS (bug_report/feature_request/product_demo/walkthrough_tutorial/feedback_review/discussion_talk/other, plus short aliases) so the AI summary doesn't misread a demo as a bug report. Applied on web today; --source mac-screen support is pending a Clipy app update.",
       "AUDIO on --source mac-screen: agent screen recordings do NOT capture the microphone by default (system audio ON, mic OFF). An agent recording on your behalf is not the same consent as a human clicking Record — nobody asked for the room, or whatever call you are on, to be captured — and agent narration rides on marks, not speech. Opt in with --mic; opt out of system audio with --no-system-audio. Both are --source mac-screen only: headless web captures are silent, so passing them on the web path is a usage error (exit 2). The resolved config is printed (`audio: system on, mic off`) and returned as a sibling `audio` {includeSystemAudio, includeMic} in --json — sibling, not inside `source`, because audio is a property of the capture, not of the surface. IMPORTANT: the CLI reports the config the APP echoed back, and if the app does not echo one (a desktop build predating agent audio control) it WARNS that the app is using its own defaults and the microphone may be recording — update the Clipy app to make the setting take effect.",
-      "CONFIRM THE CAMERA on --source mac-screen. `session start` and `record` print the surface they resolved, read LIVE from the app at start time — `recording window: \"<title>\" (id 157)` — and `session start --json` / `record --json` carry it as `source: {kind, id, title}`, the SAME shape each entry's `source` takes in `clipy sources --json`, so a caller can compare its pick against the camera with a direct object comparison. Check it and abort on mismatch: driver-attested marks prove what the DRIVER observed and say nothing about what the camera saw, so driving a background tab of the recorded window yields a truthful 'N passed' tally over footage of something else — worse than no evidence, because the tally vouches for the wrong footage. Clipy will NEVER activate or foreground a window/tab: it cannot know which tab/page/simulator you mean (on mac-screen it may not be recording a browser at all), so focusing the right surface is the caller's job, done before session start. The reported title is read at START time; the camera follows the window, so a mid-recording tab switch changes what is filmed without changing the title.",
+      "CONFIRM THE CAMERA on --source mac-screen. `session start` and `record` print the surface they resolved, read LIVE from the app at start time — `recording window: \"<title>\" (id 157)` — and `session start --json` / `record --json` carry it as `source: {kind, id, title}`, the SAME shape each entry's `source` takes in `clipy sources --json`, so a caller can compare its pick against the camera with a direct object comparison. Check it and abort on mismatch: driver-attested marks prove what the DRIVER observed and say nothing about what the camera saw, so driving a background tab of the recorded window yields a truthful 'N passed' tally over footage of something else — worse than no evidence, because the tally vouches for the wrong footage. Clipy will NEVER activate or foreground a window/tab: it cannot know which tab/page/simulator you mean (on mac-screen it may not be recording a browser at all), so focusing the right surface is the caller's job, done before session start. The reported title and screen area are fixed at START time; moving the window does not move the recording, and anything entering that area is filmed.",
       "Clipy is a RECORDER, not a driver. When you drive the browser yourself (the usual agent case), the primary path is: record the real app (--source mac-screen --window '<app>', or your own driven browser) and attach evidence with driver-attested marks — `clipy mark \"<claim>\" --observed \"<values you read>\" --verdict pass|fail` — plus `clipy chapter` for before/after. Clipy holds the ledger; it does not drive. The owned-browser auth flags (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script) are the AGENTLESS/CI fallback for when nothing is driving and Clipy needs its own logged-in context. Provenance is never pooled: driver-attested marks render '[≈ ASSERT driver-attested; observed=…]' / '[≈ FAILED …]' (hedge glyph) and clipy-evaluated ones '[assert ✓ verified-by-clipy; …]' / '[ASSERT ✗ verified-by-clipy; …]' (✓/✗ are reserved for what Clipy itself checked), and the [verification] note counts them in separate segments. The honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it.",
       "Assertion marks are the differentiator: assert what you claim. `clipy mark \"X\" --assert-selector '.status' --assert-text Active` records X only alongside the live-page truth — the daemon runs the check against its Playwright page and annotates the mark ✓/✗ with what it actually observed, so a false claim cannot pass as fact in the transcript. --fail-mode abort turns a failed assertion into a discarded session (nothing uploaded, non-zero exit). Assertions need a web session and the daemon's control endpoint (started by clipy 0.6+); they are rejected on --source mac-screen.",
       "A mark is NEVER dropped, and a late verdict never rewrites it. If the daemon can't be reached to evaluate an assertion (its event loop briefly starved during a dev-server recompile), `clipy mark` records the narration anyway tagged '[ASSERT ⚠ clipy could not evaluate — <reason>]', prints a loud ⚠, and exits 0 — an unverified claim is flagged, never promoted to a ✓. The tally's third bucket counts these: '[verification] N assertion(s): P passed, F failed, K unverified' (the ', K unverified' clause is omitted when K=0). That ⚠ is the MARK OF RECORD: if the daemon was only slow and evaluates the same claim later, that verdict judged a LATER page state, so it does NOT overwrite the ⚠ — it's recorded as a separate '[late check of \"…\" — evaluated Ns after the claim: …]' note at its own time and counts toward none of P/F/K. Plain non-asserted marks the daemon later processes are just deduped (exactly once).",
@@ -5579,7 +5627,7 @@ function cmdGuide(json: boolean): void {
       "Recording a real Chrome profile: --user-data-dir is the user-data ROOT (the dir with 'Local State'), NOT a profile subdir — pointing it at a 'Default'/'Profile N' dir is refused (Chromium would mint a blank logged-out Default inside your real profile), with a hint to pass the parent + --profile-directory. --profile-directory '<name>' selects a named profile: Playwright's launchPersistentContext IGNORES an in-place --profile-directory switch (verified: it's stripped and Default always loads), so Clipy COPIES <root>/<name> into a temp 0700 scratch root's Default/ (+ the root's 'Local State'; skipping Singleton-locks and Cache/Code Cache/GPUCache/Service Worker CacheStorage), launches the copy, and deletes it after upload. The copy is disclosed loudly on stderr (never silent — that's the whole point), the real profile is never opened or written, a running Chrome only draws a warning (in-use DBs may copy inconsistently), and a stranded copy from a SIGKILL is swept after 24h at the next record/session start.",
       "clipy record gates its capture clock on the first non-blank frame (up to a 10s cap, then starts anyway) so notes aren't anchored to a still-compiling t=0.",
       "Run `clipy doctor` first when record/session or --source mac-screen fails — it names the exact missing piece (key, bridge socket/handshake/version, Playwright, install mode).",
-      "Public recordings have an unauthenticated context document at https://clipy.online/video/<id>.md.",
+      "Public recordings have a canonical unauthenticated AREC document at https://clipy.online/video/<id>.arec; .md remains a byte-identical compatibility alias.",
       "READING AN IMPORT WITHOUT DROWNING IN IT. Imported videos are often an hour or more, so read in widening passes rather than pulling the whole document. (1) Metadata + classification first — `clipy context read` opens with the self-describing header (source, duration, video type, whether the words stand alone, and the timestamps the classifier flagged as blind); over MCP `get_context_document` returns exactly that WITHOUT the transcript, the cheapest possible orientation. (2) Then the targeted span — the document is sectioned in [MM:SS] blocks and MCP `read_context_document` takes startMs/endMs, returning only overlapping sections (and reporting how many it withheld), so a two-hour video costs two minutes of context. (3) Frames LAST, and only at the timestamps the classifier said the transcript cannot carry. Whole-document reads are for short videos (~under 10 minutes) or when you genuinely need every word.",
       "FAILURE RECOVERY. Under --json every command's error is a stable-code envelope {ok:false, error:{code,message,hint}} — see errorCodes for the full table with per-code remediation. The three an agent actually hits: auth_required (401) ⇒ run `clipy login` and WAIT for the user to approve in the browser it opens, saying out loud that you are waiting (a silently blocking agent looks hung); quota_exceeded (429) ⇒ report the limit to the user and STOP, never retry-loop; ytdlp_download_403 ⇒ the CLI already retried internally, so treat the import as done-but-incomplete, tell the user frames are pending, and move on with the transcript. When you cannot tell which state you are in, run `clipy doctor --json` — it reports yt-dlp, ffmpeg, auth, and API reachability in one call.",
       "PARTIAL SUCCESS IS SUCCESS. A context import whose transcript synced while frames failed produces a real, readable document. Complete it by re-running the SAME import command on the SAME source (imports are idempotent and resolve to the same document); never re-import from scratch and never delete the partial first — see partialSuccess.",
@@ -5588,7 +5636,15 @@ function cmdGuide(json: boolean): void {
 }
 
 /** transcript --replace: PUT agent-authored transcript content. */
-async function cmdTranscriptReplace(ctx: Ctx, id: string, file: string): Promise<void> {
+async function cmdTranscriptReplace(
+  ctx: Ctx,
+  id: string,
+  file: string,
+  revision: string,
+): Promise<void> {
+  if (!/^[a-f0-9]{64}$/.test(revision)) {
+    die("--revision must be the 64-character revision returned by `clipy transcript <id> --json`", 2);
+  }
   const pid = encodeURIComponent(normalizeId(id, ctx));
   let raw: string;
   if (file === "-") {
@@ -5596,9 +5652,9 @@ async function cmdTranscriptReplace(ctx: Ctx, id: string, file: string): Promise
   } else {
     raw = readFileSync(resolve(file), "utf8");
   }
-  let payload: unknown;
+  let payload: Json;
   try {
-    payload = JSON.parse(raw);
+    payload = JSON.parse(raw) as Json;
   } catch {
     die("replace file must be JSON: {segments:[{start,end,text}...]} or {plaintext:\"...\"}", 2);
   }
@@ -5610,7 +5666,7 @@ async function cmdTranscriptReplace(ctx: Ctx, id: string, file: string): Promise
       "Content-Type": "application/json",
       "User-Agent": `clipy-cli/${VERSION}`,
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ ...payload, expectedRevision: revision }),
   });
   const text = await res.text();
   let body: Json = {};
@@ -5684,6 +5740,7 @@ async function main(): Promise<void> {
       viewports: { type: "string" },
       max: { type: "string" },
       replace: { type: "string" },
+      revision: { type: "string" },
       transcript: { type: "string" },
       language: { type: "string" },
       folder: { type: "string" },
@@ -5844,9 +5901,17 @@ async function main(): Promise<void> {
       await cmdShow(ctx, rest[0], json);
       return;
     case "transcript": {
-      if (!rest[0]) die("usage: clipy transcript <id|url> [--srt|--vtt|--json] [--replace <file.json|->]", 2);
+      if (!rest[0]) die("usage: clipy transcript <id|url> [--srt|--vtt|--json] | --replace <file.json|-> --revision <sha256>", 2);
       if (values.replace) {
-        await cmdTranscriptReplace(ctx, rest[0], String(values.replace));
+        if (!values.revision) {
+          die("--revision is required with --replace; read the current transcript with --json first", 2);
+        }
+        await cmdTranscriptReplace(
+          ctx,
+          rest[0],
+          String(values.replace),
+          String(values.revision),
+        );
         return;
       }
       const fmt = json ? "json" : values.srt ? "srt" : values.vtt ? "vtt" : "text";
@@ -5999,6 +6064,7 @@ async function main(): Promise<void> {
         notes: ((values.note as string[] | undefined) ?? []).map(parseNoteFlag),
         wait: Boolean(values.wait),
         json,
+        verificationFor: (values.for as string | undefined)?.trim() || undefined,
       });
       return;
     }

@@ -175,7 +175,7 @@ const partialBody = soleJson(partial);
 assert.equal(partialBody.ok, true, "partial success is still ok:true");
 assert.equal(partialBody.publicId, "xg61vyh0d4dy", "the data that DID succeed must be complete");
 assert.ok(partialBody.bundlePath, "the bundle path must survive a partial");
-assert.ok(partialBody.contextPath.endsWith("recording.md"), "an agent needs the file, not just the directory");
+assert.ok(partialBody.contextPath.endsWith("recording.arec"), "an agent needs the AREC file, not just the directory");
 assert.ok(Array.isArray(partialBody.warnings) && partialBody.warnings.length > 0, "the failure must surface as a warning");
 const warning = partialBody.warnings[0];
 assert.equal(warning.code, "frames_upload_failed");
@@ -203,7 +203,7 @@ assert.equal(humanFail.stdout, "", "a failure must not print a partial result to
 const humanOk = await run([video, "--transcript", vtt, "--output", dir]);
 assert.equal(humanOk.status, 0);
 assert.match(humanOk.stdout, /Your agent-ready context for "clip\.mp4" is ready\./);
-assert.match(humanOk.stdout, /→ local bundle: .*recording\.md/);
+assert.match(humanOk.stdout, /→ local bundle: .*recording\.arec/);
 assert.match(humanOk.stdout, /clipy context read /);
 assert.ok(!humanOk.stdout.includes("in your Clipy library"), "a local-only run must not claim a library entry");
 assert.match(humanOk.stdout, /transcript: 1 segments from user_file/, "the detail lines must still follow");

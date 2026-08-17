@@ -197,13 +197,18 @@ function bundleFilesFor() {
 
   // The bundle is the same shape as every other one, warning and all.
   const bundle = join(dir, bundleFilesFor().at(-1));
-  const md = readFileSync(join(bundle, "recording.md"), "utf8");
+  const md = readFileSync(join(bundle, "recording.arec"), "utf8");
   assert.match(md, /NOTE FOR AI AGENTS/, "the untrusted-content warning must be present");
   assert.match(md, /- Source: loom/);
   assert.match(md, /\[00:00\] first we open the dashboard/);
-  for (const file of ["recording.md", "manifest.json", "transcript.json"]) {
+  for (const file of ["recording.arec", "recording.md", "manifest.json", "transcript.json"]) {
     assert.ok(existsSync(join(bundle, file)), `missing ${file}`);
   }
+  assert.equal(
+    readFileSync(join(bundle, "recording.arec"), "utf8"),
+    readFileSync(join(bundle, "recording.md"), "utf8"),
+    "the legacy recording.md copy must remain byte-identical",
+  );
 
   // Captions were preferred over the phrase JSON, and only one was fetched.
   assert.deepEqual(seen.transcriptHits, ["/captions.vtt"]);

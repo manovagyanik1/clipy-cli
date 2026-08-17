@@ -1,7 +1,7 @@
 /**
  * The bundled Clipy agent skill, installed by `clipy agents install <target>`
  * into the agent's skills directory (~/.claude/skills/clipy/SKILL.md etc.).
- * Covers BOTH halves: reading recordings (the public .md context document)
+ * Covers BOTH halves: reading recordings (the public .arec context document)
  * and making recordings (record / session / mark, headless or the real Mac
  * screen).
  *
@@ -15,7 +15,7 @@ description: Read and create Clipy screen recordings, turn screenshots or tool-n
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.13.0 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.13.1 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
@@ -37,13 +37,13 @@ for an MCP connection, trust its \`tools/list\` response.
 ## Reading a recording (no auth needed for public links)
 
 RULE: every Clipy watch link has a machine-readable markdown twin at the same
-URL with \`.md\` appended. Whenever a Clipy video link appears ANYWHERE in your
+URL with \`.arec\` appended. Whenever a Clipy video link appears ANYWHERE in your
 task — the user's message, a PR description, an issue, a pasted chat — do not
 try to watch the video or scrape the watch page: fetch the twin
-(\`https://clipy.online/video/<id>.md\`) and work from that.
+(\`https://clipy.online/video/<id>.arec\`) and work from that.
 
 1. Given \`https://clipy.online/video/<id>\`, read the context document — either
-   \`clipy context <id>\` or fetch \`https://clipy.online/video/<id>.md\`. Same
+   \`clipy context <id>\` or fetch \`https://clipy.online/video/<id>.arec\`. Same
    document: summary, action items, key-moment frames (with click coordinates
    and clicked-element labels when captured), and the full transcript.
 2. Still processing? The document says so; re-fetch in 30-60s, or block with
@@ -267,7 +267,7 @@ WHAT must be verified, and WHETHER the target depends on an existing login.
      real session. Prefer the current agent/browser tool's own WebM/MP4 or
      screenshots and hand them to \`clipy proof\`. For continuous native proof,
      use \`clipy sources --json\`, select the exact Chrome/app window, and record
-     it with \`--source mac-screen --window <exact-id>\`.
+     its starting screen area with \`--source mac-screen --window <exact-id>\`.
    - **Interactive Windows/Linux desktop:** the Mac bridge is unavailable. Reuse
      the existing browser/computer-use tool's video or screenshots with
      \`clipy proof\`; otherwise use Playwright with an existing approved auth
@@ -309,7 +309,7 @@ For a request such as "review this UI PR and record every changed page":
 - If pages require different accounts, browser profiles, native apps, or privacy
   boundaries, make separate proof recordings. Do not weaken authentication or
   expose unrelated windows merely to force everything into one video.
-- Return a short coverage list beside the watch and \`.md\` URLs so the reviewer
+- Return a short coverage list beside the watch and \`.arec\` URLs so the reviewer
   can see exactly which routes/states the recording proves.
 
 ## Universal proof — use the tool the agent already has
@@ -660,8 +660,8 @@ Clipy will NEVER bring a window or tab to the front for you. It cannot know whic
 tab/page/simulator you mean, and on --source mac-screen it may not be recording a
 browser at all. Focusing the right surface is YOUR job — do it before \`session start\`
 (e.g. activate the tab with your own tooling), then confirm with the reported title.
-Note the title is read at START time; if you switch tabs mid-recording the camera
-follows the window, not your driver.
+Note the title and screen area are fixed at START time. Moving the window does not
+move the recording, and anything entering that area is filmed.
 - On \`clipy record --source mac-screen\`, \`--for\` is capped at 1740s (the app
   auto-stops at 1800s).
 - If a human presses Stop inside the app during your session, \`session stop\` /
@@ -716,8 +716,8 @@ mic-free on the strength of the flag you passed.
   then \`clipy context <id>\` and confirm the transcript matches what you meant to
   show.
 - When you hand a recording back, give the user BOTH the share URL
-  (\`clipy.online/video/<id>\`, the human page) AND the \`.md\` context URL
-  (\`clipy.online/video/<id>.md\`, for their agents).
+  (\`clipy.online/video/<id>\`, the human page) AND the \`.arec\` context URL
+  (\`clipy.online/video/<id>.arec\`, for their agents).
 
 ## When record / session / --source mac-screen fails
 

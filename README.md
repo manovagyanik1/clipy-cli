@@ -95,11 +95,14 @@ clipy memory search <query> [--kind recording|context] [--json]
 clipy search <query>                 # full-text search titles + descriptions
 clipy show <id|share-url>            # metadata + share link
 clipy transcript <id> [--marks-only] # one entry per line, timestamped (--srt/--vtt to export)
+clipy transcript <id> --json > transcript.json
+clipy transcript <id> --replace replacement.json --revision <transcript.revision>
+                                      # guarded replacement; stale revisions return a conflict
 clipy summary <id>                   # TL;DR, key points, action items
 clipy moments <id>                   # key moments: timestamps, captions, click coords
 clipy context <id>                   # the full agent-context bundle as markdown
 clipy context import <url|file> --sync   # turn ANY video into an agent-readable bundle
-clipy context read <bundle-path>     # print a local bundle's recording.md
+clipy context read <bundle-path>     # print a local bundle's recording.arec
 clipy download <id> [-o out.mp4]     # download the MP4
 clipy open <id>                      # open the share page in your browser
 clipy wait <id> --for both           # block until transcript/summary are ready
@@ -140,7 +143,7 @@ recording-library search.
 ## Import any video as context
 
 `clipy context import` turns a YouTube URL, a Loom share link, or a local video file into an agent-readable
-bundle (`recording.md` + `manifest.json` + `transcript.json`), and optionally into private
+bundle (`recording.arec` + byte-identical `recording.md` + `manifest.json` + `transcript.json`), and optionally into private
 Clipy memory.
 
 ```bash
@@ -567,7 +570,7 @@ By default it captures the primary display. Target one window instead:
 ```bash
 clipy sources                                   # list displays + windows with ids
 clipy session start --source mac-screen --window "Chrome" --title "Fix walkthrough"
-# … the agent drives the real, logged-in Chrome while Clipy records that window …
+# … the agent drives Chrome while Clipy records its initial screen area …
 clipy mark "reproduced the bug"
 clipy mark "fix applied — retesting"
 clipy session stop                              # uploads, prints the share link
@@ -613,8 +616,8 @@ of a different tab: worse than no evidence, because the tally vouches for the wr
 **Clipy will never bring a window or tab to the front for you.** It can't know which
 tab/page/simulator you mean, and on `--source mac-screen` it may not be recording a browser
 at all — focusing the right surface is the caller's job. Do it before `session start`, then
-confirm with the reported title. (That title is read at start time; the camera follows the
-window, so switching tabs mid-recording changes what's filmed without changing the title.)
+confirm with the reported title. (The title and recorded screen area are fixed at start time;
+moving the window does not move the recording, and anything entering that area is filmed.)
 
 ## Scripting
 
@@ -659,8 +662,8 @@ API, but with agent-native tools and inline key-moment frames
 [setup docs](https://clipy.online/docs/mcp)). `clipy mcp` is a shortcut that runs it.
 
 Also: every **public** Clipy watch link is agent-readable without any install — append
-`.md` to it (`https://clipy.online/video/<id>.md`) and it serves a markdown context
-document with the summary, key moments, and transcript. Details at
+`.arec` to it (`https://clipy.online/video/<id>.arec`) and it serves actionable AREC
+Markdown. The legacy `.md` URL remains byte-identical. Details at
 [clipy.online/for-agents](https://clipy.online/for-agents).
 
 ## Links

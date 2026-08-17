@@ -1,10 +1,14 @@
 /**
- * `clipy context read <bundle-path>` — prints a local bundle's recording.md.
+ * `clipy context read <bundle-path>` — prints a local bundle's recording.arec.
  * Output is for agents: plain, unpaged, uncoloured.
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import {
+  AREC_CANONICAL_FILENAME,
+  AREC_LEGACY_FILENAME,
+} from "../context-core/index.js";
 
 export function cmdContextRead(target: string): void {
   let dir = resolve(target);
@@ -28,7 +32,11 @@ export function cmdContextRead(target: string): void {
     );
   }
 
-  const doc = join(dir, "recording.md");
-  if (!existsSync(doc)) throw new Error(`${dir} has a manifest but no recording.md.`);
+  const arec = join(dir, AREC_CANONICAL_FILENAME);
+  const legacy = join(dir, AREC_LEGACY_FILENAME);
+  const doc = existsSync(arec) ? arec : legacy;
+  if (!existsSync(doc)) {
+    throw new Error(`${dir} has a manifest but no ${AREC_CANONICAL_FILENAME}.`);
+  }
   process.stdout.write(readFileSync(doc, "utf8"));
 }

@@ -983,6 +983,56 @@ await test("session start --source mac-screen reports the resolved capture sourc
   }
 });
 
+await test("session stop --source mac-screen reports the finalized byte count returned by the app bridge", async () => {
+  const ws = freshWorkspace();
+  const WINDOW = { id: 157, app_name: "TextEdit", title: "Clipy diagnostic", width: 640, height: 480 };
+  const sockPath = join(mkdtempSync(join(tmpdir(), "clipy-size-sock-")), "bridge.sock");
+  const bridge = createNetServer((conn) => {
+    let buf = "";
+    conn.on("data", (d) => {
+      buf += d;
+      const nl = buf.indexOf("\n");
+      if (nl === -1) return;
+      const req = JSON.parse(buf.slice(0, nl));
+      const reply = (data) => conn.end(`${JSON.stringify({ ok: true, data })}\n`);
+      if (req.cmd === "sources") return reply({ displays: [], windows: [WINDOW] });
+      if (req.cmd === "start")
+        return reply({
+          started: true,
+          audio: { includeSystemAudio: true, includeMic: false, micDeviceId: null },
+        });
+      if (req.cmd === "stop")
+        return reply({
+          publicId: "pub-size",
+          shareUrl: "https://clipy.online/video/pub-size",
+          autoStopped: false,
+          sizeBytes: 80870,
+        });
+      return reply({});
+    });
+  });
+  await new Promise((resolve) => bridge.listen(sockPath, resolve));
+  const bridgeFile = join(mkdtempSync(join(tmpdir(), "clipy-size-bridge-")), "agent-bridge.json");
+  writeFileSync(
+    bridgeFile,
+    JSON.stringify({ socketPath: sockPath, token: "t", pid: process.pid, appVersion: "0.1.45", protocolVersion: 2 }),
+  );
+  const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
+  try {
+    const start = await runCli(
+      ["session", "start", "--source", "mac-screen", "--window", "157", "--json"],
+      { cwd: ws.cwd, env },
+    );
+    assert.equal(start.code, 0, `mac session start failed (${start.code}): ${start.stderr}`);
+
+    const stop = await runCli(["session", "stop", "--json"], { cwd: ws.cwd, env });
+    assert.equal(stop.code, 0, `mac session stop failed (${stop.code}): ${stop.stderr}`);
+    assert.equal(JSON.parse(stop.stdout).sizeBytes, 80870, "the bridge's real MP4 size must reach CLI JSON");
+  } finally {
+    bridge.close();
+  }
+});
+
 await test("session start --source mac-screen prints the resolved surface prominently, before the usage hints", async () => {
   const ws = freshWorkspace();
   const WINDOW = { id: 42, app_name: "Simulator", title: "iPhone 15 — Checkout", width: 390, height: 844 };

@@ -24,7 +24,11 @@ export type TranscriptSource =
    *  fidelity source we accept, and worth flagging as such to an agent. */
   | 'auto_captions_translated'
   | 'user_file'
-  | 'local_stt';
+  | 'local_stt'
+  /** The source published none. The bundle is metadata-only: still worth
+   *  storing (it says which video, how long, and where it lives), but an agent
+   *  must not read the absence of speech as an absence of content. */
+  | 'none';
 
 export interface NormalizedTranscript {
   language?: string;
@@ -133,7 +137,7 @@ export interface ArecCompleteness {
 
 export interface ArecManifest {
   bundleVersion: 1;
-  arecVersion: '0.2-draft';
+  arecVersion: '0.3-draft';
   title: string;
   source: ContextSource;
   durationMs: number;

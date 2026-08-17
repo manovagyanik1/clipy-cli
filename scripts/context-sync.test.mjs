@@ -69,7 +69,7 @@ assert.equal(b.folderName, "Imports");
 assert.equal(typeof b.arecMarkdown, "string");
 assert.ok(b.arecMarkdown.includes("NOTE FOR AI AGENTS"));
 assert.equal(b.manifest.bundleVersion, 1);
-assert.equal(b.manifest.arecVersion, "0.2-draft");
+assert.equal(b.manifest.arecVersion, "0.3-draft");
 assert.equal(b.manifest.profile, "transcript");
 assert.equal(b.manifest.compiler.name, "@clipy/cli");
 assert.equal(b.manifest.source.kind, "local");

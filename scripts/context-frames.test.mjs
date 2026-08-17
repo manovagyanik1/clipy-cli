@@ -149,13 +149,14 @@ assert.equal(manifest.serverClassification.moments.length, 2, "the planned momen
 assert.equal(manifest.source.fileName, "clip.mp4");
 assert.ok(!manifest.frames.some((f) => f.file.includes("/")), "manifest frame refs must be basenames");
 
-const md = readFileSync(join(bundle, "recording.md"), "utf8");
-assert.ok(md.includes("Video type: tutorial"), "recording.md does not mention the video type");
-assert.ok(md.includes(`![frame at 00:01](frames/${files[0]})`), "recording.md has no inline frame ref");
-assert.ok(md.includes(`![frame at 00:03](frames/${files[1]})`), "recording.md is missing the second frame ref");
-assert.ok(md.includes("[00:01] opens the dashboard"), "recording.md does not caption the first frame");
-assert.ok(md.includes("[00:03] clicks the highlighted button"), "recording.md does not caption the second frame");
-assert.ok(!md.includes(dir), "recording.md leaked a local filesystem path");
+const md = readFileSync(join(bundle, "recording.arec"), "utf8");
+assert.equal(md, readFileSync(join(bundle, "recording.md"), "utf8"), "legacy .md is not byte-identical");
+assert.ok(md.includes("Video type: tutorial"), "recording.arec does not mention the video type");
+assert.ok(md.includes(`![frame at 00:01](frames/${files[0]})`), "recording.arec has no inline frame ref");
+assert.ok(md.includes(`![frame at 00:03](frames/${files[1]})`), "recording.arec is missing the second frame ref");
+assert.ok(md.includes("[00:01] opens the dashboard"), "recording.arec does not caption the first frame");
+assert.ok(md.includes("[00:03] clicks the highlighted button"), "recording.arec does not caption the second frame");
+assert.ok(!md.includes(dir), "recording.arec leaked a local filesystem path");
 
 // --- --no-frames opts out of phase 2 --------------------------------------
 
@@ -179,7 +180,7 @@ assert.ok(!md.includes("## Incomplete"), "a bundle with all its frames must not 
 
 // --- an incomplete bundle says so IN the document --------------------------
 
-// The warning envelope is gone by the next session, so recording.md itself has
+// The warning envelope is gone by the next session, so recording.arec itself has
 // to carry "what is missing" and "how to finish it".
 const failDir = mkdtempSync(join(tmpdir(), "clipy-frames-fail-"));
 const failed = await run([], failDir, { failFrames: true });
@@ -187,7 +188,7 @@ assert.equal(failed.status, 0, "a frames failure is a PARTIAL success, not a fai
 
 const failOut = JSON.parse(failed.stdout);
 const failBundle = failOut.bundlePath;
-const failMd = readFileSync(join(failBundle, "recording.md"), "utf8");
+const failMd = readFileSync(join(failBundle, "recording.arec"), "utf8");
 const failManifest = JSON.parse(readFileSync(join(failBundle, "manifest.json"), "utf8"));
 
 assert.equal(failManifest.completeness.status, "incomplete");
@@ -195,7 +196,7 @@ assert.equal(failManifest.completeness.missingFrames, 2, "both planned frames ar
 assert.equal(failManifest.completeness.reasonCode, "frames_upload_failed");
 assert.match(failManifest.completeness.rerunCommand, /^clipy context import /);
 
-assert.ok(failMd.includes("## Incomplete"), "recording.md must carry an Incomplete section");
+assert.ok(failMd.includes("## Incomplete"), "recording.arec must carry an Incomplete section");
 // Near the top: after the title, before the metadata a reader would act on.
 assert.ok(
   failMd.indexOf("## Incomplete") < failMd.indexOf("## Metadata"),
@@ -224,7 +225,7 @@ const gated = await run([], gateDir, {
 });
 assert.equal(gated.status, 0);
 const gateBundle = JSON.parse(gated.stdout).bundlePath;
-const gateMd = readFileSync(join(gateBundle, "recording.md"), "utf8");
+const gateMd = readFileSync(join(gateBundle, "recording.arec"), "utf8");
 const gateManifest = JSON.parse(readFileSync(join(gateBundle, "manifest.json"), "utf8"));
 
 assert.equal(gateManifest.completeness.status, "complete", "no frames were planned, so nothing is missing");
