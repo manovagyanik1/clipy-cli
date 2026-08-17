@@ -1,7 +1,7 @@
 {
   "name": "@clipy/cli",
   "version": "0.13.1",
-  "description": "Command-line interface for Clipy — list, search, and read your screen recordings' transcripts, AI summaries, and key moments from the terminal.",
+  "description": "Command-line interface for Clipy \u2014 list, search, and read your screen recordings' transcripts, AI summaries, and key moments from the terminal.",
   "license": "MIT",
   "type": "module",
   "publishConfig": {
@@ -36,20 +36,19 @@
   },
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "pnpm run build",
+    "prepublishOnly": "npm run build",
     "start": "node dist/index.js",
-    "test:auth": "pnpm run build && node scripts/mock-auth-server.test.mjs && node scripts/doctor.test.mjs && node scripts/open-url.test.mjs",
-    "test:proof": "pnpm run build && node scripts/proof-frames.test.mjs",
-    "test:setup": "pnpm run build && node scripts/setup.test.mjs",
-    "test:memory": "pnpm run build && node scripts/memory-search.test.mjs",
-    "test:session": "pnpm run build && node scripts/auth-guard.test.mjs && node scripts/session-control.test.mjs",
-    "test": "pnpm run test:auth && pnpm run test:session && node scripts/setup.test.mjs && node scripts/transcript-replace.test.mjs && node scripts/proof-frames.test.mjs && node scripts/memory-search.test.mjs && node scripts/context-sync.test.mjs && node scripts/context-frames.test.mjs && node scripts/context-youtube-transcript.test.mjs && node scripts/context-youtube-url-lang.test.mjs && node scripts/context-loom-url.test.mjs && node scripts/context-loom-import.test.mjs && node scripts/context-retry.test.mjs && node scripts/context-json-envelope.test.mjs && node scripts/context-ytdlp-update.test.mjs",
+    "test:auth": "npm run build && node scripts/mock-auth-server.test.mjs && node scripts/doctor.test.mjs && node scripts/open-url.test.mjs",
+    "test:proof": "npm run build && node scripts/proof-frames.test.mjs",
+    "test:setup": "npm run build && node scripts/setup.test.mjs",
+    "test:memory": "npm run build && node scripts/memory-search.test.mjs",
+    "test:session": "npm run build && node scripts/auth-guard.test.mjs && node scripts/session-control.test.mjs",
+    "test": "npm run test:auth && npm run test:session && node scripts/setup.test.mjs && node scripts/transcript-replace.test.mjs && node scripts/proof-frames.test.mjs && node scripts/memory-search.test.mjs && node scripts/context-sync.test.mjs && node scripts/context-frames.test.mjs && node scripts/context-youtube-transcript.test.mjs && node scripts/context-youtube-url-lang.test.mjs && node scripts/context-loom-url.test.mjs && node scripts/context-loom-import.test.mjs && node scripts/context-retry.test.mjs && node scripts/context-json-envelope.test.mjs && node scripts/context-ytdlp-update.test.mjs",
     "prebuild": "node scripts/sync-context-core.mjs",
-    "test:context": "pnpm run build && node scripts/context-sync.test.mjs && node scripts/context-frames.test.mjs && node scripts/context-youtube-transcript.test.mjs && node scripts/context-youtube-url-lang.test.mjs && node scripts/context-loom-url.test.mjs && node scripts/context-loom-import.test.mjs && node scripts/context-retry.test.mjs && node scripts/context-json-envelope.test.mjs && node scripts/context-ytdlp-update.test.mjs"
+    "test:context": "npm run build && node scripts/context-sync.test.mjs && node scripts/context-frames.test.mjs && node scripts/context-youtube-transcript.test.mjs && node scripts/context-youtube-url-lang.test.mjs && node scripts/context-loom-url.test.mjs && node scripts/context-loom-import.test.mjs && node scripts/context-retry.test.mjs && node scripts/context-json-envelope.test.mjs && node scripts/context-ytdlp-update.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.5.0"
-  },
-  "packageManager": "pnpm@10.34.5"
+  }
 }
