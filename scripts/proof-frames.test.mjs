@@ -37,8 +37,19 @@ mp4.writeUInt32BE(24, 0);
 mp4.write("ftyp", 4, "ascii");
 writeFileSync(recordedMp4, mp4);
 
+// Spans two 4 MiB read windows with no repeating runs, so a part that carries
+// stale bytes from the previous window or memory past the read is detectable.
+const multipartMp4 = join(work, "multi-part.mp4");
+const large = Buffer.alloc(4 * 1024 * 1024 + 1234);
+for (let i = 0; i < large.length; i++) large[i] = (i * 31 + (i >> 8)) & 0xff;
+large.writeUInt32BE(24, 0);
+large.write("ftyp", 4, "ascii");
+writeFileSync(multipartMp4, large);
+
 const completes = [];
 const chunkMediaTypes = [];
+const chunkFileBytes = [];
+const partsByToken = new Map();
 let uploads = 0;
 const server = createServer(async (req, res) => {
   const body = await new Promise((resolveBody) => {
@@ -76,6 +87,20 @@ const server = createServer(async (req, res) => {
           ? "video/webm"
           : "unknown",
     );
+    // The "file" field is everything between its headers and the next
+    // boundary. Guards against sending the whole reused read buffer.
+    const boundary = /boundary=(.+)$/.exec(req.headers["content-type"] ?? "")?.[1];
+    const field = (name) => {
+      const header = multipart.indexOf(`name="${name}"`);
+      const start = multipart.indexOf("\r\n\r\n", header) + 4;
+      return body.subarray(start, multipart.indexOf(`\r\n--${boundary}`, start));
+    };
+    const file = field("file");
+    chunkFileBytes.push(file.length);
+    const token = field("uploadToken").toString("latin1");
+    const parts = partsByToken.get(token) ?? [];
+    parts.push({ partNumber: Number(field("partNumber").toString("latin1")), bytes: Buffer.from(file) });
+    partsByToken.set(token, parts);
     send(200, { ok: true });
     return;
   }
@@ -145,6 +170,7 @@ try {
   assert.equal(frameResult.source.frameCount, 2);
   assert.equal(frameResult.source.durationSeconds, 3);
   assert.equal(chunkMediaTypes[0], "video/mp4");
+  assert.equal(chunkFileBytes[0], 4096, "the chunk must carry only the bytes read, not the 4 MiB read buffer");
   const ffmpegArgs = JSON.parse(readFileSync(ffmpegArgsPath, "utf8"));
   assert.deepEqual(ffmpegArgs.slice(ffmpegArgs.indexOf("-c:v"), ffmpegArgs.indexOf("-c:v") + 2), [
     "-c:v",
@@ -181,6 +207,7 @@ try {
   assert.equal(videoResult.source.container, "mp4");
   assert.equal("path" in videoResult.source, false, "JSON must not disclose the local media path");
   assert.equal(chunkMediaTypes[1], "video/mp4");
+  assert.equal(chunkFileBytes[1], 4096, "the chunk must carry only the bytes read, not the 4 MiB read buffer");
   assert.equal(completes[1].narration.notes[0].text, "agent opened the verified page");
 
   const bothSources = await run(["proof", "--frame", frame1, "--video", recordedMp4, "--json"]);
@@ -205,6 +232,21 @@ try {
   assert.match(oddWidth.stderr, /--width must be even/);
 
   assert.equal(uploads, 2, "invalid invocations must fail before creating an upload");
+
+  const multi = await run(["proof", "--video", multipartMp4, "--title", "Multi-part", "--json"]);
+  assert.equal(multi.code, 0, multi.stderr);
+  const multiParts = partsByToken.get("token-3");
+  assert.deepEqual(
+    multiParts.map(({ partNumber, bytes }) => [partNumber, bytes.length]),
+    [
+      [1, 4 * 1024 * 1024],
+      [2, 1234],
+    ],
+  );
+  assert.ok(
+    Buffer.concat(multiParts.map(({ bytes }) => bytes)).equals(large),
+    "the reassembled parts must be byte-identical to the source file",
+  );
 
   process.stdout.write("proof frames/video: ok\n");
 } finally {

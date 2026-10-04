@@ -46,6 +46,7 @@ import { cmdContextRead } from "./context/readCmd.js";
 import { errorEnvelope } from "./context/errors.js";
 import { supportsWebp } from "./context/ffmpeg.js";
 import { renderProofFrames } from "./proofFrames.js";
+import { waitForAgentContext } from "./agentReadiness.js";
 import {
   BridgeUnavailableError,
   bridgeRequest,
@@ -207,12 +208,20 @@ function requireKey(ctx: Ctx): string {
   );
 }
 
-async function api(ctx: Ctx, path: string, accept = "application/json"): Promise<Response> {
+async function api(
+  ctx: Ctx,
+  path: string,
+  accept = "application/json",
+  deadlineSignal?: AbortSignal,
+): Promise<Response> {
   const key = requireKey(ctx);
   const controller = new AbortController();
+  const abortForDeadline = () => controller.abort();
+  if (deadlineSignal?.aborted) controller.abort();
+  else deadlineSignal?.addEventListener("abort", abortForDeadline, { once: true });
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    return await fetch(`${ctx.apiUrl}${path}`, {
+    const response = await fetch(`${ctx.apiUrl}${path}`, {
       headers: {
         Authorization: `Bearer ${key}`,
         Accept: accept,
@@ -220,13 +229,21 @@ async function api(ctx: Ctx, path: string, accept = "application/json"): Promise
       },
       signal: controller.signal,
     });
+    const body = await response.arrayBuffer();
+    return new Response(body.byteLength > 0 ? body : null, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   } catch (e) {
     if ((e as Error).name === "AbortError") {
+      if (deadlineSignal?.aborted) throw e;
       die(`request timed out after ${FETCH_TIMEOUT_MS / 1000}s (${path})`);
     }
     throw e;
   } finally {
     clearTimeout(timer);
+    deadlineSignal?.removeEventListener("abort", abortForDeadline);
   }
 }
 
@@ -941,7 +958,23 @@ async function cmdMoments(ctx: Ctx, id: string, json: boolean): Promise<void> {
 async function cmdContext(ctx: Ctx, id: string): Promise<void> {
   const publicId = normalizeId(id, ctx);
   const pid = encodeURIComponent(publicId);
-  const res = await api(ctx, `/api/agent-context/${pid}`, "text/markdown, text/plain, application/json");
+  const waited = await waitForAgentContext(
+    (signal) => api(
+      ctx,
+      `/api/agent-context/${pid}`,
+      "text/markdown, text/plain, application/json",
+      signal,
+    ),
+    {
+      timeoutMs: 60_000,
+      now: Date.now,
+      sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    },
+  );
+  const res = waited.response;
+  if (waited.timedOut) {
+    process.stderr.write(`${c.yellow("!")} recording is still preparing; returning the latest available context\n`);
+  }
   const text = await res.text();
   if (!res.ok) {
     let msg = `Clipy API error ${res.status}`;
@@ -1666,8 +1699,11 @@ async function ingestPostChunk(
   for (let attempt = 1; attempt <= 4; attempt++) {
     // Copy the window into a standalone ArrayBuffer: it satisfies BlobPart
     // under strict lib settings (a subarray's .buffer is ArrayBufferLike) and
-    // makes the snapshot independent of the reused read buffer.
-    const part = bytes.slice().buffer as ArrayBuffer;
+    // makes the snapshot independent of the reused read buffer. Not
+    // bytes.slice(): on a Node Buffer that is a view, so its .buffer is the
+    // whole 4 MiB read buffer, and every part would carry stale bytes and
+    // uninitialized memory past bytes.length.
+    const part = new Uint8Array(bytes).buffer as ArrayBuffer;
     const form = new FormData();
     form.append("recordingId", recordingId);
     form.append("uploadToken", uploadToken);
