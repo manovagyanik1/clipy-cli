@@ -15,7 +15,7 @@ description: Read and create Clipy screen recordings, turn screenshots or tool-n
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.14.0 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.15.0 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
@@ -292,6 +292,15 @@ WHAT must be verified, and WHETHER the target depends on an existing login.
      signed-out substitute and call it proof.
    - **Public/local route with no login dependency:** a fresh isolated headless
      browser is normally the cleanest option.
+   - **Autonomous run that needs a tab-exact recording WITH tab audio, or a
+     persistent signed-in automation identity:** \`--source chrome-for-clipy\`
+     (see the Chrome for Clipy section below). It records tab audio without
+     a manual capture-picker step; it uses a dedicated browser the
+     user signed into once, never their daily one.
+   - **The user asks you to record yourself doing something in the browser,
+     and does not need marks:** \`--source chrome-extension\` (see "Recording
+     through the Clipy extension" below). Same dedicated browser; the Clipy
+     extension records and uploads the tab.
 
 Before capture, visibly confirm the resolved target: expected URL, expected
 signed-in/signed-out state, expected account/role when it is safe to display, and
@@ -490,6 +499,47 @@ and \`CLIPY_DISABLE_CDP=1\` forces it off.
 Headless captures are silent, so your notes/marks BECOME the transcript (honestly
 labeled as agent narration, never passed off as speech). Narrate every meaningful
 step.
+
+### Chrome for Clipy: the agent's own browser (tab video + tab audio)
+
+    clipy session start --source chrome-for-clipy --url https://app.example.com \\
+      --title "PR-1234 verification" --type pr_review
+    # drive it over the ALWAYS-published CDP endpoint (cdpUrl in the start JSON),
+    # add clipy mark evidence, then:
+    clipy session stop
+
+"Chrome for Clipy" is a dedicated, persistent automation browser the CLI owns
+(\`clipy chrome start|stop|status|install-app\`): its own profile (the user
+signs in ONCE and stays signed in), CDP always exposed, and picker-free tab
+capture. \`--source chrome-for-clipy\` records EXACTLY ONE TAB, with that tab's
+AUDIO, no human gesture, and keeps recording across navigations and while the
+tab is backgrounded. The session starts the browser if needed, opens --url in
+the recorded tab, and stopping never closes the browser.
+
+Use it when the verification needs sound (a player, a call UI, TTS), a
+tab-exact frame with zero desktop clutter, or a standing signed-in identity for
+automation. Do NOT treat it as the user's daily browser: it is a separate
+identity by design, and everything in its profile is reachable by any local
+process while CDP is open. Browser automation setup is opt-in. Install with
+\`clipy setup <agent> --with-browser\` or \`clipy chrome start\`, only when the
+user asked for browser automation.
+
+### Recording through the Clipy extension (no marks)
+
+    clipy chrome setup --json        # one-time; quick check when already ready
+    clipy session start --source chrome-extension --url <page> --json
+    # drive the tab showing <page> over cdpHttpUrl with Playwright
+    clipy session stop --json        # returns shareUrl + contextUrl
+
+The Clipy extension inside Chrome for Clipy records the tab (video and tab
+audio) with no click, because Chrome for Clipy launches with
+\`--allowlisted-extension-id\`. \`clipy chrome setup\` waits up to 15 minutes
+for the two steps only the user can do in the Chrome for Clipy window: click
+"Add to Chrome" on the extension page it opens, and sign in to Clipy. Relay
+those instructions and never try to do either yourself. \`clipy mark\` and
+\`clipy chapter\` are refused on this source; use \`--source chrome-for-clipy\`
+when you need them. Full agent instructions:
+https://clipy.online/docs/chrome-for-clipy.md
 
 ### Assert what you claim (two provenances, never pooled)
 

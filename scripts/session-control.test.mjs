@@ -411,6 +411,24 @@ await test("in-page __clipyMark(text, opts) evaluates assertions daemon-side (�
     const chapterArity = await page.evaluate(() => window.__clipyChapter.length);
     assert.equal(chapterArity, 1, `window.__clipyChapter.length should be 1, got ${chapterArity}`);
 
+    const unrelated = await cdpBrowser.contexts()[0].newPage();
+    await unrelated.goto(appBase);
+    assert.equal(await unrelated.evaluate(() => typeof window.__clipyMarkImpl), "undefined",
+      "an unrelated tab must not receive recording bindings");
+    await unrelated.close();
+    await page.evaluate((url) => {
+      const iframe = document.createElement("iframe");
+      iframe.src = url.replace("127.0.0.1", "localhost");
+      document.body.appendChild(iframe);
+    }, appBase);
+    await page.waitForFunction(() => document.querySelector("iframe")?.contentWindow !== null);
+    const frame = page.frames().find((f) => f !== page.mainFrame());
+    await frame.waitForLoadState();
+    await assert.rejects(frame.evaluate(() => window.__clipyMarkImpl("steal", { assertSelector: "body" })),
+      /Only the recorded main frame|is not a function/);
+    await assert.rejects(frame.evaluate(() => window.__clipyChapterImpl("untrusted chapter")),
+      /Only the recorded main frame|is not a function/);
+
     // Passing assertion (#t contains Hello) → ✓-annotated, returned to the driver.
     const passRes = await page.evaluate(() =>
       window.__clipyMark("in-page hello", { assertSelector: "#t", assertText: "Hello" }),

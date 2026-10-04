@@ -344,6 +344,31 @@ test("authenticated setup --json reports one complete truthful result", () => {
   assert.equal(body.mcp.method, "config-file");
 });
 
+test("setup --with-browser only provisions Chrome for Clipy, and a browser failure never fails setup", () => {
+  // CLIPY_DISABLE_CDP=1 makes Chrome for Clipy refuse to start without spawning
+  // a browser, which exercises the failure path deterministically.
+  const result = runCli(["setup", "cursor", "--with-browser", "--json"], {
+    CLIPY_API_KEY: "clipy_sk_live_test",
+    CLIPY_DISABLE_CDP: "1",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const body = JSON.parse(result.stdout);
+  assert.equal(body.ok, true);
+  assert.equal(body.skill.installed, true);
+  assert.equal(body.mcp.method, "config-file");
+  assert.deepEqual(Object.keys(body.browser).sort(), ["chrome", "ok"]);
+  assert.equal(body.browser.ok, false);
+  assert.equal(body.browser.chrome.running, false);
+  assert.equal(typeof body.browser.chrome.error, "string");
+  assert.doesNotMatch(result.stdout, /open-browser-use|allowed_origins|manifests/);
+});
+
+test("setup without --with-browser reports no browser key", () => {
+  const result = runCli(["setup", "cursor", "--json"], { CLIPY_API_KEY: "clipy_sk_live_test" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal("browser" in JSON.parse(result.stdout), false);
+});
+
 test("setup --json reports manual MCP work as incomplete without installing the skill", () => {
   const original = JSON.stringify({ mcpServers: "preserve-me" });
   const result = runCli(
