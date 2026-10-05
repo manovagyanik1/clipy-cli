@@ -54,9 +54,12 @@ import {
 import {
   ExtensionRecordingEndedError,
   abortExtensionRecording,
+  ExtensionAlreadyUploadedError,
   extensionReadiness,
   extensionRecordingStatus,
   extensionStoreUrl,
+  openTabForPerson,
+  sendExtensionMark,
   startExtensionRecording,
   stopExtensionRecording,
 } from "./chromeExtensionCapture.js";
@@ -537,15 +540,18 @@ ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session
                                     published there, so drivers attach to the same
                                     browser being recorded. --source chrome-extension
                                     records the same way through the Clipy extension
-                                    installed there (no marks yet); run
+                                    installed there (marks become its transcript); run
                                     clipy chrome setup once first
   session run [start flags] -- <command …>
                                     Start a session, run the command (inherited
                                     stdio), then GUARANTEE cleanup: exit 0 uploads,
                                     any non-zero exit or signal discards and
                                     propagates the code. Sets CLIPY_SESSION=1 (+
-                                    CLIPY_CDP_URL with --expose-cdp). Crash-safe
-                                    wrapper for driver scripts — no dead-air uploads.
+                                    CLIPY_CDP_URL with --expose-cdp; with
+                                    --source chrome-extension also
+                                    CLIPY_TARGET_ID and CLIPY_PAGE_WS_URL for the
+                                    recorded tab). Crash-safe
+                                    wrapper for driver scripts: no dead-air uploads.
   mark "<what just happened>"       Drop a live timestamped note; marks become the
                                     recording's transcript. Attach evidence — one
                                     provenance per mark, never pooled:
@@ -3216,6 +3222,8 @@ interface SessionState {
   /** chrome-extension: there is no daemon. The Clipy extension inside Chrome
    *  for Clipy owns the recording; this id routes stop/abort/status to it. */
   extensionRecordingId?: string;
+  /** chrome-extension: what the extension build supports ("name", "narration"). */
+  extensionFeatures?: string[];
   bridge?: { socketPath: string; token: string; pid: number };
   pid: number;
   cwd: string;
@@ -3243,6 +3251,8 @@ interface SessionState {
    *  named profile into it); profileScratchRoot marks it for daemon cleanup. */
   userDataDir?: string;
   profileScratchRoot?: string;
+  /** chrome-extension: the recorded tab's CDP target id. */
+  extensionTargetId?: string;
   /** Mac sessions have no daemon to merge a tally, so `clipy mark --observed/
    *  --verdict` counts driver-attested marks here; `session stop` sends the
    *  [verification] summary as a final bridge mark before stopping. */
@@ -3827,6 +3837,103 @@ function cdpDriverSnippet(cdpHttpUrl: string): string {
   ].join("\n");
 }
 
+// Same limits the server enforces (lib/server/agentNarration.ts); an invalid
+// narration would fail the whole upload, so trim instead.
+const EXTENSION_MAX_NOTES = 200;
+const EXTENSION_MAX_NOTE_CHARS = 1_000;
+const EXTENSION_MAX_NOTE_START_MS = 24 * 60 * 60 * 1000;
+
+/** The session's marks as narration notes, plus the [verification] tally of
+ *  driver-attested marks stamped at the stop. */
+function extensionSessionNotes(state: SessionState): NarrationNote[] {
+  let lines: string[] = [];
+  try {
+    lines = readFileSync(state.marksPath, "utf8").split("\n").filter(Boolean);
+  } catch {
+    // no marks
+  }
+  const notes: NarrationNote[] = [];
+  for (const line of lines) {
+    try {
+      const m = JSON.parse(line) as { tMs?: unknown; text?: unknown };
+      if (typeof m.tMs === "number" && typeof m.text === "string" && m.text.trim()) {
+        notes.push({
+          startMs: Math.min(EXTENSION_MAX_NOTE_START_MS, Math.max(0, Math.round(m.tMs))),
+          text: m.text.trim().slice(0, EXTENSION_MAX_NOTE_CHARS),
+        });
+      }
+    } catch {
+      // skip a torn line
+    }
+  }
+  notes.sort((a, b) => a.startMs - b.startMs);
+  const tally = verificationNote({
+    clipyPassed: 0,
+    clipyFailed: 0,
+    clipyUnverified: 0,
+    driverPassed: state.attestedPassed ?? 0,
+    driverFailed: state.attestedFailed ?? 0,
+  });
+  const stopMs = state.recordStartEpochMs
+    ? Math.min(EXTENSION_MAX_NOTE_START_MS, Math.max(0, Date.now() - state.recordStartEpochMs))
+    : 0;
+  const kept = notes.slice(0, EXTENSION_MAX_NOTES - tally.length);
+  return [...kept, ...tally.map((t) => ({ startMs: stopMs, text: t.text }))];
+}
+
+/** The server keeps 200 notes and stop adds one verification summary, so a
+ *  200th mark would be dropped. Refuse it instead of reporting success. */
+function refuseExtensionMarkOverLimit(state: SessionState, text: string): void {
+  if (text.length > EXTENSION_MAX_NOTE_CHARS) {
+    die(
+      `this mark is ${text.length} characters (including any --observed annotation); the limit is ${EXTENSION_MAX_NOTE_CHARS}. Shorten it or split it into several marks.`,
+      2,
+    );
+  }
+  let count = 0;
+  try {
+    count = readFileSync(state.marksPath, "utf8").split("\n").filter(Boolean).length;
+  } catch {
+    // no marks yet
+  }
+  if (count >= EXTENSION_MAX_NOTES - 1) {
+    die(`mark limit reached: a recording keeps at most ${EXTENSION_MAX_NOTES - 1} marks. Stop this recording and start another to keep going.`);
+  }
+}
+
+/** Sends the mark to the extension before the CLI records it locally. If the
+ *  extension cannot be reached the local copy still goes out at stop; if the
+ *  recording already ended on its own, the mark is refused rather than
+ *  reported as recorded. */
+async function forwardExtensionMark(state: SessionState, tMs: number, text: string, summary?: string): Promise<void> {
+  if (!(state.extensionFeatures ?? []).includes("mark") || !state.extensionRecordingId) return;
+  // Retried, then refused: a mark the extension never received would be lost
+  // if the recording auto-stops before session stop sends the local copy.
+  let sent: Awaited<ReturnType<typeof sendExtensionMark>> | null = null;
+  let lastError = "";
+  for (let attempt = 1; attempt <= 3 && !sent; attempt++) {
+    sent = await sendExtensionMark({
+      port: extensionSessionPort(state),
+      env: process.env,
+      recordingId: state.extensionRecordingId,
+      startMs: tMs,
+      text,
+      summary,
+    }).catch((error: unknown) => {
+      lastError = error instanceof Error ? error.message : String(error);
+      return null;
+    });
+    if (!sent && attempt < 3) await new Promise((r) => setTimeout(r, 500 * attempt));
+  }
+  if (!sent) {
+    die(`could not reach the Clipy extension to record this mark (${lastError}); it was not recorded. Check \`clipy session status\` and try again.`);
+  }
+  if (sent.ended) {
+    die("the recording already ended (it reached --max and uploaded); this mark was not recorded. Run `clipy session stop` to collect it.");
+  }
+  if (!sent.ok) die(`the extension refused the mark: ${sent.error ?? "unknown error"}`);
+}
+
 function extensionSessionPort(state: SessionState): number {
   return state.chromePort ?? DEFAULT_CDP_PORT;
 }
@@ -3844,6 +3951,7 @@ function extensionSessionId(state: SessionState): string {
 async function cmdSessionStartExtension(opts: {
   url: string;
   name?: string;
+  tabAudio?: boolean;
   recordingKind?: string;
   maxSec: number;
   json: boolean;
@@ -3861,8 +3969,8 @@ async function cmdSessionStartExtension(opts: {
   if (opts.userDataDir) {
     die("--user-data-dir doesn't apply to --source chrome-extension; it records in the persistent Chrome for Clipy profile", 2);
   }
-  if ((opts.name || opts.recordingKind) && !opts.json) {
-    process.stderr.write(`${c.yellow("note: --name/--type are not applied to --source chrome-extension recordings yet")}\n`);
+  if (opts.recordingKind && !opts.json) {
+    process.stderr.write(`${c.yellow("note: --type is not applied to --source chrome-extension recordings yet")}\n`);
   }
   const file = sessionFilePath(process.cwd());
   const existing = readSessionState(file);
@@ -3874,17 +3982,18 @@ async function cmdSessionStartExtension(opts: {
   }
   if (existing) cleanupSessionFiles(existing, file);
 
-  const chromium = await loadChromium();
   const maxSec = Math.min(Math.max(1, opts.maxSec), SESSION_HARD_CAP_SEC);
   let started: Awaited<ReturnType<typeof startExtensionRecording>>;
   try {
-    started = await startExtensionRecording(chromium as unknown as Parameters<typeof startExtensionRecording>[0], {
+    started = await startExtensionRecording({
       home: homedir(),
       env: process.env,
       platform: process.platform,
       port: DEFAULT_CDP_PORT,
       targetUrl: target.href,
       maxSec,
+      name: opts.name,
+      tabAudio: opts.tabAudio,
       log: (m) => {
         if (!opts.json) process.stderr.write(`${c.dim(m)}\n`);
       },
@@ -3892,6 +4001,8 @@ async function cmdSessionStartExtension(opts: {
   } catch (error) {
     die(`could not start the extension recording: ${error instanceof Error ? error.message : String(error)}`);
   }
+  // Always on stderr, even with --json: a requested feature was dropped.
+  for (const warning of started.warnings) process.stderr.write(`${c.yellow(`warning: ${warning}`)}\n`);
   // The extension is recording from here on: record the session before
   // anything else can fail, or nothing could stop or collect it.
   const dir = sessionDir();
@@ -3900,6 +4011,8 @@ async function cmdSessionStartExtension(opts: {
     kind: "chrome-extension",
     chromePort: started.port,
     extensionRecordingId: started.recordingId,
+    extensionFeatures: started.features,
+    extensionTargetId: started.targetId,
     // Chrome for Clipy's pid: the session is alive only while that browser is.
     pid: started.chromePid,
     cwd: process.cwd(),
@@ -3910,7 +4023,7 @@ async function cmdSessionStartExtension(opts: {
     state: "recording",
     recordStartEpochMs: started.startedAtEpochMs,
     cdpHttpUrl: started.cdpHttpUrl,
-    marksPath: join(dir, "unused"),
+    marksPath: join(dir, `marks-${randomUUID()}.jsonl`),
     controlPath: join(dir, "unused"),
     logPath: join(dir, "unused"),
     tmpDir: join(dir, "unused"),
@@ -3922,7 +4035,7 @@ async function cmdSessionStartExtension(opts: {
       untilEpochMs: started.startedAtEpochMs + maxSec * 1000,
     });
   } catch (error) {
-    await abortExtensionRecording(chromium as unknown as Parameters<typeof abortExtensionRecording>[0], {
+    await abortExtensionRecording({
       port: started.port,
       env: process.env,
       recordingId: started.recordingId,
@@ -3941,12 +4054,15 @@ async function cmdSessionStartExtension(opts: {
       extensionVersion: started.extensionVersion,
       cdpUrl: cdpUrl ?? null,
       cdpHttpUrl: started.cdpHttpUrl,
+      // The recorded tab, exactly: other tabs can share its url.
+      targetId: started.targetId,
+      pageWsUrl: `ws://127.0.0.1:${started.port}/devtools/page/${started.targetId}`,
     });
     return;
   }
   process.stdout.write(
     `${c.green("✓")} the Clipy extension is recording ${c.bold(session.url)} in Chrome for Clipy (max ${maxSec}s)\n` +
-      `${c.dim("drive that tab over CDP:")} ${started.cdpHttpUrl}  ${c.dim("(the tab whose url() is the one above)")}\n` +
+      `${c.dim("drive that tab over CDP:")} target ${started.targetId}  ${c.dim(`(ws://127.0.0.1:${started.port}/devtools/page/${started.targetId})`)}\n` +
       `${c.dim("when finished:")} clipy session stop   ${c.dim("· discard:")} clipy session abort\n`,
   );
 }
@@ -3970,6 +4086,8 @@ async function cmdSessionStart(
     userDataDir?: string;
     profileDirectory?: string;
     audio: AudioChoice;
+    /** --source chrome-extension only: record the tab's sound too. */
+    tabAudio?: boolean;
   },
 ): Promise<void> {
   if (opts.source === "chrome-extension") {
@@ -4237,7 +4355,50 @@ async function cmdMark(text: string, json: boolean, opts: MarkOpts): Promise<voi
   const backdated = opts.atSec != null || opts.agoSec != null;
 
   if (state.kind === "chrome-extension") {
-    die("marks are not supported for --source chrome-extension recordings yet; use --source chrome-for-clipy when you need marks", 2);
+    // The extension owns the page, not Clipy's daemon, so Clipy cannot evaluate
+    // an assertion. Plain and driver-attested marks are kept here and sent with
+    // the stop, where they become the recording's transcript.
+    if (hasAssert) {
+      die("Clipy-evaluated assertions need a Clipy-owned page: use --observed/--verdict to attach evidence you collected yourself", 2);
+    }
+    if (state.state !== "recording" || !state.recordStartEpochMs) {
+      die(`session is ${state.state}; marks can only be added while recording`);
+    }
+    const nowMs = Math.max(0, Date.now() - state.recordStartEpochMs);
+    const requestedMs =
+      opts.atSec != null
+        ? Math.round(opts.atSec * 1000)
+        : opts.agoSec != null
+          ? nowMs - Math.round(opts.agoSec * 1000)
+          : nowMs;
+    // A mark can only point inside the recording so far; the server would
+    // reject a timestamp past 24h and fail the whole upload.
+    const tMs = Math.min(nowMs, EXTENSION_MAX_NOTE_START_MS, Math.max(0, requestedMs));
+    const markText = attest ? `${text.trim()} ${attestedMarkAnnotation(attest.verdict, attest.observed)}` : text.trim();
+    refuseExtensionMarkOverLimit(state, markText);
+    const passed = (state.attestedPassed ?? 0) + (attest?.verdict === "pass" ? 1 : 0);
+    const failed = (state.attestedFailed ?? 0) + (attest && attest.verdict !== "pass" ? 1 : 0);
+    // Sent with each verdict so a recording that auto-stops at --max still
+    // ends with the tally; an explicit stop sends its own and this is unused.
+    const summary = attest
+      ? verificationNote({ clipyPassed: 0, clipyFailed: 0, clipyUnverified: 0, driverPassed: passed, driverFailed: failed })[0]?.text
+      : undefined;
+    await forwardExtensionMark(state, tMs, markText, summary);
+    appendFileSync(state.marksPath, `${JSON.stringify({ tMs, text: markText })}\n`, { mode: 0o600 });
+    if (attest) {
+      state.attestedPassed = passed;
+      state.attestedFailed = failed;
+      writeSessionState(file, state);
+    }
+    printMarkResult(
+      {
+        tMs,
+        text: markText,
+        ...(attest ? { assert: { passed: attest.verdict === "pass", observed: attest.observed, attested: true } } : {}),
+      },
+      json,
+    );
+    return;
   }
   if (state.kind === "mac") {
     // The Mac app records the real screen — there is no Clipy-owned page to probe,
@@ -4407,7 +4568,16 @@ async function cmdChapter(label: string, json: boolean): Promise<void> {
   const { file, state } = requireSession();
   const chapterText = `=== CHAPTER: ${label} ===`;
   if (state.kind === "chrome-extension") {
-    die("chapters are not supported for --source chrome-extension recordings yet; use --source chrome-for-clipy when you need them", 2);
+    if (state.state !== "recording" || !state.recordStartEpochMs) {
+      die(`session is ${state.state}; chapters can only be added while recording`);
+    }
+    const tMs = Math.max(0, Date.now() - state.recordStartEpochMs);
+    refuseExtensionMarkOverLimit(state, chapterText);
+    await forwardExtensionMark(state, tMs, chapterText);
+    appendFileSync(state.marksPath, `${JSON.stringify({ tMs, text: chapterText })}\n`, { mode: 0o600 });
+    if (json) printJson({ tMs, label, text: chapterText });
+    else process.stdout.write(`${c.green("✓")} chapter @ ${(tMs / 1000).toFixed(1)}s: ${label}\n`);
+    return;
   }
   if (state.kind === "mac") {
     const result = await bridgeRequest(bridgeInfoFromSession(state), "mark", { text: chapterText }).catch(
@@ -4466,14 +4636,20 @@ async function cmdSessionStop(json: boolean): Promise<void> {
   const { file, state } = requireSession();
   if (state.kind === "chrome-extension") {
     if (!json) process.stderr.write(`${c.dim("stopping; the extension is uploading…")}\n`);
-    const chromium = await loadChromium();
+    const notes = extensionSessionNotes(state);
+    if (notes.length && !(state.extensionFeatures ?? []).includes("narration")) {
+      process.stderr.write(
+        `${c.yellow(`warning: this Clipy extension build cannot receive marks; ${notes.length} mark(s) will not reach the recording. Update the extension.`)}\n`,
+      );
+    }
     let result: Awaited<ReturnType<typeof stopExtensionRecording>>;
     try {
-      result = await stopExtensionRecording(chromium as unknown as Parameters<typeof stopExtensionRecording>[0], {
+      result = await stopExtensionRecording({
         port: extensionSessionPort(state),
         env: process.env,
         recordingId: extensionSessionId(state),
         timeoutMs: 600_000,
+        notes,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4598,15 +4774,23 @@ function reportSessionResult(result: SessionResult, json: boolean): void {
 async function cmdSessionAbort(json: boolean): Promise<void> {
   const { file, state } = requireSession();
   if (state.kind === "chrome-extension") {
-    const chromium = await loadChromium();
     let failure: string | null = null;
-    await abortExtensionRecording(chromium as unknown as Parameters<typeof abortExtensionRecording>[0], {
+    let uploaded: string | null = null;
+    await abortExtensionRecording({
       port: extensionSessionPort(state),
       env: process.env,
       recordingId: extensionSessionId(state),
     }).catch((error: unknown) => {
-      failure = error instanceof Error ? error.message : String(error);
+      if (error instanceof ExtensionAlreadyUploadedError) uploaded = error.message;
+      else failure = error instanceof Error ? error.message : String(error);
     });
+    if (uploaded) {
+      // Too late to discard: keep the session so `session stop` can collect it.
+      if (json) printJson({ state: "uploaded", error: uploaded });
+      else process.stderr.write(`${c.yellow("!")} the recording was ${uploaded}; it cannot be discarded here. Run \`clipy session stop\` to collect it, or delete it from the library.\n`);
+      process.exitCode = 1;
+      return;
+    }
     if (failure && (await chromeStatus(homedir(), process.platform)).running) {
       // Chrome for Clipy is up, so the recording may still be running: keep
       // the session so a retry (or stop) can still reach it.
@@ -4719,8 +4903,7 @@ async function cmdSessionStatus(json: boolean): Promise<void> {
     const elapsedSec = state.recordStartEpochMs ? Math.round((Date.now() - state.recordStartEpochMs) / 1000) : null;
     let live: { state: string; result: { publicId?: string; shareUrl?: string; error?: string } | null };
     try {
-      const chromium = await loadChromium();
-      live = await extensionRecordingStatus(chromium as unknown as Parameters<typeof extensionRecordingStatus>[0], {
+      live = await extensionRecordingStatus({
         port: extensionSessionPort(state),
         env: process.env,
         recordingId: extensionSessionId(state),
@@ -4736,6 +4919,11 @@ async function cmdSessionStatus(json: boolean): Promise<void> {
         maxSec: state.maxSec,
         cdpUrl: state.cdpUrl ?? null,
         cdpHttpUrl: state.cdpHttpUrl ?? null,
+        // The recorded tab, exactly, for an agent resuming without the start output.
+        targetId: state.extensionTargetId ?? null,
+        pageWsUrl: state.extensionTargetId
+          ? `ws://127.0.0.1:${extensionSessionPort(state)}/devtools/page/${state.extensionTargetId}`
+          : null,
         ...(live.result ? { result: live.result } : {}),
       });
       return;
@@ -4836,7 +5024,9 @@ async function cmdSessionRun(
   await cmdSessionStart(ctx, { ...startOpts, json: false });
 
   const file = sessionFilePath(process.cwd());
-  const cdpHttpUrl = readSessionState(file)?.cdpHttpUrl;
+  const started = readSessionState(file);
+  const cdpHttpUrl = started?.cdpHttpUrl;
+  const targetId = started?.extensionTargetId;
 
   const [cmd, ...args] = childArgv;
   process.stderr.write(`${c.dim(`running: ${childArgv.join(" ")}`)}\n`);
@@ -4850,6 +5040,11 @@ async function cmdSessionRun(
       CLIPY_SESSION: "1",
       CLIPY_SESSION_FILE: file,
       ...(cdpHttpUrl ? { CLIPY_CDP_URL: cdpHttpUrl } : {}),
+      // chrome-extension: the exact recorded tab, since other tabs in the
+      // persistent profile can share its url.
+      ...(targetId && started?.chromePort
+        ? { CLIPY_TARGET_ID: targetId, CLIPY_PAGE_WS_URL: `ws://127.0.0.1:${started.chromePort}/devtools/page/${targetId}` }
+        : {}),
     },
   });
 
@@ -5935,6 +6130,11 @@ async function cmdChromeSetup(home: string, port: number, json: boolean): Promis
   const say = (m: string) => {
     if (!json) process.stdout.write(`${m}\n`);
   };
+  // What the person must do. On stderr with --json, so an agent waiting on
+  // setup can relay it while stdout stays one JSON object.
+  const ask = (m: string) => {
+    (json ? process.stderr : process.stdout).write(`${m}\n`);
+  };
   const fail = (error: string): never => {
     if (json) printJson({ ok: false, error });
     else process.stderr.write(`error: ${error}\n`);
@@ -5948,22 +6148,12 @@ async function cmdChromeSetup(home: string, port: number, json: boolean): Promis
   }
   const started = await startChromeForClipy(home, process.env, process.platform, port);
   if (!started.ok) fail(started.error);
-  const chromium = (await loadChromium()) as unknown as Parameters<typeof extensionReadiness>[0];
-  const openTab = async (url: string) => {
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-    try {
-      const page = await browser.contexts()[0]?.newPage();
-      await page?.goto(url, { waitUntil: "load", timeout: 30_000 }).catch(() => {});
-      await page?.bringToFront().catch(() => {});
-    } finally {
-      await browser.close().catch(() => {});
-    }
-  };
+  const openTab = (url: string) => openTabForPerson(port, url).catch(() => {});
   const deadline = Date.now() + CHROME_SETUP_TIMEOUT_MS;
   let askedInstall = false;
   let askedSignIn = false;
   for (;;) {
-    const ready = await extensionReadiness(chromium, port, process.env);
+    const ready = await extensionReadiness(port, process.env);
     if (ready.installed && ready.error) fail(ready.error);
     if (ready.installed && ready.signedIn) {
       const status = await chromeStatus(home, process.platform);
@@ -5978,11 +6168,11 @@ async function cmdChromeSetup(home: string, port: number, json: boolean): Promis
     if (!ready.installed && !askedInstall) {
       askedInstall = true;
       await openTab(extensionStoreUrl(process.env));
-      say(`→ In the ${CHROME_FOR_CLIPY_APP_NAME} window, click "Add to Chrome" on the Clipy extension page. Waiting…`);
+      ask(`→ In the ${CHROME_FOR_CLIPY_APP_NAME} window, click "Add to Chrome" on the Clipy extension page. Waiting…`);
     } else if (ready.installed && !ready.signedIn && !askedSignIn) {
       askedSignIn = true;
       await openTab("https://clipy.online/?signin=1&signup_flow=extension");
-      say(`→ Sign in to Clipy in the ${CHROME_FOR_CLIPY_APP_NAME} window. Waiting…`);
+      ask(`→ Sign in to Clipy in the ${CHROME_FOR_CLIPY_APP_NAME} window. Waiting…`);
     }
     if (Date.now() >= deadline) {
       fail(ready.installed ? "timed out waiting for sign-in" : "timed out waiting for the Clipy extension to be installed");
@@ -6202,7 +6392,7 @@ function cmdGuide(json: boolean): void {
         ["--frame", "--caption", "--video", "--for", "--hold", "--width", "--height", "--title", "--description", "--type", "--note", "--wait", "--json"],
       ),
       cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. Auth (web capture only, applied before the first navigation so a logged-in SPA's route guard sees it): --storage-state <playwright storageState JSON path>, --cookie 'name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]' (repeatable), --local-storage 'key=value' (repeatable, target origin only), --init-script <js file run before every page load>, --user-data-dir <dir> (launch from a persistent Chromium user-data ROOT with its whole logged-in identity; web only, mutually exclusive with --storage-state; refused if <dir> is a profile subdir — pass the root — or, in direct mode, a live-locked root via SingletonLock/Socket), --profile-directory <name> (with --user-data-dir: pick a NAMED profile like 'Profile 12' from chrome://version; Playwright can't select a profile in place, so Clipy COPIES it into a temp recording root and launches the copy — loudly disclosed, the real profile is never opened or written, and the copy is deleted after upload; no need to quit Chrome, though it warns if Chrome is running since in-use DBs may copy inconsistently). Auth boundary: --storage-state only seeds what the file contains; for cross-origin auth produce it with `npx playwright open --save-storage=auth.json <login-host>`, or use --user-data-dir + --profile-directory to record your real profile, or --source mac-screen --window Chrome. With --source mac-screen: records the real screen via the Clipy Mac app (--type not yet applied on mac; auth flags rejected — the screen is already logged in); --window '<title|app|id>' records that window's initial screen area and --display <id> records one display (ids from clipy sources). --json prints {id, shareUrl, contextUrl, sizeBytes}", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--storage-state", "--cookie", "--local-storage", "--init-script", "--user-data-dir", "--profile-directory", "--width", "--height", "--wait", "--source", "--window", "--display", "--json"]),
-      cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen|chrome-for-clipy|chrome-extension] [--window w] [--display d] [--expose-cdp] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). With --source mac-screen, --window records that window's initial screen area and --display records one display. --source chrome-extension records ONE TAB through the Clipy extension inside Chrome for Clipy (needs a one-time clipy chrome setup): no daemon, the extension records and uploads; start returns cdpHttpUrl, stop waits for the upload and returns the link; mark/chapter are refused on this source. --source chrome-for-clipy records ONE TAB (tab video + tab audio, no picker or gesture) inside the persistent Chrome for Clipy instance: the instance is started automatically (sign in once via clipy chrome start and the profile stays signed in), the recorded tab opens at --url, its CDP endpoint is always published as cdpUrl/cdpHttpUrl so drivers attach to the very browser being recorded, and stopping the session leaves Chrome for Clipy running; auth-capture flags and --user-data-dir are rejected for this source. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code — the crash-safe wrapper so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). `session run` exports CLIPY_SESSION_FILE to the child so mark/chapter resolve the session from any cwd. --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--expose-cdp", "--storage-state", "--user-data-dir", "--profile-directory", "--cookie", "--local-storage", "--init-script", "--json"]),
+      cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen|chrome-for-clipy|chrome-extension] [--window w] [--display d] [--expose-cdp] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). With --source mac-screen, --window records that window's initial screen area and --display records one display. --source chrome-extension records ONE TAB through the Clipy extension inside Chrome for Clipy (needs a one-time clipy chrome setup): no daemon, the extension records and uploads; start returns cdpHttpUrl and the recorded tab's url (opened in the background, never focused), --name titles the recording, the tab's sound is left out unless --tab-audio (detected speech would replace the marks as the transcript), mark/chapter (plain or --observed/--verdict, not --assert-*) are kept by the CLI and sent at stop as the transcript, stop waits for the upload and returns the link. --source chrome-for-clipy records ONE TAB (tab video + tab audio, no picker or gesture) inside the persistent Chrome for Clipy instance: the instance is started automatically (sign in once via clipy chrome start and the profile stays signed in), the recorded tab opens at --url, its CDP endpoint is always published as cdpUrl/cdpHttpUrl so drivers attach to the very browser being recorded, and stopping the session leaves Chrome for Clipy running; auth-capture flags and --user-data-dir are rejected for this source. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp, plus CLIPY_TARGET_ID/CLIPY_PAGE_WS_URL for the recorded tab with --source chrome-extension), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code. It is the crash-safe wrapper, so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). `session run` exports CLIPY_SESSION_FILE to the child so mark/chapter resolve the session from any cwd. --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--tab-audio", "--expose-cdp", "--storage-state", "--user-data-dir", "--profile-directory", "--cookie", "--local-storage", "--init-script", "--json"]),
       cmdDoc("mark", "clipy mark \"<text>\" [--observed \"<values>\" --verdict pass|fail] [--assert-selector <css> [--assert-text <substr>]] [--assert-url <glob>] [--fail-mode warn|abort] [--at <sec>|--ago <sec>] [--json]", "Drop a live-timestamped note into the active session. A mark carries at most ONE evidence provenance, and the two are labeled + tallied separately so they can never be pooled. DRIVER-ATTESTED (--observed '<values>' --verdict pass|fail, both required together): you drove the browser and report what YOU observed — renders '<text> [≈ ASSERT driver-attested; observed=<values>]' (pass) / '<text> [≈ FAILED driver-attested; observed=<values>]' (fail) — a HEDGE glyph, never ✓/✗, so a skim distinguishes provenance by shape alone and works in EVERY session type including --source mac-screen. Honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it — put real observed values there. Combining --observed/--verdict with --assert-* is a usage error. CLIPY-VERIFIED assertion marks (Clipy-owned page only) make the note evidence Clipy itself checked: --assert-selector checks a CSS selector matches (its trimmed textContent is recorded as 'observed'); --assert-text requires that element's text to contain a substring (needs --assert-selector); --assert-url matches the page URL against a glob (** = any, * = any non-slash, no * = substring). The daemon evaluates against its live page and annotates the mark: pass ⇒ '<text> [assert ✓ verified-by-clipy; <observed>]', fail ⇒ '<text> [ASSERT ✗ verified-by-clipy; expected …; observed …]' — a false claim cannot read as fact. --fail-mode warn (default) records the ✗; --fail-mode abort DISCARDS the whole session on a failed assertion (no upload) and the CLI exits non-zero. If any assertion was attempted, a leading 0ms [verification] note is prepended, reporting the provenances as SEPARATE segments: '[verification] N clipy-verified: P passed, F failed, K unverified · M driver-attested: P passed, F failed' (a segment is omitted when empty; with only clipy-verified marks the legacy 'N assertion(s): …' rendering is byte-identical). --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now (mutually exclusive). Assertions/backdating need a web session (rejected on --source mac-screen). Up to 200 marks per recording.", ["--observed", "--verdict", "--assert-selector", "--assert-text", "--assert-url", "--fail-mode", "--at", "--ago", "--json"]),
       cmdDoc("chapter", "clipy chapter \"<label>\" [--json]", "Mark a BEFORE/AFTER section boundary in the active recording (stored as '=== CHAPTER: <label> ==='). The PR-review shape: demo the base branch, run `clipy chapter \"AFTER — fix applied\"`, swap branches + restart the dev server, demo the fix — one video carrying both states. Works on web + --source mac-screen sessions.", ["--json"]),
       cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API reachability (GET /api/health, with latency), API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), context/proof prerequisites (yt-dlp presence/path/version, ffmpeg + ffprobe presence/version, and whether that ffmpeg has libwebp), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails. Read-only: it never installs anything, so a missing yt-dlp/ffmpeg reports WARN with the install command rather than silently downloading a binary. Run it first whenever an import, proof, or recording fails.", ["--json"]),
@@ -6346,6 +6536,7 @@ async function main(): Promise<void> {
       "marks-only": { type: "boolean", default: false },
       mic: { type: "boolean", default: false },
       "no-system-audio": { type: "boolean", default: false },
+      "tab-audio": { type: "boolean", default: false },
       vtt: { type: "boolean", default: false },
       for: { type: "string" },
       timeout: { type: "string" },
@@ -6796,6 +6987,9 @@ async function main(): Promise<void> {
           );
         }
         if (source !== "mac-screen" && audioFlagsPresent) die(webAudioGuard, 2);
+        if (values["tab-audio"] && source !== "chrome-extension") {
+          die("--tab-audio applies to --source chrome-extension only", 2);
+        }
         const url = (values.url as string | undefined)?.trim() || positionalUrl;
         if (!url && source !== "mac-screen") {
           die("usage: clipy session start --url <http(s) url> [--max <sec>] [--source web|mac-screen|chrome-for-clipy|chrome-extension]", 2);
@@ -6819,6 +7013,7 @@ async function main(): Promise<void> {
           userDataDir: userDataDir(),
           profileDirectory: profileDirectory(),
           audio: audioChoice(),
+          tabAudio: Boolean(values["tab-audio"]),
         };
       };
       if (sub === "start") {

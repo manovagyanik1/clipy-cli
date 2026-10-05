@@ -15,7 +15,7 @@ description: Read and create Clipy screen recordings, turn screenshots or tool-n
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.15.0 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.15.1 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
@@ -297,10 +297,11 @@ WHAT must be verified, and WHETHER the target depends on an existing login.
      (see the Chrome for Clipy section below). It records tab audio without
      a manual capture-picker step; it uses a dedicated browser the
      user signed into once, never their daily one.
-   - **The user asks you to record yourself doing something in the browser,
-     and does not need marks:** \`--source chrome-extension\` (see "Recording
-     through the Clipy extension" below). Same dedicated browser; the Clipy
-     extension records and uploads the tab.
+   - **The user asks you to record yourself doing something in the browser
+     (a walkthrough, an SOP, docs, a verification) while they keep working:**
+     \`--source chrome-extension\` (see "Recording through the Clipy
+     extension" below). Same dedicated browser; the Clipy extension records
+     the tab in the background and uploads it.
 
 Before capture, visibly confirm the resolved target: expected URL, expected
 signed-in/signed-out state, expected account/role when it is safe to display, and
@@ -524,21 +525,27 @@ process while CDP is open. Browser automation setup is opt-in. Install with
 \`clipy setup <agent> --with-browser\` or \`clipy chrome start\`, only when the
 user asked for browser automation.
 
-### Recording through the Clipy extension (no marks)
+### Recording through the Clipy extension
 
     clipy chrome setup --json        # one-time; quick check when already ready
-    clipy session start --source chrome-extension --url <page> --json
-    # drive the tab showing <page> over cdpHttpUrl with Playwright
+    clipy session start --source chrome-extension --url <page> --name "<title>" --json
+    # drive the tab whose CDP target id is the output's targetId (or attach to pageWsUrl)
+    clipy mark "Opened Settings > Billing"   # one mark per meaningful step
     clipy session stop --json        # returns shareUrl + contextUrl
 
-The Clipy extension inside Chrome for Clipy records the tab (video and tab
-audio) with no click, because Chrome for Clipy launches with
+The Clipy extension inside Chrome for Clipy records the tab (picture only;
+add \`--tab-audio\` for its sound, but detected speech then replaces your
+marks as the transcript) with no click, because Chrome for Clipy launches with
 \`--allowlisted-extension-id\`. \`clipy chrome setup\` waits up to 15 minutes
 for the two steps only the user can do in the Chrome for Clipy window: click
 "Add to Chrome" on the extension page it opens, and sign in to Clipy. Relay
-those instructions and never try to do either yourself. \`clipy mark\` and
-\`clipy chapter\` are refused on this source; use \`--source chrome-for-clipy\`
-when you need them. Full agent instructions:
+those instructions and never try to do either yourself. The recorded tab opens
+in the background: never bring it to the front, drive it step by step over CDP,
+and the user keeps working in other tabs or apps meanwhile. These recordings
+are silent, so your marks become the transcript, the summary and the steps an
+SOP or doc is written from: mark each step as you take it. \`--observed\` /
+\`--verdict\` attested marks work; Clipy-evaluated \`--assert-*\` marks do not
+(the extension, not Clipy, owns the page). Full agent instructions:
 https://clipy.online/docs/chrome-for-clipy.md
 
 ### Assert what you claim (two provenances, never pooled)
