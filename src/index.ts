@@ -14,9 +14,9 @@
  */
 
 import { parseArgs } from "node:util";
-import { appendFileSync, closeSync, cpSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { appendFileSync, closeSync, copyFileSync, cpSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -27,6 +27,7 @@ import { pathToFileURL } from "node:url";
 import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { CLIPY_SKILL_MD } from "./skill.js";
+import { attachCdpDiagnostics, type CdpDiagnostics, type DiagnosticsLevel } from "./cdpDiagnostics.js";
 import {
   SETUP_TARGETS,
   detectSetupTarget,
@@ -48,6 +49,8 @@ import {
   startChrome as startChromeForClipy,
   startChromeForClipyCapture,
   markExtensionRecording,
+  ownershipProbeStatus as chromeOwnershipProbeStatus,
+  resolveChromeBinary,
   stopChrome as stopChromeForClipy,
   TAB_CAPTURE_TITLE_MARKER,
 } from "./chromeForClipy.js";
@@ -90,7 +93,24 @@ import {
   describeDisplay,
   type BridgeInfo,
   type BridgeDiagnostics,
+  resolveFromSources,
 } from "./macBridge.js";
+import {
+  defaultDisplay,
+  describeCaps,
+  ffmpegCaps,
+  isWaylandSession,
+  listLinuxSources,
+  orphanedCaptureProcesses,
+  parseDisplaySize,
+  realRunner,
+  startScreenRecorder,
+  startVirtualDisplay,
+  type LinuxSources,
+  type LinuxTarget,
+  type ScreenRecorder,
+  type VirtualDisplay,
+} from "./linuxScreen.js";
 
 // Exit quietly when stdout/stderr close early (e.g. `clipy list | head`).
 for (const stream of [process.stdout, process.stderr]) {
@@ -506,8 +526,9 @@ ${c.bold("RECORD")} ${c.dim("(needs an API key with the \"ingest\" permission)")
                           records the copy — real profile untouched, deleted after
 
 ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session per directory)")}
-  ${c.dim("--source mac-screen on record/session records the REAL screen via the")}
-  ${c.dim("running Clipy Mac app (consent-gated, indicator always visible).")}
+  ${c.dim("--source screen on record/session records the REAL screen: on macOS via the")}
+  ${c.dim("running Clipy Mac app (consent-gated, indicator always visible; mac-screen is")}
+  ${c.dim("the same thing), on Linux with the CLI's own X11 recorder (ffmpeg x11grab).")}
   ${c.dim("On start it prints the resolved surface — recording window: \"<title>\" (id N).")}
   ${c.dim("CONFIRM that matches what you are driving: attested marks prove what YOU saw,")}
   ${c.dim("not what the camera saw. Clipy never fronts a window/tab for you.")}
@@ -516,8 +537,18 @@ ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session
                                     --json gives each entry a "source" {kind,id,title}
                                     matching what session start/record report, so you
                                     can compare pick-vs-camera directly
-    --window "<title|app|id>"       Record that window's current screen area (e.g. --window Chrome)
+    --window "<title|app|id>"       Record that window by itself (e.g. --window Chrome):
+                                    windows on top of it stay out, and it follows moves,
+                                    only when --json says windowCapture "window" (Linux:
+                                    covered parts are black without a compositor).
+                                    "area" (an older Clipy Mac app, or ffmpeg < 5.1)
+                                    records whatever is on top
     --display <id>                  Record a specific display
+    --x-display :N                  Linux: the X display to record (default $DISPLAY)
+    --virtual-display               Linux: start a private X display (--width/--height,
+                                    default 1280x720) and record it. Launch apps there
+                                    with DISPLAY=:N; session run sets it for the command.
+                                    The user's screen, cursor and keyboard are untouched.
     --mic                           Opt IN to microphone capture (default: mic OFF —
                                     an agent recording for you is not the same consent
                                     as you clicking Record, so we never take the room)
@@ -533,6 +564,11 @@ ${c.bold("SESSION")} ${c.dim("(agent works, Clipy records — one active session
                                     Accepts the same auth flags as record
                                     (--storage-state/--cookie/--local-storage/--init-script)
                                     and --json (returns cdpUrl/cdpHttpUrl).
+                                    Browser evidence (console, failed requests,
+                                    GraphQL errors, WebSockets) is attached:
+                                    --diagnostics off|errors|all (default errors);
+                                    --network-detail also keeps headers and bodies
+                                    (cookies/authorization never leave the machine).
                                     --source chrome-for-clipy records ONE TAB (with
                                     tab audio) inside the persistent Chrome for
                                     Clipy instance (started automatically; sign in
@@ -589,7 +625,7 @@ ${c.bold("AGENTS")}
                                     first-run one. Use ${c.bold("setup")} unless you deliberately
                                     want just the skill file
   agents status | uninstall <t>     Show / remove installed skills
-  chrome <setup|start|stop|status|install-app> [--port <n>]
+  chrome <setup|start|stop|status|install-app> [--port <n>] [--foreground]
                                     "Chrome for Clipy": a dedicated, persistent
                                     automation browser with CDP exposed, picker-free
                                     tab capture (retitle a tab with the marker), and
@@ -1399,6 +1435,40 @@ async function doctorPlaywrightCheck(): Promise<DoctorCheck> {
   };
 }
 
+/** Chrome for Clipy (`--source chrome-for-clipy` / `chrome-extension`) needs a
+ *  Chrome binary AND host tools that can prove a CDP listener is ours. Both
+ *  used to fail only at record time, the second as a misleading "not owned".
+ *  Optional for everyone else, so a gap is a warning, never a failure. */
+function doctorChromeCheck(): DoctorCheck {
+  const sources = "--source chrome-for-clipy / chrome-extension";
+  const binary = resolveChromeBinary(process.env, process.platform, homedir());
+  if (!binary) {
+    const override = process.env.CLIPY_CHROME_BINARY?.trim();
+    return {
+      name: "chrome",
+      status: "warn",
+      detail: override
+        ? `CLIPY_CHROME_BINARY points at a missing file (${override}); ${sources} unavailable`
+        : `Google Chrome not found; ${sources} unavailable`,
+      hint: "install Google Chrome, or set CLIPY_CHROME_BINARY to its executable",
+      data: { binary: null },
+    };
+  }
+  const probe = chromeOwnershipProbeStatus();
+  if (!probe.ok) {
+    return {
+      name: "chrome",
+      status: "warn",
+      detail: `found ${binary}, but ${probe.error}; ${sources} cannot start`,
+      hint: process.platform === "win32"
+        ? "Chrome for Clipy needs netstat and Windows PowerShell (Get-CimInstance) from System32"
+        : "Chrome for Clipy needs lsof and ps on PATH",
+      data: { binary, ownershipProbe: false },
+    };
+  }
+  return { name: "chrome", status: "pass", detail: `Chrome for Clipy can run (${binary})`, data: { binary, ownershipProbe: true } };
+}
+
 // --- context prerequisites -------------------------------------------------
 // `clipy context import` needs yt-dlp (YouTube resolution) and ffmpeg/ffprobe
 // (probing + frame extraction), and both fail LATE — after the user has already
@@ -1613,14 +1683,81 @@ function doctorGlyph(status: CheckStatus): string {
   }
 }
 
+/**
+ * `--source screen` on Linux: what this machine can record. Display capture
+ * needs ffmpeg with x11grab; window capture also needs x11-utils (and
+ * FFmpeg 5.1+ to capture by id); a private screen needs Xvfb. Warnings, never
+ * failures: an agent on a box without them still has web and proof paths.
+ */
+function doctorLinuxScreenChecks(): DoctorCheck[] {
+  if (process.platform !== "linux") return [];
+  const caps = ffmpegCaps(realRunner);
+  const has = (cmd: string) => realRunner("sh", ["-c", `command -v ${cmd}`], process.env).status === 0;
+  const data: Json = {
+    ffmpeg: caps.available,
+    x11grab: caps.x11grab,
+    windowIdCapture: caps.windowId,
+    encoder: caps.encoder,
+    display: process.env.DISPLAY ?? null,
+    wayland: isWaylandSession(process.env),
+    xwininfo: has("xwininfo"),
+    xprop: has("xprop"),
+    xvfb: has("Xvfb"),
+    compositor: has("picom") || has("xcompmgr"),
+  };
+  const out: DoctorCheck[] = [];
+  if (!caps.available || !caps.x11grab || !caps.encoder) {
+    out.push({
+      name: "screen",
+      status: "warn",
+      detail: `cannot record the screen: ${describeCaps(caps)}`,
+      hint: "only needed for --source screen; install ffmpeg with x11grab and libx264 (Debian/Ubuntu: sudo apt install ffmpeg)",
+      data,
+    });
+    return out;
+  }
+  const where = process.env.DISPLAY
+    ? isWaylandSession(process.env)
+      ? `Wayland session (the real screen needs the desktop's consent; use --virtual-display or --x-display)`
+      : `X display ${process.env.DISPLAY}`
+    : "no DISPLAY (use --virtual-display or --x-display :N)";
+  out.push({ name: "screen", status: "pass", detail: `${describeCaps(caps)} · ${where}`, data });
+  if (!data.xwininfo || !data.xprop) {
+    out.push({
+      name: "screen windows",
+      status: "warn",
+      detail: "cannot list windows, so --window is unavailable",
+      hint: "install x11-utils (Debian/Ubuntu: sudo apt install x11-utils)",
+    });
+  }
+  if (!data.xvfb) {
+    out.push({
+      name: "virtual display",
+      status: "warn",
+      detail: "Xvfb not found, so --virtual-display is unavailable",
+      hint: "install xvfb (Debian/Ubuntu: sudo apt install xvfb); add picom or xcompmgr so covered windows record in full",
+    });
+  } else if (!data.compositor) {
+    out.push({
+      name: "virtual display",
+      status: "pass",
+      detail: "Xvfb available (no compositor: a covered window records black where it is covered)",
+      hint: "install picom or xcompmgr for full window captures on a virtual display",
+    });
+  }
+  return out;
+}
+
 async function cmdDoctor(ctx: Ctx, json: boolean): Promise<void> {
   const checks: DoctorCheck[] = [
     await doctorApiCheck(ctx),
     await doctorAuthCheck(ctx),
     ...(await doctorBridgeChecks()),
     await doctorPlaywrightCheck(),
+    doctorChromeCheck(),
     await doctorYtDlpCheck(),
     ...(await doctorFfmpegChecks()),
+    ...doctorLinuxScreenChecks(),
     doctorInstallCheck(),
   ];
   const failed = checks.filter((chk) => chk.status === "fail").length;
@@ -2245,6 +2382,8 @@ async function uploadVideoToClipy(
     narration?: Narration;
     recordingKind?: string;
     sourceVersion?: string;
+    /** v2 browser-diagnostics sidecar from a browser Clipy drove (session). */
+    browserDiagnostics?: Record<string, unknown> | null;
     log: (m: string) => void;
   },
 ): Promise<UploadedRecording> {
@@ -2322,6 +2461,22 @@ async function uploadVideoToClipy(
         : {}),
     });
     uploadToken = ""; // completed — nothing to abort below
+    // Browser evidence rides the same sidecar route the extension uses. It is
+    // a bonus on top of a finished upload: a failure here is reported, never
+    // allowed to fail the recording.
+    if (opts.browserDiagnostics) {
+      try {
+        await ingestPostJson(ctx, "/api/videos/raw-upload/cursor", {
+          recordingId,
+          videoPublicId: publicId,
+          browserDiagnostics: opts.browserDiagnostics,
+        });
+        const count = Array.isArray(opts.browserDiagnostics.events) ? opts.browserDiagnostics.events.length : 0;
+        opts.log(`${c.dim(`attached browser evidence (${count} event${count === 1 ? "" : "s"})`)}`);
+      } catch (err) {
+        opts.log(`browser evidence was not attached: ${(err as Error).message}`);
+      }
+    }
   } catch (e) {
     // Best-effort: release the half-uploaded streaming session so it doesn't
     // sit as an orphan (the server also janitors orphans after 8 days).
@@ -3216,9 +3371,21 @@ interface SessionState {
    *  Clipy instance and records one tab via the recorder-page capture engine
    *  (tab video + tab audio, no picker). Everything except the capture engine
    *  (control server, marks, upload) is the web daemon path. */
-  kind?: "web" | "mac" | "chrome-for-clipy" | "chrome-extension";
+  kind?: "web" | "mac" | "chrome-for-clipy" | "chrome-extension" | "linux-screen";
   /** chrome-for-clipy / chrome-extension: the CDP port of Chrome for Clipy. */
   chromePort?: number;
+  /** linux-screen: the X display recorded (":0", or the virtual one once the
+   *  daemon has started it). */
+  xDisplay?: string;
+  /** linux-screen: start a private Xvfb display of this size and record it. */
+  virtualDisplay?: { width: number; height: number };
+  /** linux-screen: Xvfb's pid, so a stale session can be cleaned up. */
+  virtualDisplayPid?: number;
+  /** linux-screen: what to record, resolved by the parent from --window or
+   *  --display (absent for a virtual display: the whole display). */
+  screenTarget?: LinuxTarget;
+  /** linux-screen: the resolved surface, reported like `clipy sources`. */
+  screenSource?: ResolvedSource;
   /** chrome-extension: there is no daemon. The Clipy extension inside Chrome
    *  for Clipy owns the recording; this id routes stop/abort/status to it. */
   extensionRecordingId?: string;
@@ -3237,6 +3404,10 @@ interface SessionState {
   /** Opt-in (via --expose-cdp): only then does the daemon launch a debugging
    *  port. The env kill switch CLIPY_DISABLE_CDP=1 overrides it in the daemon. */
   exposeCdp?: boolean;
+  /** Browser evidence for web/chrome-for-clipy sessions (--diagnostics,
+   *  default errors) and whether to keep headers/bodies (--network-detail). */
+  diagnostics?: DiagnosticsLevel;
+  networkDetail?: boolean;
   /** Auth-capture flags (web sessions). The daemon is a separate process that
    *  re-reads this file, so the RAW specs ride here and it re-parses + applies
    *  them to its context (storage-state as a file path, cookies + init scripts).
@@ -3284,6 +3455,9 @@ interface SessionState {
   error?: string;
   /** On upload failure the capture is preserved here instead of deleted. */
   keptVideoPath?: string;
+  /** The finished capture, recorded once the upload starts, so a daemon that
+   *  dies mid-upload does not take the only copy down with its work directory. */
+  videoPath?: string;
   result?: SessionResult;
   marksPath: string;
   controlPath: string;
@@ -3333,6 +3507,39 @@ function writeSessionState(file: string, state: SessionState): void {
   renameSync(tmp, file);
 }
 
+/**
+ * Move a file, copying when the destination is on another filesystem
+ * (rename cannot cross devices, and /tmp is often a tmpfs). The source is
+ * removed only once the copy is complete.
+ */
+function moveFile(from: string, to: string): void {
+  // A kept capture is the user's screen: owner-only before it moves, so a
+  // cross-device copy is never readable by others either.
+  try {
+    chmodSync(from, 0o600);
+  } catch {
+    // best-effort on platforms without POSIX modes
+  }
+  try {
+    renameSync(from, to);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
+    try {
+      copyFileSync(from, to);
+    } catch (copyErr) {
+      // A partial copy would only take the space the caller needs next.
+      rmSync(to, { force: true });
+      throw copyErr;
+    }
+    rmSync(from, { force: true });
+  }
+  try {
+    chmodSync(to, 0o600);
+  } catch {
+    // best-effort on platforms without POSIX modes
+  }
+}
+
 function pidAlive(pid: number): boolean {
   // kill(0, 0) signals our own process group and "succeeds".
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -3351,7 +3558,77 @@ function sessionIsActive(state: SessionState): boolean {
   );
 }
 
-function cleanupSessionFiles(state: SessionState, file: string): void {
+/**
+ * Clears a finished or stale session. Returns where a capture that was never
+ * uploaded was kept, so the caller can tell the user.
+ */
+function cleanupSessionFiles(
+  state: SessionState,
+  file: string,
+  opts: { daemonKilled?: boolean } = {},
+): string | undefined {
+  // A daemon killed outright cannot stop the ffmpeg recording its segments,
+  // which would keep encoding the screen into a directory nobody reads. The
+  // caller that just SIGKILLed it says so: the pid can outlive the signal
+  // until it is reaped.
+  const daemonGone = opts.daemonKilled || !pidAlive(state.pid);
+  let keptPath = state.keptVideoPath;
+  if (state.kind === "linux-screen" && state.tmpDir && daemonGone) {
+    for (const pid of orphanedCaptureProcesses(state.tmpDir)) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        // already gone
+      }
+    }
+    // A daemon that died while uploading, or whose recovery move failed,
+    // leaves the finished video in tmpDir as the only copy: move it out
+    // before the directory goes, or keep it where it is.
+    let kept = state.keptVideoPath;
+    if (!kept && state.videoPath && (state.state === "uploading" || state.state === "failed")) {
+      kept = state.videoPath;
+    }
+    if (kept && !existsSync(kept)) kept = undefined;
+    if (kept && isInside(kept, state.tmpDir)) {
+      const out = join(sessionDir(), `kept-${randomUUID()}${extname(kept) || ".mp4"}`);
+      try {
+        moveFile(kept, out);
+        kept = out;
+      } catch {
+        // stays in tmpDir, which is then kept below
+      }
+    }
+    keptPath = kept;
+    if (kept && isInside(kept, state.tmpDir)) {
+      // Only the segments it was joined from can go.
+      try {
+        for (const name of readdirSync(state.tmpDir)) {
+          if (name.startsWith("segment-")) rmSync(join(state.tmpDir, name), { force: true });
+        }
+      } catch {
+        // best-effort
+      }
+    } else {
+      // Its segments are unreachable once the state file goes. A failure that
+      // left no finished video discards them too, as the daemon itself does.
+      try {
+        rmSync(state.tmpDir, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+    }
+  }
+  // Nor can it stop the Xvfb it started. Only stop a pid that is still that
+  // Xvfb, so a reused pid is never touched.
+  if (state.virtualDisplayPid && daemonGone) {
+    try {
+      if (readFileSync(`/proc/${state.virtualDisplayPid}/comm`, "utf8").trim() === "Xvfb") {
+        process.kill(state.virtualDisplayPid, "SIGTERM");
+      }
+    } catch {
+      // already gone, or not Linux
+    }
+  }
   for (const p of [state.marksPath, state.controlPath, file]) {
     try {
       rmSync(p, { force: true });
@@ -3359,6 +3636,24 @@ function cleanupSessionFiles(state: SessionState, file: string): void {
       // best-effort
     }
   }
+  return keptPath;
+}
+
+/** A stale session's capture that was never uploaded is the user's to keep. */
+function reportKeptCapture(path: string | undefined): void {
+  if (path) process.stderr.write(`${c.yellow("!")} a session capture that was never uploaded was kept at: ${path}\n`);
+}
+
+/** A mark or chapter that found the daemon dead: say so, and where its capture went. */
+function dieSessionCleared(keptPath: string | undefined, json: boolean): never {
+  const message = "the session daemon is no longer running (crashed?) — session cleared. Start a new one.";
+  if (json) printJson({ state: "cleared", error: message, ...(keptPath ? { keptVideoPath: keptPath } : {}) });
+  die(keptPath ? `${message}\nThe capture was kept at: ${keptPath}` : message);
+}
+
+function isInside(path: string, dir: string): boolean {
+  const rel = relative(resolve(dir), resolve(path));
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
 // --- Assertion-backed marks -------------------------------------------------
@@ -3552,6 +3847,407 @@ async function evaluateAssertion(page: PwPage, assert: MarkAssert): Promise<Asse
   return { passed, observed: observed.join("; "), expected: expected.join("; ") };
 }
 
+// --- Real-screen source naming ----------------------------------------------
+
+/**
+ * `--source screen` is the real screen on every OS: the Clipy Mac app on
+ * macOS and the CLI's own X11 recorder on Linux. `mac-screen` stays the
+ * explicit Mac spelling. Windows has no screen path for agents yet, so it is
+ * refused with the paths that do work there, never silently downgraded.
+ */
+const WINDOWS_SCREEN_REFUSAL =
+  "--source screen isn't available on Windows yet: the Clipy Windows app has no agent bridge. " +
+  "Record a browser tab with --source chrome-for-clipy, a web page headlessly with --url, " +
+  "or hand your own tool's screenshots or video to `clipy proof`.";
+
+function normalizeScreenSource(raw: string, platform: NodeJS.Platform = process.platform): string {
+  if (raw === "screen") {
+    if (platform === "darwin") return "mac-screen";
+    if (platform === "linux") return "linux-screen";
+    die(WINDOWS_SCREEN_REFUSAL, 2);
+  }
+  if (raw === "linux-screen" && platform !== "linux") die("--source linux-screen records an X11 display and only runs on Linux", 2);
+  // CLIPY_BRIDGE_FILE points the bridge client at an explicit app (tests and
+  // remote setups use it off macOS), so only refuse when nothing could answer.
+  if (raw === "mac-screen" && platform === "linux" && !process.env.CLIPY_BRIDGE_FILE?.trim()) {
+    die("--source mac-screen records through the Clipy Mac app; on Linux use --source screen", 2);
+  }
+  return raw;
+}
+
+/** Both real-screen transports: they take --window/--display, not auth flags. */
+function isScreenSource(source: string): boolean {
+  return source === "mac-screen" || source === "linux-screen";
+}
+
+// --- Linux screen flows (--source screen on Linux): the CLI records ---------
+
+interface LinuxCapturePlan {
+  /** The X display to record; absent until a virtual display is started. */
+  xDisplay?: string;
+  virtualDisplay?: { width: number; height: number };
+  target?: LinuxTarget;
+  /** For a window target: its own pixels by id ("window"), or, on an ffmpeg
+   *  older than 5.1, the screen area it covers ("area"). */
+  windowCapture?: "window" | "area";
+  resolved: ResolvedSource;
+  label: string;
+}
+
+/**
+ * Turn the flags into what to record. Fails before anything starts when the
+ * request cannot be met (no display, Wayland, missing tools, no match), so an
+ * agent never gets a session that looks live but captures nothing.
+ */
+function planLinuxCapture(opts: {
+  window?: string;
+  display?: string;
+  xDisplay?: string;
+  virtualDisplay?: boolean;
+  width: number;
+  height: number;
+}): LinuxCapturePlan {
+  const caps = ffmpegCaps(realRunner);
+  if (!caps.available) die("recording the screen on Linux needs ffmpeg (Debian/Ubuntu: `sudo apt install ffmpeg`)");
+  if (!caps.x11grab) die("this ffmpeg was built without x11grab, so it cannot record an X display");
+  if (!caps.encoder) die("this ffmpeg has neither libx264 nor libvpx, so it cannot encode a recording");
+
+  if (opts.virtualDisplay) {
+    if (opts.window || opts.display || opts.xDisplay) {
+      die(
+        "--virtual-display records a new, empty display as a whole; it has no windows to pick yet. " +
+          "To record one window, start your own display, launch the app, then use --x-display :N --window <id>.",
+        2,
+      );
+    }
+    let size: { width: number; height: number };
+    try {
+      size = parseDisplaySize(`${opts.width}x${opts.height}`);
+    } catch (e) {
+      die((e as Error).message, 2);
+    }
+    return {
+      virtualDisplay: size,
+      resolved: { kind: "display", title: `virtual display ${size.width}×${size.height}` },
+      label: `a new ${size.width}×${size.height} virtual display`,
+    };
+  }
+
+  const xDisplay = opts.xDisplay?.trim() || process.env.DISPLAY;
+  if (!xDisplay) {
+    die(
+      "no X display to record: run on a desktop session, name one with --x-display :N, " +
+        "or pass --virtual-display to give the agent a screen of its own",
+    );
+  }
+  if (!opts.xDisplay && isWaylandSession(process.env)) {
+    die(
+      "this is a Wayland session, which only lets an app read the screen through the desktop's own consent dialog. " +
+        "Record a private screen with --virtual-display, name an X display with --x-display :N, or log in to an X11 session.",
+    );
+  }
+  const sources = listLinuxSources(xDisplay);
+  if (sources.displays.length === 0) die(`could not read X display ${xDisplay} (is it running, and is DISPLAY/XAUTHORITY right?)`);
+  if (opts.window && sources.windowsUnavailable) die(sources.windowsUnavailable);
+  if (!opts.window && !opts.display) {
+    const display = defaultDisplay(sources);
+    return {
+      xDisplay,
+      target: { kind: "display", display },
+      resolved: describeDisplay(display),
+      label: display.name,
+    };
+  }
+  let picked: ReturnType<typeof resolveFromSources>;
+  try {
+    picked = resolveFromSources(sources, { window: opts.window, display: opts.display });
+  } catch (e) {
+    die((e as Error).message);
+  }
+  if (picked.source.type === "window") {
+    const id = picked.source.id;
+    const window = sources.windows.find((w) => w.id === id)!;
+    if (!caps.windowId) {
+      process.stderr.write(
+        `${c.yellow("note:")} this ffmpeg cannot capture a window by id (needs FFmpeg 5.1+), so Clipy records the window's area of the screen and moves it with the window; windows on top of it will show.\n`,
+      );
+    }
+    return {
+      xDisplay,
+      target: { kind: "window", window },
+      windowCapture: caps.windowId ? "window" : "area",
+      resolved: picked.resolved,
+      label: picked.label,
+    };
+  }
+  const id = picked.source.type === "display" ? picked.source.id : -1;
+  const display = sources.displays.find((d) => d.id === id)!;
+  return { xDisplay, target: { kind: "display", display }, resolved: picked.resolved, label: picked.label };
+}
+
+/**
+ * Stops a session daemon that did not reach `recording` in time, and clears
+ * what it started (ffmpeg, Xvfb, its segments), so nothing is recorded or
+ * uploaded behind a start that was reported as failed.
+ */
+async function abandonStartingDaemon(file: string, pid: number): Promise<void> {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // already gone
+  }
+  const grace = Date.now() + 3000;
+  while (pidAlive(pid) && Date.now() < grace) await new Promise((r) => setTimeout(r, 150));
+  if (pidAlive(pid)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+  const s = readSessionState(file);
+  if (s) cleanupSessionFiles(s, file, { daemonKilled: true });
+}
+
+async function cmdSessionStartLinux(
+  ctx: Ctx,
+  opts: {
+    name?: string;
+    description?: string;
+    recordingKind?: string;
+    maxSec: number;
+    width: number;
+    height: number;
+    json: boolean;
+    window?: string;
+    display?: string;
+    xDisplay?: string;
+    virtualDisplay?: boolean;
+  },
+): Promise<void> {
+  const file = sessionFilePath(process.cwd());
+  const existing = readSessionState(file);
+  if (existing && sessionIsActive(existing)) {
+    die(
+      `a recording session is already active in this workspace (pid ${existing.pid}, started for ${existing.url}).\n` +
+        `Finish it with \`clipy session stop\` or discard it with \`clipy session abort\`.`,
+    );
+  }
+  if (existing) reportKeptCapture(cleanupSessionFiles(existing, file));
+  const key = requireKey(ctx);
+  const plan = planLinuxCapture(opts);
+
+  const maxSec = Math.min(Math.max(1, opts.maxSec), SESSION_HARD_CAP_SEC);
+  const id = randomUUID();
+  const dir = sessionDir();
+  mkdirSync(dir, { recursive: true });
+  const state: SessionState = {
+    version: 1,
+    kind: "linux-screen",
+    xDisplay: plan.xDisplay,
+    virtualDisplay: plan.virtualDisplay,
+    screenTarget: plan.target,
+    screenSource: plan.resolved,
+    pid: 0,
+    cwd: process.cwd(),
+    url: `screen:${plan.label}`,
+    name: opts.name,
+    description: opts.description,
+    recordingKind: opts.recordingKind,
+    maxSec,
+    width: opts.width,
+    height: opts.height,
+    state: "starting",
+    marksPath: join(dir, `marks-${id}.jsonl`),
+    controlPath: join(dir, `control-${id}.json`),
+    logPath: join(dir, `daemon-${id}.log`),
+    tmpDir: join(tmpdir(), `clipy-session-${id}`),
+  };
+  const logFd = openSync(state.logPath, "a");
+  const child = spawn(process.execPath, [process.argv[1], "__session-daemon", file], {
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+    env: { ...process.env, CLIPY_API_KEY: key, CLIPY_API_URL: ctx.apiUrl },
+  });
+  closeSync(logFd);
+  if (!child.pid) die("failed to spawn the session daemon");
+  state.pid = child.pid;
+  writeSessionState(file, state);
+  child.unref();
+
+  // Recording only counts once frames are landing (the recorder checks), so
+  // the agent's next command is inside a live capture.
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    const s = readSessionState(file);
+    if (s?.state === "recording") break;
+    if (s?.state === "failed" || Date.now() >= deadline || (s && !pidAlive(s.pid))) {
+      // A daemon still starting would otherwise go on to record, and upload,
+      // after this command has reported failure; a failed one leaves its work
+      // directory and state behind.
+      await abandonStartingDaemon(file, child.pid);
+      if (s?.state === "failed") die(`session failed to start: ${s.error ?? "unknown error"} (log: ${state.logPath})`);
+      die(`session daemon did not start in time (log: ${state.logPath})`);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  const started = readSessionState(file);
+  const xDisplay = started?.xDisplay ?? plan.xDisplay;
+  if (opts.json) {
+    printJson({
+      state: "recording",
+      captureMode: "linux-screen",
+      xDisplay,
+      virtualDisplay: Boolean(plan.virtualDisplay),
+      maxSec,
+      sessionFile: file,
+      source: captureSourceResult(plan.resolved),
+      ...(plan.windowCapture ? { windowCapture: plan.windowCapture } : {}),
+    });
+    return;
+  }
+  process.stdout.write(`${c.green("✓")} recording ${plan.label} on ${xDisplay} (max ${maxSec}s)\n`);
+  if (plan.virtualDisplay) {
+    process.stdout.write(
+      `${c.bold("virtual display:")} ${xDisplay}: only what you launch there is recorded, and it never touches the user's screen.\n` +
+        `${c.dim("launch apps on it with:")} DISPLAY=${xDisplay} <command>   ${c.dim("(or use clipy session run, which sets DISPLAY)")}\n`,
+    );
+  } else if (plan.target?.kind === "window") {
+    process.stdout.write(
+      plan.windowCapture === "area"
+        ? `${c.bold("recording window:")} "${plan.resolved.title}" (id ${plan.resolved.id}), as the screen area it covers, so keep it in front: anything on top of it is recorded.\n`
+        : `${c.bold("recording window:")} "${plan.resolved.title}" (id ${plan.resolved.id}), its own pixels. Under a compositor it records in full even when covered; without one, keep it unobscured, because covered parts record black.\n`,
+    );
+  }
+  process.stdout.write(
+    `${c.dim("while it runs:")} clipy mark "what just happened"\n` +
+      `${c.dim("when finished:")} clipy session stop   ${c.dim("· discard:")} clipy session abort\n`,
+  );
+}
+
+/** One-shot `clipy record --source screen --for N` on Linux. */
+async function cmdRecordLinux(
+  ctx: Ctx,
+  opts: {
+    forSec: number;
+    name?: string;
+    description?: string;
+    recordingKind?: string;
+    window?: string;
+    display?: string;
+    xDisplay?: string;
+    virtualDisplay?: boolean;
+    width: number;
+    height: number;
+    notes: ParsedNote[];
+    json: boolean;
+  },
+): Promise<{
+  publicId: string;
+  shareUrl: string;
+  contextUrl: string;
+  sizeBytes: number;
+  source: CaptureSourceResult;
+  windowCapture?: "window" | "area";
+}> {
+  requireKey(ctx);
+  if (maxPassRef(opts.notes) > 0) {
+    die('pass-scoped --note values need --viewports; a screen recording is one take, so use "12: text"', 2);
+  }
+  const plan = planLinuxCapture(opts);
+  const vd = plan.virtualDisplay ? await startVirtualDisplay(plan.virtualDisplay) : null;
+  const xDisplay = vd?.display ?? plan.xDisplay!;
+  const auto: NarrationNote[] = [];
+  const workDir = join(tmpdir(), `clipy-record-${randomUUID()}`);
+  // Set when an upload fails: the finished video is kept for the user to
+  // retry, and only the intermediate segments are removed.
+  let keptVideo: string | null = null;
+  try {
+    if (vd) {
+      process.stderr.write(
+        `${c.bold("virtual display:")} ${xDisplay}: launch apps there with DISPLAY=${xDisplay}; it closes when the recording ends.\n`,
+      );
+    }
+    const recorder = await startScreenRecorder({
+      xDisplay,
+      target: plan.target ?? { kind: "display", display: defaultDisplay(listLinuxSources(xDisplay)) },
+      tmpDir: workDir,
+      caps: ffmpegCaps(realRunner),
+    });
+    if (!opts.json) process.stderr.write(`${c.dim(`recording ${plan.label} for ${opts.forSec}s…`)}\n`);
+    const until = recorder.startedAt + opts.forSec * 1000;
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 400));
+      let note: string | null = null;
+      try {
+        note = recorder.tick();
+      } catch (e) {
+        auto.push({ startMs: Date.now() - recorder.startedAt, text: `[auto] screen capture stopped: ${(e as Error).message}` });
+        break;
+      }
+      if (note) auto.push({ startMs: Date.now() - recorder.startedAt, text: note });
+      if (recorder.ended()) break;
+    }
+    const videoPath = await recorder.finish();
+    const notes: NarrationNote[] = [
+      ...opts.notes.map((n) => ({ startMs: n.startMs ?? 0, text: n.text })),
+      ...auto,
+    ].sort((a, b) => a.startMs - b.startMs);
+    let uploaded: Awaited<ReturnType<typeof uploadVideoToClipy>>;
+    try {
+      uploaded = await uploadVideoToClipy(ctx, {
+        videoPath,
+        name: opts.name,
+        description: opts.description,
+        recordingKind: opts.recordingKind,
+        narration: notes.length ? { notes } : undefined,
+        log: (m) => {
+          if (!opts.json) process.stderr.write(`${m}\n`);
+        },
+      });
+    } catch (e) {
+      keptVideo = videoPath;
+      throw new Error(`${(e as Error).message}\nThe recording was kept at: ${videoPath}`);
+    }
+    return {
+      publicId: uploaded.publicId,
+      shareUrl: uploaded.shareUrl,
+      contextUrl: uploaded.contextUrl,
+      sizeBytes: uploaded.sizeBytes,
+      source: captureSourceResult(plan.resolved),
+      windowCapture: plan.windowCapture,
+    };
+  } finally {
+    await vd?.stop();
+    if (keptVideo) {
+      for (const name of readdirSync(workDir)) {
+        if (name.startsWith("segment-")) rmSync(join(workDir, name), { force: true });
+      }
+    } else {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }
+}
+
+/** `clipy sources` on Linux: the same shape the Mac app reports. */
+function printLinuxSources(sources: LinuxSources, json: boolean): void {
+  if (json) {
+    printJson({
+      xDisplay: sources.xDisplay,
+      displays: sources.displays.map((d) => ({ ...d, source: describeDisplay(d) })),
+      windows: sources.windows.map((w) => ({ ...w, source: describeWindow(w) })),
+      ...(sources.windowsUnavailable ? { windowsUnavailable: sources.windowsUnavailable } : {}),
+    });
+    return;
+  }
+  process.stdout.write(`${c.bold(`displays on ${sources.xDisplay}`)}\n`);
+  for (const d of sources.displays) process.stdout.write(`  ${d.id}  ${d.name}  ${d.width}×${d.height}\n`);
+  process.stdout.write(`${c.bold("windows")}\n`);
+  if (sources.windowsUnavailable) process.stdout.write(`  ${c.dim(sources.windowsUnavailable)}\n`);
+  for (const w of sources.windows) process.stdout.write(`  ${w.id}  ${windowLabel(w)}  ${w.width}×${w.height}\n`);
+  if (!sources.windowsUnavailable && sources.windows.length === 0) process.stdout.write(`  ${c.dim("(none)")}\n`);
+}
+
 // --- Mac bridge flows (--source mac-screen): the desktop app records -------
 
 /** Resolves --window/--display to a bridge capture source (null = app default,
@@ -3627,6 +4323,54 @@ function echoedAudio(startResult: Record<string, unknown>): AudioChoice | null {
  * below this, the app silently ignores the field and records with ITS defaults.
  */
 const AUDIO_PROTOCOL_VERSION = 2;
+
+/**
+ * From bridge protocol v3 the app says how it records a window: `window` (its
+ * own pixels, the macOS default) or `area` (the fixed screen rectangle, which
+ * records anything on top of it). An older app always records the area, so an
+ * agent must not be told the window is isolated.
+ */
+const WINDOW_CAPTURE_PROTOCOL_VERSION = 3;
+
+function warnWindowNotIsolated(emit: (m: string) => void, reason: string): void {
+  emit(
+    c.yellow(
+      `warning: ${reason}, so it records the window's screen area: windows on top of it, and ` +
+        `anything else that enters the rectangle, are recorded too. Update the Clipy app ` +
+        `(https://clipy.online/download) to record a window by itself.`,
+    ),
+  );
+}
+
+/** Before `start`: an app too old to say how it records a window records the area. */
+function warnWindowCaptureUnknown(
+  protocolVersion: number,
+  target: { resolved: ResolvedSource } | null,
+  emit: (m: string) => void,
+): boolean {
+  if (target?.resolved.kind !== "window" || protocolVersion >= WINDOW_CAPTURE_PROTOCOL_VERSION) return false;
+  warnWindowNotIsolated(emit, `this Clipy app speaks bridge protocol v${protocolVersion} (needs v${WINDOW_CAPTURE_PROTOCOL_VERSION})`);
+  return true;
+}
+
+/** After `start`: what the app confirmed, and "area" when it confirmed nothing. */
+function appliedWindowCapture(
+  target: { resolved: ResolvedSource } | null,
+  startResult: Record<string, unknown>,
+  emit: (m: string) => void,
+  warned: boolean,
+): "window" | "area" | undefined {
+  if (target?.resolved.kind !== "window") return undefined;
+  const echoed = startResult.windowCapture;
+  if (echoed === "window") return "window";
+  if (!warned) {
+    warnWindowNotIsolated(
+      emit,
+      echoed === "area" ? "the Clipy app is set to record a window with its screen area" : "the Clipy app did not confirm how it records the window",
+    );
+  }
+  return "area";
+}
 
 /**
  * Warn BEFORE `start` when the running app can't honour the audio request.
@@ -3706,6 +4450,7 @@ async function cmdRecordMac(opts: {
   shareUrl: string;
   source: CaptureSourceResult;
   audio: AudioChoice;
+  windowCapture?: "window" | "area";
 }> {
   // A real-screen capture is one continuous take — there are no viewport passes
   // to anchor pass-scoped notes against.
@@ -3749,6 +4494,7 @@ async function cmdRecordMac(opts: {
   const audioUncontrollable = warnAudioUncontrollable(info.protocolVersion, opts.audio, (m) =>
     process.stderr.write(`${m}\n`),
   );
+  const windowWarned = warnWindowCaptureUnknown(info.protocolVersion, target, (m) => process.stderr.write(`${m}\n`));
   const notes = resolveNarrationNotes(opts.notes, [0]);
   const startResult = await bridgeRequest(info, "start", {
     // Explicit, never implicit: an absent field would fall through to the app's
@@ -3769,6 +4515,7 @@ async function cmdRecordMac(opts: {
     log,
     audioUncontrollable,
   );
+  const windowCapture = appliedWindowCapture(target, startResult, (m) => process.stderr.write(`${m}\n`), windowWarned);
   log(`${c.dim(`recording for ${opts.forSec}s…`)}`);
   await new Promise((r) => setTimeout(r, opts.forSec * 1000));
   log(`${c.dim("stopping + uploading…")}`);
@@ -3782,6 +4529,7 @@ async function cmdRecordMac(opts: {
     // the surface — folding it in would muddy `source` and break its shape
     // parity with `clipy sources --json` entries.
     audio: appliedAudio,
+    ...(windowCapture ? { windowCapture } : {}),
   };
 }
 
@@ -3980,7 +4728,7 @@ async function cmdSessionStartExtension(opts: {
         `Finish it with \`clipy session stop\` or discard it with \`clipy session abort\`.`,
     );
   }
-  if (existing) cleanupSessionFiles(existing, file);
+  if (existing) reportKeptCapture(cleanupSessionFiles(existing, file));
 
   const maxSec = Math.min(Math.max(1, opts.maxSec), SESSION_HARD_CAP_SEC);
   let started: Awaited<ReturnType<typeof startExtensionRecording>>;
@@ -4078,10 +4826,16 @@ async function cmdSessionStart(
     width: number;
     height: number;
     json: boolean;
-    source: "web" | "mac-screen" | "chrome-for-clipy" | "chrome-extension";
+    source: "web" | "mac-screen" | "linux-screen" | "chrome-for-clipy" | "chrome-extension";
     window?: string;
     display?: string;
+    /** linux-screen: the X display to record (default $DISPLAY). */
+    xDisplay?: string;
+    /** linux-screen: start a private display and record it. */
+    virtualDisplay?: boolean;
     exposeCdp?: boolean;
+    diagnostics: DiagnosticsLevel;
+    networkDetail: boolean;
     auth: AuthCapture;
     userDataDir?: string;
     profileDirectory?: string;
@@ -4092,6 +4846,10 @@ async function cmdSessionStart(
 ): Promise<void> {
   if (opts.source === "chrome-extension") {
     await cmdSessionStartExtension(opts);
+    return;
+  }
+  if (opts.source === "linux-screen") {
+    await cmdSessionStartLinux(ctx, opts);
     return;
   }
   if (opts.source === "mac-screen") {
@@ -4114,6 +4872,9 @@ async function cmdSessionStart(
     const audioUncontrollable = warnAudioUncontrollable(info.protocolVersion, opts.audio, (m) =>
       process.stderr.write(`${m}\n`),
     );
+    const windowWarned = warnWindowCaptureUnknown(info.protocolVersion, target, (m) =>
+      process.stderr.write(`${m}\n`),
+    );
     const startResult = await bridgeRequest(info, "start", {
       // Explicit, never implicit — see reportAudio(): an absent field falls
       // through to the app's interactive defaults (mic ON) on older builds.
@@ -4131,6 +4892,12 @@ async function cmdSessionStart(
       (m) => process.stderr.write(`${m}\n`),
       audioUncontrollable,
     );
+    const windowCapture = appliedWindowCapture(
+      target,
+      startResult,
+      (m) => process.stderr.write(`${m}\n`),
+      windowWarned,
+    );
     if (opts.json) {
       printJson({
         state: "recording",
@@ -4142,6 +4909,7 @@ async function cmdSessionStart(
         target: target?.label,
         source: captureSourceResult(target?.resolved),
         audio: appliedAudio,
+        ...(windowCapture ? { windowCapture } : {}),
       });
       return;
     }
@@ -4198,7 +4966,7 @@ async function cmdSessionStart(
         `Finish it with \`clipy session stop\` or discard it with \`clipy session abort\`.`,
     );
   }
-  if (existing) cleanupSessionFiles(existing, file); // stale (daemon died) — clear
+  if (existing) reportKeptCapture(cleanupSessionFiles(existing, file)); // stale (daemon died) — clear
 
   // --profile-directory ⇒ copy the named profile into a scratch root HERE, in the
   // parent, so the user sees the loud disclosure (the daemon's stdout goes to a
@@ -4231,6 +4999,8 @@ async function cmdSessionStart(
     width: opts.width,
     height: opts.height,
     exposeCdp: opts.exposeCdp,
+    diagnostics: opts.diagnostics,
+    networkDetail: opts.networkDetail,
     storageStatePath: opts.auth.storageStatePath,
     initScriptPath: opts.auth.initScriptPath,
     cookieSpecs: opts.auth.cookieSpecs.length ? opts.auth.cookieSpecs : undefined,
@@ -4400,6 +5170,12 @@ async function cmdMark(text: string, json: boolean, opts: MarkOpts): Promise<voi
     );
     return;
   }
+  if (state.kind === "linux-screen" && hasAssert) {
+    die(
+      "Clipy-evaluated assertions need a Clipy-owned page; use --observed/--verdict to attach evidence you collected yourself",
+      2,
+    );
+  }
   if (state.kind === "mac") {
     // The Mac app records the real screen — there is no Clipy-owned page to probe,
     // so Clipy-EVALUATED assertions can't run here. Driver-attested marks CAN: the
@@ -4441,10 +5217,7 @@ async function cmdMark(text: string, json: boolean, opts: MarkOpts): Promise<voi
     );
     return;
   }
-  if (!pidAlive(state.pid)) {
-    cleanupSessionFiles(state, file);
-    die("the session daemon is no longer running (crashed?) — session cleared. Start a new one.");
-  }
+  if (!pidAlive(state.pid)) dieSessionCleared(cleanupSessionFiles(state, file), json);
   if (state.state !== "recording" || !state.recordStartEpochMs) {
     die(`session is ${state.state} — marks can only be added while recording`);
   }
@@ -4598,10 +5371,7 @@ async function cmdChapter(label: string, json: boolean): Promise<void> {
     );
     return;
   }
-  if (!pidAlive(state.pid)) {
-    cleanupSessionFiles(state, file);
-    die("the session daemon is no longer running (crashed?) — session cleared. Start a new one.");
-  }
+  if (!pidAlive(state.pid)) dieSessionCleared(cleanupSessionFiles(state, file), json);
   if (state.state !== "recording" || !state.recordStartEpochMs) {
     die(`session is ${state.state} — chapters can only be added while recording`);
   }
@@ -4716,11 +5486,12 @@ async function cmdSessionStop(json: boolean): Promise<void> {
       cleanupSessionFiles(state, file);
       return;
     }
-    cleanupSessionFiles(state, file);
+    const keptPath = cleanupSessionFiles(state, file);
+    const kept = keptPath ? `\nThe capture was kept at: ${keptPath}` : "";
     die(
       state.state === "failed"
-        ? `session failed: ${state.error ?? "unknown"} (log: ${state.logPath})`
-        : "the session daemon is no longer running (crashed?) — session cleared.",
+        ? `session failed: ${state.error ?? "unknown"} (log: ${state.logPath})${kept}`
+        : `the session daemon is no longer running (crashed?) — session cleared.${kept}`,
     );
   }
   writeFileSync(state.controlPath, JSON.stringify({ action: "stop" }));
@@ -4735,8 +5506,8 @@ async function cmdSessionStop(json: boolean): Promise<void> {
       return;
     }
     if (s?.state === "failed") {
-      const kept = s.keptVideoPath ? `\nThe capture was kept at: ${s.keptVideoPath}` : "";
-      cleanupSessionFiles(s, file);
+      const keptPath = cleanupSessionFiles(s, file);
+      const kept = keptPath ? `\nThe capture was kept at: ${keptPath}` : "";
       die(`session upload failed: ${s.error ?? "unknown"}${kept}`);
     }
     if (s?.state === "aborted") {
@@ -4744,8 +5515,9 @@ async function cmdSessionStop(json: boolean): Promise<void> {
       die("session was aborted");
     }
     if (s && !pidAlive(s.pid)) {
-      cleanupSessionFiles(s, file);
-      die(`the session daemon died mid-stop (log: ${state.logPath})`);
+      const keptPath = cleanupSessionFiles(s, file);
+      const kept = keptPath ? `\nThe capture was kept at: ${keptPath}` : "";
+      die(`the session daemon died mid-stop (log: ${state.logPath})${kept}`);
     }
     if (Date.now() >= deadline) {
       die(`timed out waiting for the session to finish (log: ${state.logPath})`);
@@ -4791,11 +5563,14 @@ async function cmdSessionAbort(json: boolean): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    if (failure && (await chromeStatus(homedir(), process.platform)).running) {
-      // Chrome for Clipy is up, so the recording may still be running: keep
-      // the session so a retry (or stop) can still reach it.
-      if (json) printJson({ state: "recording", error: failure });
-      else process.stderr.write(`${c.yellow("!")} could not reach the extension to cancel (${failure}); the session is kept, retry \`clipy session abort\`\n`);
+    const chrome = failure ? await chromeStatus(homedir(), process.platform) : null;
+    if (failure && chrome && (chrome.running || chrome.error)) {
+      // Chrome for Clipy is up (or its state cannot be verified), so the
+      // recording may still be running: keep the session so a retry (or stop)
+      // can still reach it.
+      const reason = chrome.running ? failure : `${failure}; ${chrome.error}`;
+      if (json) printJson({ state: "recording", error: reason });
+      else process.stderr.write(`${c.yellow("!")} could not reach the extension to cancel (${reason}); the session is kept, retry \`clipy session abort\`\n`);
       process.exitCode = 1;
       return;
     }
@@ -4818,9 +5593,11 @@ async function cmdSessionAbort(json: boolean): Promise<void> {
     return;
   }
   if (!pidAlive(state.pid)) {
-    cleanupSessionFiles(state, file);
-    if (!json) process.stdout.write(`${c.green("✓")} stale session cleared (daemon was not running)\n`);
-    else printJson({ state: "cleared" });
+    const keptPath = cleanupSessionFiles(state, file);
+    if (!json) {
+      process.stdout.write(`${c.green("✓")} stale session cleared (daemon was not running)\n`);
+      reportKeptCapture(keptPath);
+    } else printJson(keptPath ? { state: "cleared", keptVideoPath: keptPath } : { state: "cleared" });
     return;
   }
   writeFileSync(state.controlPath, JSON.stringify({ action: "abort" }));
@@ -4874,12 +5651,14 @@ async function cmdSessionAbort(json: boolean): Promise<void> {
       }
     }
   }
-  if (final) cleanupSessionFiles(final, file);
+  const keptPath = final ? cleanupSessionFiles(final, file, { daemonKilled: wedged }) : undefined;
+  if (!json) reportKeptCapture(keptPath);
+  const kept = keptPath ? { keptVideoPath: keptPath } : {};
   if (wedged) {
     // Exit non-zero (and truthfully) — the daemon had to be force-killed, so we
     // can't promise a clean discard. Use process.exitCode (not process.exit) so
     // a caller like `session run` can still override with the child's code.
-    if (json) printJson({ state: "killed", pid: final?.pid ?? null });
+    if (json) printJson({ state: "killed", pid: final?.pid ?? null, ...kept });
     else
       process.stderr.write(
         `${c.yellow("!")} the session daemon ignored abort for 30s and was force-killed (pid ${final?.pid}); nothing was uploaded\n`,
@@ -4887,7 +5666,7 @@ async function cmdSessionAbort(json: boolean): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  if (json) printJson({ state: "aborted" });
+  if (json) printJson({ state: "aborted", ...kept });
   else process.stdout.write(`${c.green("✓")} session aborted — nothing was uploaded\n`);
 }
 
@@ -5027,6 +5806,9 @@ async function cmdSessionRun(
   const started = readSessionState(file);
   const cdpHttpUrl = started?.cdpHttpUrl;
   const targetId = started?.extensionTargetId;
+  // A Linux screen session: the driver's apps belong on the recorded display
+  // (essential for a virtual one, which nothing else knows about).
+  const xDisplay = started?.kind === "linux-screen" ? started.xDisplay : undefined;
 
   const [cmd, ...args] = childArgv;
   process.stderr.write(`${c.dim(`running: ${childArgv.join(" ")}`)}\n`);
@@ -5040,6 +5822,7 @@ async function cmdSessionRun(
       CLIPY_SESSION: "1",
       CLIPY_SESSION_FILE: file,
       ...(cdpHttpUrl ? { CLIPY_CDP_URL: cdpHttpUrl } : {}),
+      ...(xDisplay ? { DISPLAY: xDisplay, CLIPY_X_DISPLAY: xDisplay } : {}),
       // chrome-extension: the exact recorded tab, since other tabs in the
       // persistent profile can share its url.
       ...(targetId && started?.chromePort
@@ -5154,6 +5937,7 @@ async function runSessionDaemon(file: string): Promise<void> {
 
   const autoMarks: NarrationNote[] = [];
   let recordStart = 0;
+  let browserEvidence: CdpDiagnostics | null = null;
   const autoMark = (text: string) => {
     if (autoMarks.length >= 50 || recordStart === 0) return;
     autoMarks.push({ startMs: Math.max(0, Date.now() - recordStart), text });
@@ -5191,7 +5975,8 @@ async function runSessionDaemon(file: string): Promise<void> {
   // A failed --fail-mode=abort assertion sets this; the main loop discards.
   let controlSignal: "abort" | null = null;
 
-  mkdirSync(state.tmpDir, { recursive: true });
+  // Owner-only: it holds the user's screen (or page) as it is recorded.
+  mkdirSync(state.tmpDir, { recursive: true, mode: 0o700 });
   let browser: PwBrowser | null = null;
   // Persistent (--user-data-dir) contexts have no separate browser, so track the
   // context too for the finally cleanup (an exception before stop must not leak
@@ -5199,9 +5984,12 @@ async function runSessionDaemon(file: string): Promise<void> {
   let ctxToClose: PwContext | null = null;
   let controlServer: ReturnType<typeof createHttpServer> | null = null;
   let discardCapture: (() => Promise<void>) | null = null;
+  // --source screen on Linux: the CLI's own X11 recorder, and the private
+  // display it may have started. There is no page in this mode.
+  let screenRecorder: ScreenRecorder | null = null;
+  let virtualDisplay: VirtualDisplay | null = null;
   try {
-    const chromium = await loadChromium();
-    let page: PwPage;
+    let page: PwPage | null = null;
     let cdpUrl: string | undefined;
     let cdpHttpUrl: string | undefined;
     // Mode-specific teardown, so the shared stop/abort paths below don't care
@@ -5213,7 +6001,42 @@ async function runSessionDaemon(file: string): Promise<void> {
     let wantCdp = false;
     let bindingContext: PwContext | null = null;
 
-    if (state.kind === "chrome-for-clipy") {
+    if (state.kind === "linux-screen") {
+      if (state.virtualDisplay) {
+        virtualDisplay = await startVirtualDisplay(state.virtualDisplay);
+        log(`virtual display ${virtualDisplay.display} started (Xvfb pid ${virtualDisplay.pid})`);
+        save({ xDisplay: virtualDisplay.display, virtualDisplayPid: virtualDisplay.pid });
+      }
+      const xDisplay = state.xDisplay;
+      if (!xDisplay) throw new Error("no X display to record");
+      // A new virtual display has nothing on it yet, so its target is the
+      // whole display; a real one was resolved by the parent.
+      const target: LinuxTarget =
+        state.screenTarget ?? { kind: "display", display: defaultDisplay(listLinuxSources(xDisplay)) };
+      const recorder = await startScreenRecorder({
+        xDisplay,
+        target,
+        tmpDir: state.tmpDir,
+        caps: ffmpegCaps(realRunner),
+        log,
+      });
+      screenRecorder = recorder;
+      const vd = virtualDisplay;
+      finishCapture = async () => {
+        try {
+          return await recorder.finish();
+        } finally {
+          await vd?.stop();
+          virtualDisplay = null;
+        }
+      };
+      discardCapture = async () => {
+        await recorder.discard().catch(() => {});
+        await vd?.stop();
+        virtualDisplay = null;
+      };
+    } else if (state.kind === "chrome-for-clipy") {
+      const chromium = await loadChromium();
       const port = state.chromePort ?? DEFAULT_CDP_PORT;
       log(`attaching to Chrome for Clipy on port ${port} for ${state.url}`);
       const cap = await startChromeForClipyCapture(
@@ -5226,6 +6049,17 @@ async function runSessionDaemon(file: string): Promise<void> {
           tmpDir: state.tmpDir,
           targetUrl: state.url,
           log,
+          // Attached before the first load, so its console, requests and
+          // environment are kept (they land at t=0).
+          onTargetPage: async (target) => {
+            browserEvidence = attachCdpDiagnostics(target as never, {
+              level: state.diagnostics ?? "errors",
+              networkDetail: !!state.networkDetail,
+              recordStart: () => recordStart,
+            });
+            // Bounded: evidence must never hold up the recording.
+            await Promise.race([browserEvidence.ready, new Promise((r) => setTimeout(r, 3_000))]);
+          },
         },
       );
       // For a CDP-connected browser, close() disconnects and leaves Chrome for
@@ -5250,6 +6084,7 @@ async function runSessionDaemon(file: string): Promise<void> {
         browser = null;
       };
     } else {
+      const chromium = await loadChromium();
       log(`launching chromium for ${state.url}`);
       // CDP is OPT-IN (--expose-cdp) and the env kill switch wins over the flag:
       // no debugging port is opened unless the user asked AND CLIPY_DISABLE_CDP
@@ -5304,9 +6139,10 @@ async function runSessionDaemon(file: string): Promise<void> {
           log(`CDP endpoint not reachable on port ${cdpPort} — browser drive unavailable`);
         }
       }
+      const recordedPage = page;
       finishCapture = async () => {
-        const video = page.video();
-        await page.close();
+        const video = recordedPage.video();
+        await recordedPage.close();
         await context.close();
         if (!video) throw new Error("browser did not produce a video (recordVideo unavailable)");
         const videoPath = await video.path();
@@ -5317,21 +6153,37 @@ async function runSessionDaemon(file: string): Promise<void> {
         return videoPath;
       };
       discardCapture = async () => {
-        await page.close().catch(() => {});
+        await recordedPage.close().catch(() => {});
         await context.close().catch(() => {});
       };
     }
 
+    // Browser evidence (console, requests, sockets) in the same v2 sidecar the
+    // extension uploads, read from the browser rather than injected into the
+    // page. Default: errors and failed requests; --network-detail adds
+    // headers and bodies.
+    // A screen capture has no page to read evidence from.
+    if (page) {
+      browserEvidence ??= attachCdpDiagnostics(page as never, {
+        level: state.diagnostics ?? "errors",
+        networkDetail: !!state.networkDetail,
+        recordStart: () => recordStart,
+      });
+      // The first navigation comes later; EventSource listening must be in
+      // place before it. Bounded so evidence never holds up the recording.
+      await Promise.race([browserEvidence.ready, new Promise((r) => setTimeout(r, 3_000))]);
+    }
+
     // Auto-marks: instrumentation ground truth alongside the agent's intent
     // marks. Type-tagged with [auto] so the transcript distinguishes them.
-    page.on("framenavigated", ((frame: PwFrame) => {
+    page?.on("framenavigated", ((frame: PwFrame) => {
       try {
         if (frame.parentFrame() === null) autoMark(`[auto] navigated to ${frame.url()}`);
       } catch {
         // never let instrumentation kill the recording
       }
     }) as never);
-    page.on("console", ((msg: PwConsoleMessage) => {
+    page?.on("console", ((msg: PwConsoleMessage) => {
       try {
         if (msg.type() === "error") {
           autoMark(`[auto] console error: ${msg.text().slice(0, 200)}`);
@@ -5374,6 +6226,11 @@ async function runSessionDaemon(file: string): Promise<void> {
         assertOut = { passed, observed: m.attest.observed, attested: true };
         assertOutcome = { kind: "driver", passed, expected: "", observed: m.attest.observed };
       } else if (m.assert && typeof m.assert === "object") {
+        if (!page) {
+          throw new Error(
+            "Clipy-evaluated assertions need a Clipy-owned page; use --observed/--verdict to attach evidence you collected yourself",
+          );
+        }
         // evaluateAssertion throws if the page is unresponsive — the HTTP path
         // turns that into a 5xx (the CLI then records a ⚠ UNVERIFIED file mark),
         // and the in-page path rejects to the driver.
@@ -5423,7 +6280,7 @@ async function runSessionDaemon(file: string): Promise<void> {
     // The bindings are exposed under *Impl names and re-declared with explicit
     // arity below, so an agent probing window.__clipyMark.length sees 2 (not the
     // 0 an exposeBinding wrapper reports).
-    if (wantCdp && bindingContext) {
+    if (wantCdp && bindingContext && page) {
       const bindings = page;
       await bindings
         .exposeBinding("__clipyMarkImpl", async (source, ...args) => {
@@ -5472,7 +6329,7 @@ async function runSessionDaemon(file: string): Promise<void> {
         })
         .catch((e: Error) => log(`in-page binding wrappers failed: ${e.message}`));
       if (state.kind === "chrome-for-clipy") {
-        await page.evaluate(() => {
+        await bindings.evaluate(() => {
           const w = globalThis as unknown as {
             __clipyMark: (text: string, opts?: unknown) => unknown;
             __clipyMarkImpl: (text: string, opts?: unknown) => unknown;
@@ -5599,7 +6456,9 @@ async function runSessionDaemon(file: string): Promise<void> {
       controlPort = 0;
     }
 
-    recordStart = Date.now();
+    // A screen take's video starts when its ffmpeg did, a little before the
+    // recorder reported frames; stamping marks from there keeps them in sync.
+    recordStart = screenRecorder?.startedAt ?? Date.now();
     save({
       state: "recording",
       recordStartEpochMs: recordStart,
@@ -5610,7 +6469,7 @@ async function runSessionDaemon(file: string): Promise<void> {
     // chrome-for-clipy already navigated the target before capture started (the
     // marker-title selection requires a loaded page); re-navigating here would
     // just reload it on camera.
-    if (state.kind !== "chrome-for-clipy") {
+    if (page && state.kind !== "chrome-for-clipy") {
       try {
         await page.goto(state.url, { waitUntil: "load", timeout: 30_000 });
       } catch {
@@ -5621,7 +6480,29 @@ async function runSessionDaemon(file: string): Promise<void> {
     // Main loop: poll the control file; enforce the max-duration rail.
     let stopReason: "stop" | "abort" | "max" = "stop";
     for (;;) {
-      await page.waitForTimeout(400);
+      if (page) await page.waitForTimeout(400);
+      else await new Promise((r) => setTimeout(r, 400));
+      if (screenRecorder) {
+        // Resizes become segments, a closed window ends the take, and a
+        // capture that keeps failing stops it: what was recorded uploads with
+        // a note saying why, rather than the session running on with nothing
+        // being captured.
+        let note: string | null = null;
+        try {
+          note = screenRecorder.tick();
+        } catch (e) {
+          autoMark(`[auto] screen capture stopped: ${(e as Error).message}`);
+          log(`screen capture failed: ${(e as Error).message}`);
+          stopReason = "stop";
+          break;
+        }
+        if (note) autoMark(note);
+        if (screenRecorder.ended()) {
+          log("recorded window is gone; stopping and uploading");
+          stopReason = "stop";
+          break;
+        }
+      }
       // A failed --fail-mode=abort assertion (set by the control handler) discards
       // the session just like a control-file abort.
       if (controlSignal === "abort") {
@@ -5666,6 +6547,15 @@ async function runSessionDaemon(file: string): Promise<void> {
       log(`max duration ${state.maxSec}s reached — auto-stopping and uploading`);
     }
     save({ state: "stopping" });
+    // Last response bodies are read from the live page; let them land first.
+    await Promise.race([browserEvidence?.settle(), new Promise((r) => setTimeout(r, 3_000))]).catch(() => {});
+    // Snapshot before the page is torn down; uploaded after the recording.
+    let diagnosticsSidecar: Record<string, unknown> | null = null;
+    try {
+      diagnosticsSidecar = (browserEvidence?.sidecar() ?? null) as Record<string, unknown> | null;
+    } catch (e) {
+      log(`browser diagnostics unavailable: ${(e as Error).message}`);
+    }
     const videoPath = await finishCapture();
     discardCapture = null;
 
@@ -5776,22 +6666,27 @@ async function runSessionDaemon(file: string): Promise<void> {
       notes = notes.slice(0, 200);
     }
 
-    save({ state: "uploading" });
+    save({ state: "uploading", videoPath });
     const uploaded = await uploadVideoToClipy(ctx, {
       videoPath,
       name: state.name,
       description: state.description,
       recordingKind: state.recordingKind,
       narration: notes.length ? { notes } : undefined,
+      browserDiagnostics: diagnosticsSidecar,
       log: (m) => log(m.replace(/\x1b\[[0-9;]*m/g, "")),
     }).catch((e: Error) => {
       // Keep the capture — losing the bytes is worse than leaving a file.
-      const kept = join(sessionDir(), `kept-${randomUUID()}.webm`);
+      const kept = join(sessionDir(), `kept-${randomUUID()}${extname(videoPath) || ".webm"}`);
       try {
-        renameSync(videoPath, kept);
+        moveFile(videoPath, kept);
         save({ keptVideoPath: kept });
+        // The capture is safe outside it, so nothing in tmpDir is needed.
+        rmSync(state.tmpDir, { recursive: true, force: true });
       } catch {
-        // original path stays in tmpDir (cleanup below is skipped on throw)
+        // The move failed (a full disk, say): report the capture where it is.
+        // Cleanup keeps a kept path that is still inside tmpDir.
+        save({ keptVideoPath: videoPath });
       }
       throw e;
     });
@@ -5814,6 +6709,9 @@ async function runSessionDaemon(file: string): Promise<void> {
     // leaking Chromium. Both closes are no-ops if the object is already closed.
     if (ctxToClose) await ctxToClose.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
+    // A failure before the recorder took ownership of the display (or after
+    // it) must not leave Xvfb running.
+    if (virtualDisplay) await (virtualDisplay as VirtualDisplay).stop().catch(() => {});
     // Remove the copied-profile scratch root (a SIGKILL strands it → the 24h
     // sweep at the next record/session start catches that).
     if (state.profileScratchRoot) {
@@ -6046,11 +6944,11 @@ async function cmdSetup(
 // chrome: the dedicated "Chrome for Clipy" automation browser.
 // ---------------------------------------------------------------------------
 
-async function cmdChrome(sub: string | undefined, json: boolean, portRaw: string | undefined): Promise<void> {
+async function cmdChrome(sub: string | undefined, json: boolean, portRaw: string | undefined, foreground = false): Promise<void> {
   const home = homedir();
   const port = portRaw ? Number(portRaw) : DEFAULT_CDP_PORT;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    die("usage: clipy chrome <setup|start|stop|status|install-app> [--port <n>] [--json]", 2);
+    die("usage: clipy chrome <setup|start|stop|status|install-app> [--port <n>] [--foreground] [--json]", 2);
   }
 
   switch (sub) {
@@ -6058,7 +6956,7 @@ async function cmdChrome(sub: string | undefined, json: boolean, portRaw: string
       await cmdChromeSetup(home, port, json);
       return;
     case "start": {
-      const result = await startChromeForClipy(home, process.env, process.platform, port);
+      const result = await startChromeForClipy(home, process.env, process.platform, port, { foreground });
       if (!result.ok) {
         if (json) printJson({ ok: false, error: result.error });
         else process.stderr.write(`error: ${result.error}\n`);
@@ -6078,7 +6976,7 @@ async function cmdChrome(sub: string | undefined, json: boolean, portRaw: string
       return;
     }
     case "stop": {
-      const result = stopChromeForClipy(home);
+      const result = await stopChromeForClipy(home);
       if (json) printJson({ ok: result.ok, stopped: result.stopped, ...(result.error ? { error: result.error } : {}) });
       else if (!result.ok) process.stderr.write(`error: ${result.error}\n`);
       else process.stdout.write(result.stopped ? "stopped\n" : "not running\n");
@@ -6094,12 +6992,21 @@ async function cmdChrome(sub: string | undefined, json: boolean, portRaw: string
       process.stdout.write(
         status.running
           ? `running (pid ${status.pid}), CDP ${status.cdpUrl} (${status.cdpReady ? (status.browser ?? "ready") : "not answering"})\n`
-          : "not running\n",
+          : status.error ? `unknown: ${status.error}\n` : "not running\n",
       );
-      process.stdout.write(`profile: ${status.profileDir}\napp installed: ${status.appInstalled ? "yes" : "no"}\n`);
+      process.stdout.write(`profile: ${status.profileDir}\n`);
+      if (process.platform === "darwin") process.stdout.write(`app installed: ${status.appInstalled ? "yes" : "no"}\n`);
       return;
     }
     case "install-app": {
+      // The launcher bundle is a macOS Finder/Spotlight identity. Elsewhere
+      // there is nothing to install, and `clipy chrome start` is the launcher.
+      if (process.platform !== "darwin") {
+        const note = "the launcher app is macOS-only; nothing to install here. Use `clipy chrome start`";
+        if (json) printJson({ ok: true, skipped: true, reason: note });
+        else process.stdout.write(`${note}\n`);
+        return;
+      }
       const result = installChromeForClipyApp(home, process.env, process.platform, port);
       if (!result.ok) {
         if (json) printJson({ ok: false, error: result.error });
@@ -6115,7 +7022,7 @@ async function cmdChrome(sub: string | undefined, json: boolean, portRaw: string
       return;
     }
     default:
-      die("usage: clipy chrome <setup|start|stop|status|install-app> [--port <n>] [--json]", 2);
+      die("usage: clipy chrome <setup|start|stop|status|install-app> [--port <n>] [--foreground] [--json]", 2);
   }
 }
 
@@ -6146,7 +7053,8 @@ async function cmdChromeSetup(home: string, port: number, json: boolean): Promis
     const app = installChromeForClipyApp(home, process.env, process.platform, port);
     if (app.ok) say(`updated the "${CHROME_FOR_CLIPY_APP_NAME}" launcher at ${app.path}`);
   }
-  const started = await startChromeForClipy(home, process.env, process.platform, port);
+  // The person installs the extension and signs in here, so the window comes forward.
+  const started = await startChromeForClipy(home, process.env, process.platform, port, { foreground: true });
   if (!started.ok) fail(started.error);
   const openTab = (url: string) => openTabForPerson(port, url).catch(() => {});
   const deadline = Date.now() + CHROME_SETUP_TIMEOUT_MS;
@@ -6276,7 +7184,7 @@ async function cmdAgents(
 // contract changes.
 // ---------------------------------------------------------------------------
 
-const GUIDE_SCHEMA_VERSION = 16;
+const GUIDE_SCHEMA_VERSION = 17;
 
 /** The stable machine-readable failure taxonomy carried in `--json` error
  *  envelopes. Codes are the contract; messages are not. Published through the
@@ -6391,13 +7299,13 @@ function cmdGuide(json: boolean): void {
         "Tool-neutral proof upload. --frame may be repeated to turn screenshots produced by any browser, computer-use, simulator, or test tool into one high-quality silent MP4; --caption must be omitted or repeated exactly once per frame and becomes timestamped agent narration. --hold controls each frame's duration (default 3s, 0.25–30; total cap 300s); --width/--height must be even integers from 320–3840 and default to 1280x720. Frame inputs are bounded to 50 MiB each and 250 MiB total. Screenshot stitching needs ffmpeg but does not need Playwright or a browser integration. --video uploads an already-recorded WebM or MP4 without re-encoding and needs no recording dependency. Exactly one source mode is required. --for <recording id|url> links the uploaded proof back to the recording it verifies (validated before upload; the link appears in the owner-only receipt on that recording's watch page and needs a key with both ingest and recordings:read). --json prints {id, shareUrl, contextUrl, sizeBytes, source, verifies?}; proof-video source reports only the detected container and never discloses the local path. Captions and notes are driver-attested narration, not Clipy-verified assertions.",
         ["--frame", "--caption", "--video", "--for", "--hold", "--width", "--height", "--title", "--description", "--type", "--note", "--wait", "--json"],
       ),
-      cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. Auth (web capture only, applied before the first navigation so a logged-in SPA's route guard sees it): --storage-state <playwright storageState JSON path>, --cookie 'name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]' (repeatable), --local-storage 'key=value' (repeatable, target origin only), --init-script <js file run before every page load>, --user-data-dir <dir> (launch from a persistent Chromium user-data ROOT with its whole logged-in identity; web only, mutually exclusive with --storage-state; refused if <dir> is a profile subdir — pass the root — or, in direct mode, a live-locked root via SingletonLock/Socket), --profile-directory <name> (with --user-data-dir: pick a NAMED profile like 'Profile 12' from chrome://version; Playwright can't select a profile in place, so Clipy COPIES it into a temp recording root and launches the copy — loudly disclosed, the real profile is never opened or written, and the copy is deleted after upload; no need to quit Chrome, though it warns if Chrome is running since in-use DBs may copy inconsistently). Auth boundary: --storage-state only seeds what the file contains; for cross-origin auth produce it with `npx playwright open --save-storage=auth.json <login-host>`, or use --user-data-dir + --profile-directory to record your real profile, or --source mac-screen --window Chrome. With --source mac-screen: records the real screen via the Clipy Mac app (--type not yet applied on mac; auth flags rejected — the screen is already logged in); --window '<title|app|id>' records that window's initial screen area and --display <id> records one display (ids from clipy sources). --json prints {id, shareUrl, contextUrl, sizeBytes}", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--storage-state", "--cookie", "--local-storage", "--init-script", "--user-data-dir", "--profile-directory", "--width", "--height", "--wait", "--source", "--window", "--display", "--json"]),
-      cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|mac-screen|chrome-for-clipy|chrome-extension] [--window w] [--display d] [--expose-cdp] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). With --source mac-screen, --window records that window's initial screen area and --display records one display. --source chrome-extension records ONE TAB through the Clipy extension inside Chrome for Clipy (needs a one-time clipy chrome setup): no daemon, the extension records and uploads; start returns cdpHttpUrl and the recorded tab's url (opened in the background, never focused), --name titles the recording, the tab's sound is left out unless --tab-audio (detected speech would replace the marks as the transcript), mark/chapter (plain or --observed/--verdict, not --assert-*) are kept by the CLI and sent at stop as the transcript, stop waits for the upload and returns the link. --source chrome-for-clipy records ONE TAB (tab video + tab audio, no picker or gesture) inside the persistent Chrome for Clipy instance: the instance is started automatically (sign in once via clipy chrome start and the profile stays signed in), the recorded tab opens at --url, its CDP endpoint is always published as cdpUrl/cdpHttpUrl so drivers attach to the very browser being recorded, and stopping the session leaves Chrome for Clipy running; auth-capture flags and --user-data-dir are rejected for this source. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp, plus CLIPY_TARGET_ID/CLIPY_PAGE_WS_URL for the recorded tab with --source chrome-extension), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code. It is the crash-safe wrapper, so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). `session run` exports CLIPY_SESSION_FILE to the child so mark/chapter resolve the session from any cwd. --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--tab-audio", "--expose-cdp", "--storage-state", "--user-data-dir", "--profile-directory", "--cookie", "--local-storage", "--init-script", "--json"]),
+      cmdDoc("record", "clipy record --url <url> [--for sec] [--viewports list] [--title t] [--type kind] [--note '12: text']… [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--wait] [--json]", "Headless one-shot capture of a web app; notes become the transcript. Notes are absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text', anchored to a --viewports pass's real start; a malformed pass note is rejected). --type declares the recording kind (bug_report|feature_request|product_demo|walkthrough_tutorial|feedback_review|discussion_talk|other, plus aliases bug/feature/demo/walkthrough/feedback/discussion) so the AI summary reads it correctly. Auth (web capture only, applied before the first navigation so a logged-in SPA's route guard sees it): --storage-state <playwright storageState JSON path>, --cookie 'name=value[; Domain=d; Path=p; Secure; HttpOnly; SameSite=Lax]' (repeatable), --local-storage 'key=value' (repeatable, target origin only), --init-script <js file run before every page load>, --user-data-dir <dir> (launch from a persistent Chromium user-data ROOT with its whole logged-in identity; web only, mutually exclusive with --storage-state; refused if <dir> is a profile subdir — pass the root — or, in direct mode, a live-locked root via SingletonLock/Socket), --profile-directory <name> (with --user-data-dir: pick a NAMED profile like 'Profile 12' from chrome://version; Playwright can't select a profile in place, so Clipy COPIES it into a temp recording root and launches the copy — loudly disclosed, the real profile is never opened or written, and the copy is deleted after upload; no need to quit Chrome, though it warns if Chrome is running since in-use DBs may copy inconsistently). Auth boundary: --storage-state only seeds what the file contains; for cross-origin auth produce it with `npx playwright open --save-storage=auth.json <login-host>`, or use --user-data-dir + --profile-directory to record your real profile, or --source mac-screen --window Chrome. With --source screen (or mac-screen on macOS): records the real screen, via the Clipy Mac app on macOS (--type not yet applied on mac) and with the CLI's own X11 recorder on Linux (silent; needs ffmpeg with x11grab). Auth flags are rejected, since the screen is already logged in; --window '<title|app|id>' records that window by itself (windows on top of it stay out, and it follows the window if it moves, only when --json reports windowCapture \"window\"; \"area\", from a Clipy Mac app older than bridge protocol v3 or on ffmpeg older than 5.1, records whatever is on top, and on Linux covered parts are black without a compositor) and --display <id> records one display (ids from clipy sources). Linux only: --x-display :N picks the X display (default $DISPLAY) and --virtual-display records a private X display sized by --width/--height. --json prints {id, shareUrl, contextUrl, sizeBytes}", ["--for", "--viewports", "--title", "--description", "--type", "--note", "--storage-state", "--cookie", "--local-storage", "--init-script", "--user-data-dir", "--profile-directory", "--width", "--height", "--wait", "--source", "--window", "--display", "--x-display", "--virtual-display", "--json"]),
+      cmdDoc("session", "clipy session <start|run|stop|abort|status> [--url <url>] [--max sec] [--type kind] [--source web|screen|chrome-for-clipy|chrome-extension] [--window w] [--display d] [--x-display :N] [--virtual-display] [--expose-cdp] [--diagnostics off|errors|all] [--network-detail] [--storage-state f] [--cookie 'n=v']… [--local-storage 'k=v']… [--init-script f] [--json]", "Background recording session; auto-stops + uploads at --max (default 600s, cap 1800s). --type sets the recording kind (see record). Web and chrome-for-clipy sessions attach browser evidence read from the browser itself (console output, uncaught errors, failed requests including GraphQL errors, WebSocket activity, environment) as the recording's browser diagnostics: --diagnostics errors (default) keeps warnings/errors and failures, all keeps every message and request, off keeps none; --network-detail also keeps request/response headers and text bodies (cookie and authorization headers never leave the machine; the server redacts the rest by field name and value pattern). With --source screen (mac-screen on macOS), --window records that window by itself (windows on top of it stay out only when --json reports windowCapture \"window\"; \"area\", from a Clipy Mac app older than bridge protocol v3 or on ffmpeg older than 5.1, records whatever is on top, and on Linux covered parts are black without a compositor) and --display records one display; on Linux --x-display :N picks the X display and --virtual-display records a private X display whose name is returned as xDisplay (session run exports it to the command as DISPLAY). --source chrome-extension records ONE TAB through the Clipy extension inside Chrome for Clipy (needs a one-time clipy chrome setup): no daemon, the extension records and uploads; start returns cdpHttpUrl and the recorded tab's url (opened in the background, never focused), --name titles the recording, the tab's sound is left out unless --tab-audio (detected speech would replace the marks as the transcript), mark/chapter (plain or --observed/--verdict, not --assert-*) are kept by the CLI and sent at stop as the transcript, stop waits for the upload and returns the link. --source chrome-for-clipy records ONE TAB (tab video + tab audio, no picker or gesture) inside the persistent Chrome for Clipy instance: the instance is started automatically (sign in once via clipy chrome start and the profile stays signed in), the recorded tab opens at --url, its CDP endpoint is always published as cdpUrl/cdpHttpUrl so drivers attach to the very browser being recorded, and stopping the session leaves Chrome for Clipy running; auth-capture flags and --user-data-dir are rejected for this source. --expose-cdp (web sessions) opens a CDP endpoint (cdpUrl/cdpHttpUrl in the state file + session start/status output) so your own tools can drive the page while it records; OFF by default (any local process could attach), and CLIPY_DISABLE_CDP=1 forces it off. `session run [start flags] -- <command…>` starts a session, runs the command with inherited stdio (env CLIPY_SESSION=1, plus CLIPY_CDP_URL when --expose-cdp, plus CLIPY_TARGET_ID/CLIPY_PAGE_WS_URL for the recorded tab with --source chrome-extension), then GUARANTEES cleanup: exit 0 uploads, any non-zero exit or signal discards (session abort) and propagates the child's code. It is the crash-safe wrapper, so a dead driver never records dead air. Accepts the same auth flags as record (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script; web only, rejected on --source mac-screen). `session run` exports CLIPY_SESSION_FILE to the child so mark/chapter resolve the session from any cwd. --json is supported on start/stop/status (start returns cdpUrl/cdpHttpUrl)", ["run", "--url", "--max", "--type", "--source", "--window", "--display", "--x-display", "--virtual-display", "--tab-audio", "--expose-cdp", "--diagnostics", "--network-detail", "--storage-state", "--user-data-dir", "--profile-directory", "--cookie", "--local-storage", "--init-script", "--json"]),
       cmdDoc("mark", "clipy mark \"<text>\" [--observed \"<values>\" --verdict pass|fail] [--assert-selector <css> [--assert-text <substr>]] [--assert-url <glob>] [--fail-mode warn|abort] [--at <sec>|--ago <sec>] [--json]", "Drop a live-timestamped note into the active session. A mark carries at most ONE evidence provenance, and the two are labeled + tallied separately so they can never be pooled. DRIVER-ATTESTED (--observed '<values>' --verdict pass|fail, both required together): you drove the browser and report what YOU observed — renders '<text> [≈ ASSERT driver-attested; observed=<values>]' (pass) / '<text> [≈ FAILED driver-attested; observed=<values>]' (fail) — a HEDGE glyph, never ✓/✗, so a skim distinguishes provenance by shape alone and works in EVERY session type including --source mac-screen. Honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it — put real observed values there. Combining --observed/--verdict with --assert-* is a usage error. CLIPY-VERIFIED assertion marks (Clipy-owned page only) make the note evidence Clipy itself checked: --assert-selector checks a CSS selector matches (its trimmed textContent is recorded as 'observed'); --assert-text requires that element's text to contain a substring (needs --assert-selector); --assert-url matches the page URL against a glob (** = any, * = any non-slash, no * = substring). The daemon evaluates against its live page and annotates the mark: pass ⇒ '<text> [assert ✓ verified-by-clipy; <observed>]', fail ⇒ '<text> [ASSERT ✗ verified-by-clipy; expected …; observed …]' — a false claim cannot read as fact. --fail-mode warn (default) records the ✗; --fail-mode abort DISCARDS the whole session on a failed assertion (no upload) and the CLI exits non-zero. If any assertion was attempted, a leading 0ms [verification] note is prepended, reporting the provenances as SEPARATE segments: '[verification] N clipy-verified: P passed, F failed, K unverified · M driver-attested: P passed, F failed' (a segment is omitted when empty; with only clipy-verified marks the legacy 'N assertion(s): …' rendering is byte-identical). --at <sec> stamps at an absolute recording time; --ago <sec> stamps N seconds before now (mutually exclusive). Assertions/backdating need a web session (rejected on --source mac-screen). Up to 200 marks per recording.", ["--observed", "--verdict", "--assert-selector", "--assert-text", "--assert-url", "--fail-mode", "--at", "--ago", "--json"]),
       cmdDoc("chapter", "clipy chapter \"<label>\" [--json]", "Mark a BEFORE/AFTER section boundary in the active recording (stored as '=== CHAPTER: <label> ==='). The PR-review shape: demo the base branch, run `clipy chapter \"AFTER — fix applied\"`, swap branches + restart the dev server, demo the fix — one video carrying both states. Works on web + --source mac-screen sessions.", ["--json"]),
       cmdDoc("doctor", "clipy doctor [--json]", "One-shot health check: API reachability (GET /api/health, with latency), API key + whoami round-trip, Mac agent bridge (exists/parses/pid/appVersion>=" + MIN_BRIDGE_APP_VERSION + "), Playwright resolvability (and the resolved path/node_modules dir), context/proof prerequisites (yt-dlp presence/path/version, ffmpeg + ffprobe presence/version, and whether that ffmpeg has libwebp), and install mode (npx/global/local) — each a pass/warn/fail with a fix hint; exits non-zero if any check fails. Read-only: it never installs anything, so a missing yt-dlp/ffmpeg reports WARN with the install command rather than silently downloading a binary. Run it first whenever an import, proof, or recording fails.", ["--json"]),
       cmdDoc("playwright-path", "clipy playwright-path [--json]", "Print the node_modules directory of the Playwright this CLI resolves, so your own --expose-cdp driver scripts can load the same copy: NODE_PATH=$(clipy playwright-path) node driver.js. Exits 1 (empty stdout) if Playwright is unresolvable. --json prints {path, nodeModulesDir, source}", ["--json"]),
-      cmdDoc("sources", "clipy sources [--json]", "List displays + windows the Clipy Mac app can capture — ids feed --window/--display. --json gives each entry a `source` {kind,id,title} in the SAME shape session start/record report for the resolved capture, so a caller can compare what it picked against what the camera reports without transforming either."),
+      cmdDoc("sources", "clipy sources [--x-display :N] [--json]", "List displays + windows that --source screen can capture (the Clipy Mac app's on macOS; the X display's on Linux, where listing windows needs x11-utils) — ids feed --window/--display. --json gives each entry a `source` {kind,id,title} in the SAME shape session start/record report for the resolved capture, so a caller can compare what it picked against what the camera reports without transforming either."),
       cmdDoc(
         "setup",
         "clipy setup [claude|codex|cursor|windsurf|opencode] [--with-browser] [--json]",
@@ -6407,9 +7315,9 @@ function cmdGuide(json: boolean): void {
       cmdDoc("agents", "clipy agents <status|install|uninstall> <claude|codex|cursor|windsurf|opencode>", "Skill file only — does NOT register MCP. `clipy setup` is the one-command form; install triggers a browser login first when no key is configured (interactive terminals only)"),
       cmdDoc(
         "chrome",
-        "clipy chrome <setup|start|stop|status|install-app> [--port <n>] [--json]",
-        "setup (one time, for --source chrome-extension): starts Chrome for Clipy, opens the Clipy extension's Web Store page and then clipy.online in that window, and waits up to 15 minutes until the extension reports it is installed and signed in; returns {ok:true, extension:{version,email}, chrome} and is a quick check on a ready machine. The two steps it waits for are the user's: an agent relays them and never performs them. Chrome for Clipy also launches with --allowlisted-extension-id (CLIPY_EXTENSION_ID overrides the store id), and an instance found running without the current flags is relaunched. Launch and manage 'Chrome for Clipy', a dedicated persistent automation browser: its own profile (sign in once, identity persists across launches), CDP on --port (default 9333) for any driver, --auto-select-tab-capture-source-by-title so a page's getDisplayMedia captures the tab whose title starts with the 'clipy-rec' marker without any picker or gesture UI, and background-throttling disabled so hidden tabs keep rendering. start is idempotent (re-reports the running instance); status returns {running,pid,port,cdpUrl,cdpReady,profileDir,appInstalled,captureTitleMarker}; install-app writes a named 'Chrome for Clipy.app' launcher into ~/Applications (macOS only). Drivers attach over raw CDP; no extension is needed.",
-        ["--port", "--json"],
+        "clipy chrome <setup|start|stop|status|install-app> [--port <n>] [--foreground] [--json]",
+        "setup (one time, for --source chrome-extension): starts Chrome for Clipy, opens the Clipy extension's Web Store page and then clipy.online in that window, and waits up to 15 minutes until the extension reports it is installed and signed in; returns {ok:true, extension:{version,email}, chrome} and is a quick check on a ready machine. The two steps it waits for are the user's: an agent relays them and never performs them. Chrome for Clipy also launches with --allowlisted-extension-id (CLIPY_EXTENSION_ID overrides the store id), and an instance found running without the current flags is relaunched. Launch and manage 'Chrome for Clipy', a dedicated persistent automation browser: its own profile (sign in once, identity persists across launches), CDP on --port (default 9333) for any driver, --auto-select-tab-capture-source-by-title so a page's getDisplayMedia captures the tab whose title starts with the 'clipy-rec' marker without any picker or gesture UI, and background-throttling disabled so hidden tabs keep rendering. start is idempotent (re-reports the running instance) and, on macOS, launches in the background without taking focus from the app the user is in (--foreground brings the window forward, e.g. to sign in; setup always does); status returns {running,pid,port,cdpUrl,cdpReady,profileDir,appInstalled,captureTitleMarker}; install-app writes a named 'Chrome for Clipy.app' launcher into ~/Applications (macOS only). Drivers attach over raw CDP; no extension is needed.",
+        ["--port", "--foreground", "--json"],
       ),
       cmdDoc("guide", "clipy guide --json", "This manifest"),
       cmdDoc("mcp", "clipy mcp", "Run the Clipy MCP server (wraps npx -y @clipy/mcp)"),
@@ -6422,8 +7330,9 @@ function cmdGuide(json: boolean): void {
       "Headless captures have no audio: --note flags and session marks become the transcript, labeled agent-narration.",
       "--note is absolute ('12: text') or pass-scoped ('pass2: text' / 'pass2@5: text'); pass-scoped notes anchor to the real start of a --viewports pass, so they don't drift when load time shifts the pass boundaries. A malformed pass note (e.g. 'pass2 text' with no colon) is a usage error, not silently demoted.",
       "--type declares what a recording IS (bug_report/feature_request/product_demo/walkthrough_tutorial/feedback_review/discussion_talk/other, plus short aliases) so the AI summary doesn't misread a demo as a bug report. Applied on web today; --source mac-screen support is pending a Clipy app update.",
+      "REAL SCREEN ON LINUX: --source screen records the X display with ffmpeg (x11grab), no Clipy app needed. A --window is that window's own pixels: under a compositor (GNOME, KDE, picom, xcompmgr) a covered window still records in full and nothing on top of it appears; without one the covered part is black. On an ffmpeg older than 5.1 a window is recorded as the screen area it covers instead, so anything on top of it shows; --json reports which as windowCapture (\"window\" or \"area\"). A resize starts a new segment that is fitted into the first frame, a closed window ends and uploads the take, and every such event lands as an [auto] mark. --virtual-display gives the agent its own private X display (Xvfb), which never touches the user's screen, cursor or keyboard; use `clipy session run --source screen --virtual-display -- <cmd>` so the command gets DISPLAY. Wayland sessions refuse the real screen (it needs the desktop's consent dialog): use --virtual-display or --x-display. Linux screen recordings are silent. Windows: no real-screen path for agents yet; use chrome-for-clipy, --url, or clipy proof.",
       "AUDIO on --source mac-screen: agent screen recordings do NOT capture the microphone by default (system audio ON, mic OFF). An agent recording on your behalf is not the same consent as a human clicking Record — nobody asked for the room, or whatever call you are on, to be captured — and agent narration rides on marks, not speech. Opt in with --mic; opt out of system audio with --no-system-audio. Both are --source mac-screen only: headless web captures are silent, so passing them on the web path is a usage error (exit 2). The resolved config is printed (`audio: system on, mic off`) and returned as a sibling `audio` {includeSystemAudio, includeMic} in --json — sibling, not inside `source`, because audio is a property of the capture, not of the surface. IMPORTANT: the CLI reports the config the APP echoed back, and if the app does not echo one (a desktop build predating agent audio control) it WARNS that the app is using its own defaults and the microphone may be recording — update the Clipy app to make the setting take effect.",
-      "CONFIRM THE CAMERA on --source mac-screen. `session start` and `record` print the surface they resolved, read LIVE from the app at start time — `recording window: \"<title>\" (id 157)` — and `session start --json` / `record --json` carry it as `source: {kind, id, title}`, the SAME shape each entry's `source` takes in `clipy sources --json`, so a caller can compare its pick against the camera with a direct object comparison. Check it and abort on mismatch: driver-attested marks prove what the DRIVER observed and say nothing about what the camera saw, so driving a background tab of the recorded window yields a truthful 'N passed' tally over footage of something else — worse than no evidence, because the tally vouches for the wrong footage. Clipy will NEVER activate or foreground a window/tab: it cannot know which tab/page/simulator you mean (on mac-screen it may not be recording a browser at all), so focusing the right surface is the caller's job, done before session start. The reported title and screen area are fixed at START time; moving the window does not move the recording, and anything entering that area is filmed.",
+      "CONFIRM THE CAMERA on --source mac-screen. `session start` and `record` print the surface they resolved, read LIVE from the app at start time — `recording window: \"<title>\" (id 157)` — and `session start --json` / `record --json` carry it as `source: {kind, id, title}`, the SAME shape each entry's `source` takes in `clipy sources --json`, so a caller can compare its pick against the camera with a direct object comparison. Check it and abort on mismatch: driver-attested marks prove what the DRIVER observed and say nothing about what the camera saw, so driving a background tab of the recorded window yields a truthful 'N passed' tally over footage of something else — worse than no evidence, because the tally vouches for the wrong footage. Clipy will NEVER activate or foreground a window/tab: it cannot know which tab/page/simulator you mean (on mac-screen it may not be recording a browser at all), so focusing the right surface is the caller's job, done before session start. The reported title is fixed at START time. The recording is that window's own pixels: it follows the window if it moves, and windows on top of it are not filmed.",
       "Clipy is a RECORDER, not a driver. When you drive the browser yourself (the usual agent case), the primary path is: record the real app (--source mac-screen --window '<app>', or your own driven browser) and attach evidence with driver-attested marks — `clipy mark \"<claim>\" --observed \"<values you read>\" --verdict pass|fail` — plus `clipy chapter` for before/after. Clipy holds the ledger; it does not drive. The owned-browser auth flags (--storage-state/--user-data-dir/--profile-directory/--cookie/--local-storage/--init-script) are the AGENTLESS/CI fallback for when nothing is driving and Clipy needs its own logged-in context. Provenance is never pooled: driver-attested marks render '[≈ ASSERT driver-attested; observed=…]' / '[≈ FAILED …]' (hedge glyph) and clipy-evaluated ones '[assert ✓ verified-by-clipy; …]' / '[ASSERT ✗ verified-by-clipy; …]' (✓/✗ are reserved for what Clipy itself checked), and the [verification] note counts them in separate segments. The honesty rule: driver-attested means Clipy vouches the agent SAID it, not that Clipy verified it.",
       "Assertion marks are the differentiator: assert what you claim. `clipy mark \"X\" --assert-selector '.status' --assert-text Active` records X only alongside the live-page truth — the daemon runs the check against its Playwright page and annotates the mark ✓/✗ with what it actually observed, so a false claim cannot pass as fact in the transcript. --fail-mode abort turns a failed assertion into a discarded session (nothing uploaded, non-zero exit). Assertions need a web session and the daemon's control endpoint (started by clipy 0.6+); they are rejected on --source mac-screen.",
       "A mark is NEVER dropped, and a late verdict never rewrites it. If the daemon can't be reached to evaluate an assertion (its event loop briefly starved during a dev-server recompile), `clipy mark` records the narration anyway tagged '[ASSERT ⚠ clipy could not evaluate — <reason>]', prints a loud ⚠, and exits 0 — an unverified claim is flagged, never promoted to a ✓. The tally's third bucket counts these: '[verification] N assertion(s): P passed, F failed, K unverified' (the ', K unverified' clause is omitted when K=0). That ⚠ is the MARK OF RECORD: if the daemon was only slow and evaluates the same claim later, that verdict judged a LATER page state, so it does NOT overwrite the ⚠ — it's recorded as a separate '[late check of \"…\" — evaluated Ns after the claim: …]' note at its own time and counts toward none of P/F/K. Plain non-asserted marks the daemon later processes are just deduped (exactly once).",
@@ -6526,6 +7435,7 @@ async function main(): Promise<void> {
       "no-browser": { type: "boolean", default: false },
       "with-browser": { type: "boolean", default: false },
       port: { type: "string" },
+      foreground: { type: "boolean", default: false },
       "api-url": { type: "string" },
       status: { type: "string" },
       page: { type: "string" },
@@ -6537,6 +7447,8 @@ async function main(): Promise<void> {
       mic: { type: "boolean", default: false },
       "no-system-audio": { type: "boolean", default: false },
       "tab-audio": { type: "boolean", default: false },
+      diagnostics: { type: "string" },
+      "network-detail": { type: "boolean", default: false },
       vtt: { type: "boolean", default: false },
       for: { type: "string" },
       timeout: { type: "string" },
@@ -6565,6 +7477,8 @@ async function main(): Promise<void> {
       source: { type: "string" },
       window: { type: "string" },
       display: { type: "string" },
+      "x-display": { type: "string" },
+      "virtual-display": { type: "boolean", default: false },
       type: { type: "string" },
       "assert-selector": { type: "string" },
       "assert-text": { type: "string" },
@@ -6664,8 +7578,19 @@ async function main(): Promise<void> {
     includeSystemAudio: !values["no-system-audio"],
     includeMic: Boolean(values.mic),
   });
+  // Browser evidence for sessions Clipy drives. `errors` (the default) keeps
+  // console warnings/errors, uncaught errors and failed requests; `all` keeps
+  // every console message and request; `off` records none.
+  const diagnosticsLevel = (): DiagnosticsLevel => {
+    const raw = values.diagnostics as string | undefined;
+    if (raw === undefined) return "errors";
+    if (raw === "off" || raw === "errors" || raw === "all") return raw;
+    die(`--diagnostics must be off, errors or all (got "${raw}")`, 2);
+  };
   const webAudioGuard =
     "--mic/--no-system-audio apply to --source mac-screen only — headless web captures record no audio at all, so there is nothing to turn on or off";
+  const linuxAudioGuard =
+    "--mic/--no-system-audio: Linux screen recordings are silent for now (narrate with clipy mark); drop the audio flag";
   const macAuthGuard = "auth state (--storage-state/--user-data-dir/--cookie/--local-storage/--init-script) applies to headless web capture — --source mac-screen records the real, already-logged-in screen";
 
   switch (command) {
@@ -6818,7 +7743,7 @@ async function main(): Promise<void> {
       await cmdSetup(ctx, rest[0], json, values["with-browser"] === true);
       return;
     case "chrome":
-      await cmdChrome(rest[0], json, values.port as string | undefined);
+      await cmdChrome(rest[0], json, values.port as string | undefined, values.foreground === true);
       return;
     case "agents":
       await cmdAgents(ctx, rest[0], rest[1], json);
@@ -6827,6 +7752,16 @@ async function main(): Promise<void> {
       cmdGuide(json);
       return;
     case "sources": {
+      // An explicit CLIPY_BRIDGE_FILE means "ask that Clipy app", on any OS.
+      if (process.platform === "linux" && !process.env.CLIPY_BRIDGE_FILE?.trim()) {
+        const xDisplay = (values["x-display"] as string | undefined)?.trim() || process.env.DISPLAY;
+        if (!xDisplay) {
+          die("no X display: run on a desktop session or name one with --x-display :N (a --virtual-display session prints its own)");
+        }
+        printLinuxSources(listLinuxSources(xDisplay), json);
+        return;
+      }
+      if (process.platform === "win32" && !process.env.CLIPY_BRIDGE_FILE?.trim()) die(WINDOWS_SCREEN_REFUSAL);
       // Enumerate what the Mac app can capture, so --window/--display have ids.
       try {
         const sources = await listSources(readBridgeInfo());
@@ -6884,19 +7819,58 @@ async function main(): Promise<void> {
       return;
     }
     case "record": {
-      const source = String(values.source ?? "web");
-      if (source !== "web" && source !== "mac-screen") {
-        die("--source must be web (headless browser) or mac-screen (the Clipy Mac app)", 2);
+      const source = normalizeScreenSource(String(values.source ?? "web"));
+      if (source !== "web" && !isScreenSource(source)) {
+        die("--source must be web (headless browser) or screen (the real screen: the Clipy Mac app on macOS, the CLI's own recorder on Linux)", 2);
       }
-      if ((values.window || values.display) && source !== "mac-screen") {
-        die("--window/--display record the real screen — add --source mac-screen", 2);
+      if ((values.window || values.display) && !isScreenSource(source)) {
+        die("--window/--display record the real screen: add --source screen", 2);
       }
       if (values.window && values.display) {
         die("--window and --display are mutually exclusive — pick one capture source", 2);
       }
-      if (source === "mac-screen" && authFlagsPresent) die(macAuthGuard, 2);
-      if (source !== "mac-screen" && audioFlagsPresent) die(webAudioGuard, 2);
+      if ((values["x-display"] || values["virtual-display"]) && source !== "linux-screen") {
+        die("--x-display/--virtual-display apply to --source screen on Linux", 2);
+      }
+      if (isScreenSource(source) && authFlagsPresent) die(macAuthGuard, 2);
+      if (source === "linux-screen" && audioFlagsPresent) die(linuxAudioGuard, 2);
+      if (source === "web" && audioFlagsPresent) die(webAudioGuard, 2);
       const recordingKind = values.type ? requireRecordingKind(String(values.type)) : undefined;
+      if (source === "linux-screen") {
+        const forSec = num(values.for, 15);
+        if (forSec > SESSION_HARD_CAP_SEC) die(`--for is capped at ${SESSION_HARD_CAP_SEC}s`, 2);
+        const result = await cmdRecordLinux(ctx, {
+          forSec,
+          name:
+            ((values.title as string | undefined) ?? (values.name as string | undefined))?.trim() ||
+            undefined,
+          description: (values.description as string | undefined)?.trim() || undefined,
+          recordingKind,
+          window: (values.window as string | undefined)?.trim() || undefined,
+          display: (values.display as string | undefined)?.trim() || undefined,
+          xDisplay: (values["x-display"] as string | undefined)?.trim() || undefined,
+          virtualDisplay: Boolean(values["virtual-display"]),
+          width: num(values.width, 1280),
+          height: num(values.height, 720),
+          notes: ((values.note as string[] | undefined) ?? []).map(parseNoteFlag),
+          json,
+        }).catch((e: Error) => die(e.message));
+        if (values.wait && result.publicId) await waitForArtifacts(ctx, result.publicId).catch(() => {});
+        if (json) {
+          printJson({
+            id: result.publicId,
+            shareUrl: result.shareUrl,
+            contextUrl: result.contextUrl,
+            sizeBytes: result.sizeBytes,
+            source: result.source,
+            ...(result.windowCapture ? { windowCapture: result.windowCapture } : {}),
+          });
+        } else {
+          process.stdout.write(`${c.green("✓")} recorded: ${c.bold(result.shareUrl)}\n`);
+          process.stdout.write(`${c.dim("next:")} clipy context ${result.publicId}  ·  clipy wait ${result.publicId}\n`);
+        }
+        return;
+      }
       if (source === "mac-screen") {
         const noteFlags = (values.note as string[] | undefined) ?? [];
         const forSec = num(values.for, 15);
@@ -6923,7 +7897,12 @@ async function main(): Promise<void> {
             await waitForArtifacts(ctx, result.publicId).catch(() => {});
           }
           if (json) {
-            printJson({ id: result.publicId, shareUrl: result.shareUrl, source: result.source });
+            printJson({
+              id: result.publicId,
+              shareUrl: result.shareUrl,
+              source: result.source,
+              ...(result.windowCapture ? { windowCapture: result.windowCapture } : {}),
+            });
           } else {
             process.stdout.write(`${c.green("✓")} recorded — ${c.bold(result.shareUrl)}\n`);
             process.stdout.write(
@@ -6966,36 +7945,42 @@ async function main(): Promise<void> {
       // cmdSessionStart opts. `positionalUrl` is rest[1] for `start` (session
       // start <url>) — `run` has no positional url, only --url.
       const buildStartOpts = (positionalUrl: string | undefined): Parameters<typeof cmdSessionStart>[1] => {
-        const source = String(values.source ?? "web");
-        if (source !== "web" && source !== "mac-screen" && source !== "chrome-for-clipy" && source !== "chrome-extension") {
+        const source = normalizeScreenSource(String(values.source ?? "web"));
+        if (source !== "web" && !isScreenSource(source) && source !== "chrome-for-clipy" && source !== "chrome-extension") {
           die(
-            "--source must be web (headless browser), mac-screen (the Clipy Mac app), chrome-for-clipy (the persistent automation browser), or chrome-extension (the Clipy extension inside Chrome for Clipy)",
+            "--source must be web (headless browser), screen (the real screen: the Clipy Mac app on macOS, the CLI's own recorder on Linux), chrome-for-clipy (the persistent automation browser), or chrome-extension (the Clipy extension inside Chrome for Clipy)",
             2,
           );
         }
-        if ((values.window || values.display) && source !== "mac-screen") {
-          die("--window/--display record the real screen — add --source mac-screen", 2);
+        if ((values.window || values.display) && !isScreenSource(source)) {
+          die("--window/--display record the real screen: add --source screen", 2);
         }
         if (values.window && values.display) {
           die("--window and --display are mutually exclusive — pick one capture source", 2);
         }
-        if (source === "mac-screen" && authFlagsPresent) die(macAuthGuard, 2);
+        if ((values["x-display"] || values["virtual-display"]) && source !== "linux-screen") {
+          die("--x-display/--virtual-display apply to --source screen on Linux", 2);
+        }
+        if (isScreenSource(source) && authFlagsPresent) die(macAuthGuard, 2);
+        if (source === "linux-screen" && audioFlagsPresent) die(linuxAudioGuard, 2);
         if ((source === "chrome-for-clipy" || source === "chrome-extension") && authFlagsPresent) {
           die(
             `auth-capture flags don't apply to --source ${source}; sign into the Chrome for Clipy profile once (clipy chrome setup) and it stays signed in`,
             2,
           );
         }
-        if (source !== "mac-screen" && audioFlagsPresent) die(webAudioGuard, 2);
+        if (!isScreenSource(source) && audioFlagsPresent) die(webAudioGuard, 2);
         if (values["tab-audio"] && source !== "chrome-extension") {
           die("--tab-audio applies to --source chrome-extension only", 2);
         }
         const url = (values.url as string | undefined)?.trim() || positionalUrl;
-        if (!url && source !== "mac-screen") {
-          die("usage: clipy session start --url <http(s) url> [--max <sec>] [--source web|mac-screen|chrome-for-clipy|chrome-extension]", 2);
+        if (!url && !isScreenSource(source)) {
+          die("usage: clipy session start --url <http(s) url> [--max <sec>] [--source web|screen|chrome-for-clipy|chrome-extension]", 2);
         }
         return {
-          url: url || "mac-screen",
+          url: url || source,
+          xDisplay: (values["x-display"] as string | undefined)?.trim() || undefined,
+          virtualDisplay: Boolean(values["virtual-display"]),
           window: (values.window as string | undefined)?.trim() || undefined,
           display: (values.display as string | undefined)?.trim() || undefined,
           name:
@@ -7007,8 +7992,10 @@ async function main(): Promise<void> {
           width: num(values.width, 1280),
           height: num(values.height, 720),
           json,
-          source: source as "web" | "mac-screen" | "chrome-for-clipy" | "chrome-extension",
+          source: source as "web" | "mac-screen" | "linux-screen" | "chrome-for-clipy" | "chrome-extension",
           exposeCdp: Boolean(values["expose-cdp"]),
+          diagnostics: diagnosticsLevel(),
+          networkDetail: Boolean(values["network-detail"]),
           auth: authCapture(),
           userDataDir: userDataDir(),
           profileDirectory: profileDirectory(),

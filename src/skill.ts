@@ -15,7 +15,7 @@ description: Read and create Clipy screen recordings, turn screenshots or tool-n
 
 # Clipy — recordings you can read AND make
 
-Written for @clipy/cli + @clipy/mcp 0.15.1 (the two versions move in lockstep). If
+Written for @clipy/cli + @clipy/mcp 0.16.0 (the two versions move in lockstep). If
 \`clipy --version\` reports older, upgrade first: \`npm i -g @clipy/cli@latest\`.
 
 Clipy (clipy.online) is the screen recorder built to be agent-readable. Every
@@ -278,13 +278,29 @@ WHAT must be verified, and WHETHER the target depends on an existing login.
      real session. Prefer the current agent/browser tool's own WebM/MP4 or
      screenshots and hand them to \`clipy proof\`. For continuous native proof,
      use \`clipy sources --json\`, select the exact Chrome/app window, and record
-     its starting screen area with \`--source mac-screen --window <exact-id>\`.
-   - **Interactive Windows/Linux desktop:** the Mac bridge is unavailable. Reuse
-     the existing browser/computer-use tool's video or screenshots with
-     \`clipy proof\`; otherwise use Playwright with an existing approved auth
-     state. Never fall back to whole-display capture silently.
+     that window by itself with \`--source mac-screen --window <exact-id>\`
+     (windows on top of it stay out, so the user can keep working, when the
+     start JSON reports \`windowCapture: "window"\`; an older Clipy app
+     reports \`"area"\` and records whatever is on top of the window).
+   - **Interactive Linux desktop (X11):** \`--source screen\` records the real
+     screen with the CLI itself, no app needed: \`clipy sources --json\`, then
+     \`--source screen --window <exact-id>\` for one window or
+     \`--display <id>\`. Check \`windowCapture\` in the start JSON before
+     relying on the window being isolated: \`"window"\` is its own pixels
+     (complete under a compositor, black where covered without one);
+     \`"area"\` (ffmpeg older than 5.1) is the screen area it covers, so keep
+     it in front, because anything on top of it is recorded. On Wayland the
+     real screen is refused (it needs the desktop's consent dialog); use
+     \`--virtual-display\` instead.
+   - **Interactive Windows desktop:** there is no real-screen path for agents
+     yet. Reuse the existing browser/computer-use tool's video or screenshots
+     with \`clipy proof\`, or \`--source chrome-for-clipy\` for a browser tab.
+     Never fall back to whole-display capture silently.
    - **SSH server / container / CI:** assume there is no usable desktop session.
-     For public routes, isolated headless Playwright is appropriate. For
+     On Linux, \`clipy session run --source screen --virtual-display -- <cmd>\`
+     gives the agent a private X display (Xvfb) to run any GUI app on and
+     records it; the command gets \`DISPLAY\`. For public routes, isolated
+     headless Playwright is appropriate. For
      authenticated routes, first reuse the repository's test login,
      Playwright \`storageState\`, init script, or existing agent-owned browser
      recording. If none exists, report the authentication blocker; do not type
@@ -517,6 +533,16 @@ AUDIO, no human gesture, and keeps recording across navigations and while the
 tab is backgrounded. The session starts the browser if needed, opens --url in
 the recorded tab, and stopping never closes the browser.
 
+It runs alongside the user, not in front of them: on macOS it launches without
+taking focus from the app they are in, and the user keeps their own cursor and
+keyboard while you drive it. Keep it that way. Open extra tabs with CDP
+\`Target.createTarget\` and \`background: true\`, not Playwright \`newPage()\`,
+and never call \`bringToFront()\` or \`Target.activateTarget\`: each of those
+pulls Chrome in front of the user's work. (During a \`--source chrome-for-clipy\`
+recording Clipy hands focus back after a \`newPage()\`; during an extension
+recording or outside a recording it cannot.) \`clipy chrome start
+--foreground\` is for when the user needs the window, for example to sign in.
+
 Use it when the verification needs sound (a player, a call UI, TTS), a
 tab-exact frame with zero desktop clutter, or a standing signed-in identity for
 automation. Do NOT treat it as the user's daily browser: it is a separate
@@ -728,8 +754,9 @@ Clipy will NEVER bring a window or tab to the front for you. It cannot know whic
 tab/page/simulator you mean, and on --source mac-screen it may not be recording a
 browser at all. Focusing the right surface is YOUR job — do it before \`session start\`
 (e.g. activate the tab with your own tooling), then confirm with the reported title.
-Note the title and screen area are fixed at START time. Moving the window does not
-move the recording, and anything entering that area is filmed.
+Note the title is fixed at START time. A \`--window\` recording is that window's own
+pixels: it follows the window if it moves and windows on top of it are not filmed,
+so it does not need to stay in front, but it must show the right tab.
 - On \`clipy record --source mac-screen\`, \`--for\` is capped at 1740s (the app
   auto-stops at 1800s).
 - If a human presses Stop inside the app during your session, \`session stop\` /

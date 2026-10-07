@@ -407,7 +407,21 @@ export async function resolveCaptureSource(
   if (opts.window && opts.display) {
     throw new Error("--window and --display are mutually exclusive — pick one capture source");
   }
-  const sources = await listSources(info);
+  return resolveFromSources(await listSources(info), opts);
+}
+
+/**
+ * The matching rules behind --window/--display, shared by the Mac app's
+ * sources and the Linux CLI's own X11 listing so both resolve a pick the
+ * same way and report the same ambiguity.
+ */
+export function resolveFromSources(
+  sources: BridgeSources,
+  opts: { window?: string; display?: string },
+): { source: CaptureSource; label: string; resolved: ResolvedSource } {
+  if (opts.window && opts.display) {
+    throw new Error("--window and --display are mutually exclusive — pick one capture source");
+  }
   if (opts.window) {
     const q = opts.window.trim();
     let matches: BridgeWindow[];

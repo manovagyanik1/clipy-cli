@@ -570,7 +570,7 @@ By default it captures the primary display. Target one window instead:
 ```bash
 clipy sources                                   # list displays + windows with ids
 clipy session start --source mac-screen --window "Chrome" --title "Fix walkthrough"
-# … the agent drives Chrome while Clipy records its initial screen area …
+# … the agent drives Chrome while Clipy records that window by itself …
 clipy mark "reproduced the bug"
 clipy mark "fix applied — retesting"
 clipy session stop                              # uploads, prints the share link
@@ -616,8 +616,58 @@ of a different tab: worse than no evidence, because the tally vouches for the wr
 **Clipy will never bring a window or tab to the front for you.** It can't know which
 tab/page/simulator you mean, and on `--source mac-screen` it may not be recording a browser
 at all — focusing the right surface is the caller's job. Do it before `session start`, then
-confirm with the reported title. (The title and recorded screen area are fixed at start time;
-moving the window does not move the recording, and anything entering that area is filmed.)
+confirm with the reported title. (The title is fixed at start time. When the start JSON reports
+`windowCapture: "window"`, a `--window` recording is that window's own pixels: it follows the
+window if it moves and windows on top of it are not filmed, so it need not stay in front, but
+it must show the right tab. `"area"`, from a Clipy app too old to record a window by itself or
+from ffmpeg older than 5.1 on Linux, films whatever is on top of it, so keep it in front.)
+
+## Record the real screen on Linux: a window, a display, or a private screen
+
+`--source screen` works on Linux without any Clipy app: the CLI records the X
+display itself with ffmpeg (`x11grab`). The same flag means the Mac app on macOS,
+so an agent can use one spelling everywhere.
+
+```bash
+clipy doctor                                   # the "screen" rows say what this machine can do
+clipy sources --json                           # displays + windows on $DISPLAY
+clipy session start --source screen --window 2097155 --title "Fix walkthrough"
+clipy mark "reproduced the bug" --observed "Save stays disabled" --verdict fail
+clipy session stop
+```
+
+- **A window** (`--window <id|title|app>`) is that window's own pixels. Under a
+  compositor (GNOME, KDE, picom, xcompmgr) a window that is covered still records
+  in full and nothing on top of it appears, so the user can keep working. Without a
+  compositor the covered part is black. The picture follows the window when it
+  moves; a resize starts a new segment that is fitted into the first frame, and a
+  closed window ends the take and uploads it. Each of these lands as an `[auto]`
+  mark. Listing windows needs `xwininfo` and `xprop` (`sudo apt install x11-utils`);
+  capturing by id needs FFmpeg 5.1+, and older builds record the window's area of
+  the screen instead (with a warning).
+- **A display** (`--display <id>`, default the first monitor) is that monitor of
+  the X screen.
+- **A private screen** (`--virtual-display`, sized by `--width`/`--height`) starts
+  an Xvfb display only the agent draws on: the user's screen, cursor and keyboard
+  are never involved, which also makes it the way to record GUI work on a server,
+  container or CI. `session run` hands the command `DISPLAY`:
+
+  ```bash
+  clipy session run --source screen --virtual-display --width 1600 --height 900 -- \
+    sh -c 'chromium --app=http://localhost:3000 & sleep 2; ./drive-the-ui.sh'
+  ```
+
+  It needs `Xvfb` (`sudo apt install xvfb`); with `picom` or `xcompmgr` installed,
+  Clipy also starts a compositor on it so covered windows record in full.
+- `--x-display :N` records any other X display, for example one your harness
+  already runs.
+
+Linux screen recordings are silent; narrate with `clipy mark`. Wayland sessions
+only let an app read the real screen through the desktop's own consent dialog, so
+`--source screen` refuses the real screen there and points at `--virtual-display`
+or `--x-display`. On Windows there is no real-screen path for agents yet: use
+`--source chrome-for-clipy` for a browser tab, `--url` for a headless page, or
+`clipy proof` with your own tool's video or screenshots.
 
 ## Scripting
 

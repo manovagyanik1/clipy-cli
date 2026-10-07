@@ -56,7 +56,7 @@ try {
   console.log('PASS: capture with changing titles + tab audio, flush, abort, repeated capture, tab cleanup, failed-recorder rejection, concurrent capture refusal, browser remains running');
 } finally {
   if(cap) await cap.discard().catch(()=>{});
-  console.log('STOP',stopChrome(home));
+  console.log('STOP',await stopChrome(home));
   server.closeAllConnections();await new Promise(r=>server.close(r));
   await new Promise(r=>setTimeout(r,1000));
   rmSync(home,{recursive:true,force:true});

@@ -72,7 +72,7 @@ if (pw.status !== 0) {
 const appServer = createServer((_req, res) => {
   res
     .writeHead(200, { "Content-Type": "text/html" })
-    .end(`<!doctype html><html><body><h1 id="t">Hello</h1></body></html>`);
+    .end(`<!doctype html><html><body><h1 id="t">Hello</h1><script>console.error("checkout exploded")</script></body></html>`);
 });
 await new Promise((r) => appServer.listen(0, "127.0.0.1", r));
 const appBase = `http://127.0.0.1:${appServer.address().port}`;
@@ -81,6 +81,7 @@ const appBase = `http://127.0.0.1:${appServer.address().port}`;
 
 let completeCalls = 0;
 let lastComplete = null;
+let lastCursor = null;
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -101,6 +102,11 @@ const ingestServer = createServer(async (req, res) => {
   if (u.pathname === "/api/videos/raw-upload/complete") {
     completeCalls += 1;
     lastComplete = JSON.parse((await readBody(req)).toString() || "{}");
+    res.writeHead(200, json).end("{}");
+    return;
+  }
+  if (u.pathname === "/api/videos/raw-upload/cursor") {
+    lastCursor = JSON.parse((await readBody(req)).toString() || "{}");
     res.writeHead(200, json).end("{}");
     return;
   }
@@ -201,6 +207,7 @@ const noteText = (notes, needle) => notes.find((n) => typeof n.text === "string"
 await test("session control protocol: 401 guard, plain mark, assert ✓/✗ + [verification], chapter, --ago backdating", async () => {
   const ws = freshWorkspace();
   lastComplete = null;
+  lastCursor = null;
   try {
     const start = await runCli(
       ["session", "start", "--url", appBase, "--max", "30", "--json"],
@@ -268,6 +275,15 @@ await test("session control protocol: 401 guard, plain mark, assert ✓/✗ + [v
 
     const stop = await runCli(["session", "stop", "--json"], ws);
     assert.equal(stop.code, 0, `session stop failed (${stop.code}): ${stop.stderr}`);
+
+    // --- Browser evidence rides the cursor sidecar route after complete ---
+    const diagnostics = lastCursor?.browserDiagnostics;
+    assert.equal(lastCursor?.videoPublicId, "testid", "the sidecar is posted for the uploaded recording");
+    assert.equal(diagnostics?.source, "cdp", "the sidecar is marked as browser-reported");
+    assert.ok(
+      diagnostics.events.some((e) => e.kind === "console" && e.message.includes("checkout exploded")),
+      `the page's console error is in the sidecar: ${JSON.stringify(diagnostics?.events)}`,
+    );
 
     // --- Inspect the uploaded transcript ---
     const notes = lastComplete?.narration?.notes ?? [];
@@ -1101,7 +1117,7 @@ await test("session start --source mac-screen prints the resolved surface promin
  *  advertises. The two are separable on purpose — a v1 app is caught before the
  *  camera starts, and a v2 app that fails to echo is caught after, and we want
  *  both gates under test rather than one standing in for the other. */
-async function withMockBridge({ echoAudio, protocolVersion = echoAudio ? 2 : 1 }, fn) {
+async function withMockBridge({ echoAudio, protocolVersion = echoAudio ? 2 : 1, windowCapture }, fn) {
   const WINDOW = { id: 7, app_name: "Chrome", title: "Dashboard", width: 800, height: 600 };
   const sockPath = join(mkdtempSync(join(tmpdir(), "clipy-audio-sock-")), "bridge.sock");
   let lastStart = null;
@@ -1115,8 +1131,8 @@ async function withMockBridge({ echoAudio, protocolVersion = echoAudio ? 2 : 1 }
       if (req.cmd === "sources") return reply({ displays: [], windows: [WINDOW] });
       if (req.cmd === "start") {
         lastStart = req;
-        return reply(
-          echoAudio
+        return reply({
+          ...(echoAudio
             ? {
                 started: true,
                 audio: {
@@ -1125,8 +1141,9 @@ async function withMockBridge({ echoAudio, protocolVersion = echoAudio ? 2 : 1 }
                   micDeviceId: null,
                 },
               }
-            : { started: true },
-        );
+            : { started: true }),
+          ...(windowCapture ? { windowCapture } : {}),
+        });
       }
       return reply({});
     });
@@ -1187,6 +1204,39 @@ await test("--mic opts in and --no-system-audio opts out, both reaching the brid
         "explicit flags reach the bridge",
       );
       assert.match(r.stderr, /audio: system off, mic ON/, `terminal states mic is live: ${r.stderr}`);
+    } finally {
+      await runCli(["session", "abort"], { cwd: ws.cwd, env }).catch(() => {});
+    }
+  });
+});
+
+// A window is only isolated when the app says so: a v3 app echoes how it records
+// the window, and an older one records the window's screen area.
+await test("mac-screen reports a window recorded by itself only when the app confirms it", async () => {
+  const ws = freshWorkspace();
+  await withMockBridge({ echoAudio: true, protocolVersion: 3, windowCapture: "window" }, async (bridgeFile) => {
+    const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
+    try {
+      const r = await runCli(["session", "start", "--source", "mac-screen", "--window", "7", "--json"], { cwd: ws.cwd, env });
+      assert.equal(r.code, 0, `start failed: ${r.stderr}`);
+      assert.equal(JSON.parse(r.stdout).windowCapture, "window");
+      assert.doesNotMatch(r.stderr, /screen area/, `no isolation warning: ${r.stderr}`);
+    } finally {
+      await runCli(["session", "abort"], { cwd: ws.cwd, env }).catch(() => {});
+    }
+  });
+});
+
+await test("an app too old to say how it records a window is reported as the area, with a warning", async () => {
+  const ws = freshWorkspace();
+  await withMockBridge({ echoAudio: true, protocolVersion: 2 }, async (bridgeFile) => {
+    const env = { ...ws.env, CLIPY_BRIDGE_FILE: bridgeFile };
+    try {
+      const r = await runCli(["session", "start", "--source", "mac-screen", "--window", "7", "--json"], { cwd: ws.cwd, env });
+      assert.equal(r.code, 0, `start failed: ${r.stderr}`);
+      assert.equal(JSON.parse(r.stdout).windowCapture, "area");
+      assert.match(r.stderr, /bridge protocol v2 \(needs v3\)/, `warned before start: ${r.stderr}`);
+      assert.equal(r.stderr.match(/screen area/g)?.length, 1, "warned once, not twice");
     } finally {
       await runCli(["session", "abort"], { cwd: ws.cwd, env }).catch(() => {});
     }
